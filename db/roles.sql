@@ -3,9 +3,10 @@
 -- Run once by the `postgres` superuser (via docker-entrypoint-initdb.d, see
 -- db/init/01-roles.sh, or manually with `psql`). Idempotent: safe to re-run.
 --
--- Expects two psql variables to be passed in with -v:
---   migrator_password  -- password for the catan_migrator (DDL/owner) role
---   app_password        -- password for the catan_app (runtime, least-privilege) role
+-- Passwords are read from the MIGRATOR_PASSWORD / APP_PASSWORD environment
+-- variables with \getenv, so they never appear on the psql command line (and
+-- therefore never show up in /proc/<pid>/cmdline or shell history). The
+-- script fails hard (ON_ERROR_STOP) if either is missing.
 --
 -- Two roles:
 --   catan_migrator  owns the schema, runs migrations (DDL).
@@ -15,6 +16,53 @@
 -- Two databases: `catan` (production) and `catan_test` (integration tests).
 
 \set ON_ERROR_STOP on
+
+\getenv migrator_password MIGRATOR_PASSWORD
+\getenv app_password APP_PASSWORD
+
+\if :{?migrator_password}
+\else
+DO $$ BEGIN RAISE EXCEPTION 'MIGRATOR_PASSWORD not set'; END $$;
+\endif
+
+\if :{?app_password}
+\else
+DO $$ BEGIN RAISE EXCEPTION 'APP_PASSWORD not set'; END $$;
+\endif
+
+-- `\getenv` only tells us the variable was present; an empty string (e.g.
+-- MIGRATOR_PASSWORD="") still satisfies :{?var} above but must not silently
+-- create a password-less role.
+SELECT :'migrator_password' = '' AS migrator_password_empty
+\gset
+
+\if :migrator_password_empty
+DO $$ BEGIN RAISE EXCEPTION 'MIGRATOR_PASSWORD is empty'; END $$;
+\endif
+
+SELECT :'app_password' = '' AS app_password_empty
+\gset
+
+\if :app_password_empty
+DO $$ BEGIN RAISE EXCEPTION 'APP_PASSWORD is empty'; END $$;
+\endif
+
+-- A short password is still a weak password even though it's non-empty.
+-- 16 chars is a conservative floor; `openssl rand -hex 24` (recommended in
+-- .env.example) produces 48.
+SELECT length(:'migrator_password') < 16 AS migrator_password_too_short
+\gset
+
+\if :migrator_password_too_short
+DO $$ BEGIN RAISE EXCEPTION 'MIGRATOR_PASSWORD is too short (must be at least 16 characters)'; END $$;
+\endif
+
+SELECT length(:'app_password') < 16 AS app_password_too_short
+\gset
+
+\if :app_password_too_short
+DO $$ BEGIN RAISE EXCEPTION 'APP_PASSWORD is too short (must be at least 16 characters)'; END $$;
+\endif
 
 -- ---------------------------------------------------------------------------
 -- Roles (idempotent create-if-not-exists)
@@ -47,6 +95,13 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'catan')
 SELECT format('CREATE DATABASE catan_test OWNER catan_migrator')
 WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'catan_test')
 \gexec
+
+-- ---------------------------------------------------------------------------
+-- Nobody should use the cluster's default maintenance databases.
+-- ---------------------------------------------------------------------------
+
+REVOKE CONNECT, TEMP ON DATABASE postgres FROM PUBLIC;
+REVOKE CONNECT, TEMP ON DATABASE template1 FROM PUBLIC;
 
 -- ---------------------------------------------------------------------------
 -- Per-database privileges. catan_app gets CONNECT + USAGE on schema public,

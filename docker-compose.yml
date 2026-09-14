@@ -1,6 +1,18 @@
+x-app-image: &app_image
+  build: .
+  image: catan-tracker:local
+
+x-logging: &default_logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *default_logging
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -19,7 +31,8 @@ services:
       retries: 10
 
   migrate:
-    build: .
+    <<: *app_image
+    logging: *default_logging
     command: ["python", "-m", "catan_bot.db.migrate"]
     environment:
       MIGRATOR_DATABASE_URL: postgresql://catan_migrator:${MIGRATOR_PASSWORD}@db:5432/catan
@@ -29,7 +42,8 @@ services:
     restart: "no"
 
   bot:
-    build: .
+    <<: *app_image
+    logging: *default_logging
     environment:
       DATABASE_URL: postgresql://catan_app:${APP_PASSWORD}@db:5432/catan
       DISCORD_TOKEN: ${DISCORD_TOKEN}

@@ -1,0 +1,112 @@
+# Catan Tracker
+
+A Discord bot for a friend group that tracks Catan wins and losses and ranks players by win rate. Seasons run for a set period with a minimum-games threshold (default 2) for eligibility; when a season ends, the lowest-ranked eligible player buys food for the top-ranked player. The bot also schedules game nights with RSVPs and reminders.
+
+## Status
+
+Early development, built milestone by milestone.
+
+- [x] Foundation — git/Docker setup, database schema and migrations, bot skeleton, `/help`
+- [ ] Domain logic — dates, ranking, bet resolution, reminders, validation
+- [ ] Repositories + SQL injection tests
+- [ ] Core commands — config, season, game reporting, leaderboard, stats
+- [ ] Events + scheduler
+- [ ] CI + deployment docs
+
+## Planned commands
+
+Only `/help` is implemented today. Everything else below is the intended
+command set for later milestones.
+
+| Command | Description | Who | Status |
+|---|---|---|---|
+| `/help` | List available commands | Anyone | Available now |
+| `/config ...` | Set announcement channel, timezone, admin role | Manage Server | Planned |
+| `/season start` / `min-games` / `end-date` / `end` / `cancel` / `info` / `history` | Manage seasons and the win/loss eligibility threshold (default 2) | Admin (`info`/`history`: anyone) | Planned |
+| `/game report winner loser1 [...] [date]` | Report a game; `date` defaults to today | Anyone | Planned |
+| Confirm / Reject buttons | Confirm or reject a reported game | Other participants | Planned |
+| `/game void`, `/game history` | Void a game / view game history | Admin / anyone | Planned |
+| `/leaderboard`, `/stats` | View rankings and player stats | Anyone | Planned |
+| `/event create [date] ...`, `/event list`, `/event cancel` | Schedule and manage game nights | Anyone / creator or admin | Planned |
+| RSVP buttons | Going / Maybe / Not going | Anyone | Planned |
+
+## Tech stack
+
+- Python 3.12
+- [discord.py](https://discordpy.readthedocs.io/)
+- asyncpg
+- PostgreSQL 16
+- Docker Compose
+- pytest, ruff, bandit
+
+## Security: SQL injection prevention
+
+- All queries use parameterized placeholders (`$1`, `$2`, ...); SQL text is kept as fixed string constants and is never built from user input.
+- An AST-based static guard test fails the test suite when it detects dynamically built SQL or database calls outside the data-access layer.
+- The database uses least-privilege roles: the application's runtime role cannot `DELETE`, `DROP`, `TRUNCATE`, or `ALTER` anything — only `SELECT`/`INSERT`/`UPDATE` on existing tables. Schema changes require a separate migration role.
+- A server-side `statement_timeout` applied to every pooled connection, plus a client-side command timeout, bound query run time.
+- The database port is bound to `localhost` only; it is never exposed publicly.
+- Discord mentions are disabled by default (`AllowedMentions.none()`); only specific, intentional pings are ever allowed through.
+
+## Getting started (local)
+
+Prerequisites: Docker, Python 3.12.
+
+1. Create a Discord application and bot at the [Discord Developer Portal](https://discord.com/developers/applications). No privileged intents are required. When generating an invite link, use scopes `bot` + `applications.commands` with permissions View Channel, Send Messages, and Embed Links.
+2. Copy the environment template, then fill it in (use the command below to generate strong passwords for the database variables):
+
+   ```bash
+   cp .env.example .env
+   openssl rand -hex 24
+   ```
+
+3. Start the database, run migrations, then start the bot:
+
+   ```bash
+   docker compose up -d db
+   docker compose run --rm migrate
+   docker compose up -d bot
+   ```
+
+Tip: set `DEV_GUILD_ID` in `.env` for instant slash command sync while developing (global sync can take up to an hour to propagate).
+
+## Running tests
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+
+.venv/bin/ruff check .
+.venv/bin/bandit -r src
+.venv/bin/pytest
+```
+
+Integration tests run against a real Postgres database and are skipped automatically unless `TEST_DATABASE_URL` and `TEST_MIGRATOR_DATABASE_URL` are set, pointing at a `catan_test` database.
+
+## Project structure
+
+```
+catan-tracker/
+├── src/catan_bot/
+│   ├── __main__.py     # entry point: python -m catan_bot
+│   ├── bot.py          # CatanBot: pool + cog loading + command sync
+│   ├── config.py       # settings (BotSettings, MigrateSettings)
+│   ├── cogs/           # slash commands (only help_cog.py so far)
+│   ├── db/
+│   │   ├── pool.py         # asyncpg pool factory
+│   │   ├── migrate.py      # versioned migration runner
+│   │   ├── migrations/     # SQL migration files
+│   │   └── repositories/   # all SQL lives here (empty for now)
+│   ├── domain/         # pure business logic (empty for now)
+│   └── views/          # Discord UI components (empty for now)
+├── db/roles.sql, db/init/   # least-privilege role setup
+├── tests/static/            # AST-based SQL injection guard
+├── tests/integration/       # tests against a real Postgres instance
+├── docker-compose.yml
+├── Dockerfile
+└── pyproject.toml
+```
+
+## Deployment
+
+The bot is designed to run 24/7 on a small always-on machine, such as an Oracle Cloud Always Free ARM VM, using `docker compose up -d`. It only makes outbound connections to Discord and the database, so no inbound ports need to be opened. A full deployment guide is planned for a later milestone.

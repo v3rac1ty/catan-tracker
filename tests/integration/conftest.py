@@ -21,20 +21,41 @@ TEST_MIGRATOR_DATABASE_URL = os.environ.get("TEST_MIGRATOR_DATABASE_URL")
 
 integration_env_available = bool(TEST_DATABASE_URL and TEST_MIGRATOR_DATABASE_URL)
 
-# All tables created by 0001_init.sql that hold application data (i.e.
-# everything except the migration-tracking `schema_migrations` table).
-_APP_TABLES = (
-    "guild_config",
-    "players",
-    "seasons",
-    "season_results",
-    "games",
-    "game_participants",
-    "events",
-    "event_rsvps",
-    "event_reminders",
+# Covers every table created by 0001_init.sql that holds application data,
+# i.e. everything except the migration-tracking `schema_migrations` table.
+# Schema-qualified so a `search_path` trick can't redirect the TRUNCATE.
+_TRUNCATE_APP_TABLES_SQL = (
+    "TRUNCATE TABLE public.guild_config, public.players, public.seasons, "
+    "public.season_results, public.games, public.game_participants, "
+    "public.events, public.event_rsvps, public.event_reminders "
+    "RESTART IDENTITY CASCADE"
 )
-_TRUNCATE_APP_TABLES_SQL = f"TRUNCATE TABLE {', '.join(_APP_TABLES)} RESTART IDENTITY CASCADE"  # noqa: S608
+
+# Schema-qualified (pg_catalog) so a same-named function earlier in
+# search_path can never shadow current_database() and fool this guard.
+_SELECT_CURRENT_DATABASE_SQL = "SELECT pg_catalog.current_database()"
+_EXPECTED_TEST_DATABASE_NAME = "catan_test"
+
+
+async def _assert_connected_to_test_database(conn: asyncpg.Connection) -> None:
+    """Last-resort guard: never run destructive/session-wide operations
+    against anything but `catan_test`, even if TEST_DATABASE_URL /
+    TEST_MIGRATOR_DATABASE_URL were misconfigured to point elsewhere."""
+    db_name = await conn.fetchval(_SELECT_CURRENT_DATABASE_SQL)
+    if db_name != _EXPECTED_TEST_DATABASE_NAME:
+        raise RuntimeError(
+            f"Refusing to operate on database {db_name!r}: integration tests must only "
+            f"ever run against {_EXPECTED_TEST_DATABASE_NAME!r}. Check TEST_DATABASE_URL "
+            "and TEST_MIGRATOR_DATABASE_URL."
+        )
+
+
+async def _check_connected_to_test_database(dsn: str) -> None:
+    conn = await asyncpg.connect(dsn)
+    try:
+        await _assert_connected_to_test_database(conn)
+    finally:
+        await conn.close()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -42,6 +63,7 @@ def run_migrations() -> None:
     """Apply migrations to catan_test once per test session."""
     if not integration_env_available:
         return
+    asyncio.run(_check_connected_to_test_database(TEST_MIGRATOR_DATABASE_URL))
     asyncio.run(_run_migrations(TEST_MIGRATOR_DATABASE_URL))
 
 
@@ -60,20 +82,31 @@ async def app_conn() -> AsyncIterator[asyncpg.Connection]:
     """A connection using the least-privilege `catan_app` (runtime) role."""
     conn = await asyncpg.connect(TEST_DATABASE_URL)
     try:
+        # A mispointed TEST_DATABASE_URL must never let a test write rows
+        # into a real database.
+        await _assert_connected_to_test_database(conn)
         yield conn
     finally:
         await conn.close()
 
 
-@pytest.fixture(autouse=True)
-async def _truncate_app_tables_after_test() -> AsyncIterator[None]:
-    """Leave every app table empty after each test, using the migrator role."""
-    if not integration_env_available:
-        yield
-        return
-    yield
+async def _truncate_app_tables() -> None:
     conn = await asyncpg.connect(TEST_MIGRATOR_DATABASE_URL)
     try:
+        await _assert_connected_to_test_database(conn)
         await conn.execute(_TRUNCATE_APP_TABLES_SQL)
     finally:
         await conn.close()
+
+
+@pytest.fixture(autouse=True)
+async def _clean_app_tables() -> AsyncIterator[None]:
+    """Leave every app table empty both before and after each test, using the
+    migrator role, so tests never see leftovers from a previous run/failure.
+    """
+    if not integration_env_available:
+        yield
+        return
+    await _truncate_app_tables()
+    yield
+    await _truncate_app_tables()

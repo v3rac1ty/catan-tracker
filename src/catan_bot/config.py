@@ -18,6 +18,8 @@ class MigrateSettings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        env_ignore_empty=True,
+        hide_input_in_errors=True,
     )
 
     migrator_database_url: SecretStr
@@ -30,6 +32,8 @@ class BotSettings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        env_ignore_empty=True,
+        hide_input_in_errors=True,
     )
 
     discord_token: SecretStr

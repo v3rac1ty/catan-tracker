@@ -32,6 +32,10 @@ class CatanBot(commands.Bot):
             command_prefix=commands.when_mentioned,
             intents=discord.Intents.default(),
             allowed_mentions=discord.AllowedMentions.none(),
+            # Disable the default prefix !help command: it echoes user-
+            # supplied text back into the channel (masked-link spoofing
+            # risk), and this bot is slash-command only.
+            help_command=None,
         )
         self.settings = settings
         self.pool: asyncpg.Pool | None = None

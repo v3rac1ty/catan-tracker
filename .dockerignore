@@ -1,0 +1,7 @@
+# Allowlist: ignore everything by default, then explicitly un-ignore only
+# what the image actually needs to build. This is safer than a denylist,
+# since a denylist silently sends along anything new nobody thought to add.
+*
+!pyproject.toml
+!src/
+**/__pycache__
