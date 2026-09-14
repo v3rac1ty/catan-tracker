@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "catan-bot"
+version = "0.1.0"
+description = "Discord bot that tracks Catan wins/losses, ranks players, and runs game-night events."
+requires-python = ">=3.12"
+dependencies = [
+  "discord.py>=2.7,<3",
+  "asyncpg>=0.31,<0.32",
+  "pydantic-settings>=2.15,<3",
+  "tzdata",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9",
+  "pytest-asyncio>=1.4",
+  "pytest-cov",
+  "ruff>=0.16",
+  "bandit>=1.9",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+catan_bot = ["db/migrations/*.sql"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "integration: tests that require a running Postgres instance (TEST_DATABASE_URL)",
+]
