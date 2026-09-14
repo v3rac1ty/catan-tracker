@@ -21,6 +21,7 @@ dev = [
   "pytest-cov",
   "ruff>=0.16",
   "bandit>=1.9",
+  "hypothesis>=6",
 ]
 
 [tool.setuptools.packages.find]
