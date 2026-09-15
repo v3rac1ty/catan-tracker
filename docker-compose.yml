@@ -48,6 +48,7 @@ services:
       DATABASE_URL: postgresql://catan_app:${APP_PASSWORD}@db:5432/catan
       DISCORD_TOKEN: ${DISCORD_TOKEN}
       DEV_GUILD_ID: ${DEV_GUILD_ID:-}
+      SYNC_COMMANDS: ${SYNC_COMMANDS:-false}
     depends_on:
       migrate:
         condition: service_completed_successfully

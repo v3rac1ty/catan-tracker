@@ -7,26 +7,23 @@ A Discord bot for a friend group that tracks Catan wins and losses and ranks pla
 Early development, built milestone by milestone.
 
 - [x] Foundation — git/Docker setup, database schema and migrations, bot skeleton, `/help`
-- [ ] Domain logic — dates, ranking, bet resolution, reminders, validation
-- [ ] Repositories + SQL injection tests
-- [ ] Core commands — config, season, game reporting, leaderboard, stats
+- [x] Domain logic — dates, ranking, bet resolution, reminders, validation
+- [x] Repositories, services, and SQL injection tests
+- [x] Core commands — config, season, game reporting, leaderboard, stats
 - [ ] Events + scheduler
 - [ ] CI + deployment docs
 
-## Planned commands
-
-Only `/help` is implemented today. Everything else below is the intended
-command set for later milestones.
+## Commands
 
 | Command | Description | Who | Status |
 |---|---|---|---|
-| `/help` | List available commands | Anyone | Available now |
-| `/config ...` | Set announcement channel, timezone, admin role | Manage Server | Planned |
-| `/season start` / `min-games` / `end-date` / `end` / `cancel` / `info` / `history` | Manage seasons and the win/loss eligibility threshold (default 2) | Admin (`info`/`history`: anyone) | Planned |
-| `/game report winner loser1 [...] [date]` | Report a game; `date` defaults to today | Anyone | Planned |
-| Confirm / Reject buttons | Confirm or reject a reported game | Other participants | Planned |
-| `/game void`, `/game history` | Void a game / view game history | Admin / anyone | Planned |
-| `/leaderboard`, `/stats` | View rankings and player stats | Anyone | Planned |
+| `/help` | List available commands | Anyone | Available |
+| `/config channel` / `timezone` / `admin-role` / `show` | View or change the server configuration | Manage Server | Available |
+| `/season start` / `min-games` / `end-date` / `end` / `cancel` / `info` / `history` | Manage seasons and the win/loss eligibility threshold (default 2) | Admin (`info`/`history`: anyone) | Available |
+| `/game report winner loser1 [...] [date]` | Report a game; `date` defaults to today | Anyone | Available |
+| Confirm / Reject buttons | Confirm or reject a pending report | Other participants; reporter may retract | Available |
+| `/game void`, `/game history` | Void a game / view game history | Admin / anyone | Available |
+| `/leaderboard`, `/stats` | View rankings and player stats | Anyone | Available |
 | `/event create [date] ...`, `/event list`, `/event cancel` | Schedule and manage game nights | Anyone / creator or admin | Planned |
 | RSVP buttons | Going / Maybe / Not going | Anyone | Planned |
 
@@ -69,7 +66,11 @@ Prerequisites: Docker, Python 3.12.
    docker compose up -d bot
    ```
 
-Tip: set `DEV_GUILD_ID` in `.env` for instant slash command sync while developing (global sync can take up to an hour to propagate).
+To publish slash commands after installing or updating the bot, set
+`SYNC_COMMANDS=true` for one startup. Set `DEV_GUILD_ID` as well to sync to a
+development server immediately; a global sync can take up to an hour to
+propagate. After the successful sync, set `SYNC_COMMANDS=false` again for
+normal restarts.
 
 ## Running tests
 
@@ -92,14 +93,15 @@ catan-tracker/
 │   ├── __main__.py     # entry point: python -m catan_bot
 │   ├── bot.py          # CatanBot: pool + cog loading + command sync
 │   ├── config.py       # settings (BotSettings, MigrateSettings)
-│   ├── cogs/           # slash commands (only help_cog.py so far)
+│   ├── cogs/           # config, season, game, stats, and help commands
 │   ├── db/
 │   │   ├── pool.py         # asyncpg pool factory
 │   │   ├── migrate.py      # versioned migration runner
 │   │   ├── migrations/     # SQL migration files
-│   │   └── repositories/   # all SQL lives here (empty for now)
-│   ├── domain/         # pure business logic (empty for now)
-│   └── views/          # Discord UI components (empty for now)
+│   │   └── repositories/   # all application SQL lives here
+│   ├── domain/         # pure dates, validation, ranking, bet, and reminder logic
+│   ├── services/       # transactions and application workflows
+│   └── views/          # persistent game confirmation buttons
 ├── db/roles.sql, db/init/   # least-privilege role setup
 ├── tests/static/            # AST-based SQL injection guard
 ├── tests/integration/       # tests against a real Postgres instance

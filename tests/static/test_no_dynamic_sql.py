@@ -495,6 +495,346 @@ def test_normal_english_fstring_is_not_flagged(expr: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pre-M4 hardening (DESIGN.md "Guard backlog"): a large English negative
+# corpus, so the retuned build-time SQL-shape patterns (layer 3) don't
+# false-positive on ordinary Discord bot copy. Every sample is a full,
+# self-contained module (like `_BAD_SINGLE_FILE` above) rather than a
+# shared wrapper, since the strings need different free variables and
+# construction forms (f-string / .format / '+' / '%', "where natural" --
+# most of these have a natural interpolation slot; a few don't, and are
+# built with `.format()` or `+` purely to exercise the checker's code
+# paths on plain English text).
+# ---------------------------------------------------------------------------
+
+_SQL_SHAPE_NEGATIVE = [
+    # --- The 9 audit false-positive examples (DESIGN.md Guard backlog). ---
+    pytest.param(
+        'def build(user):\n    return f"{user} is returning to the table"\n',
+        id="audit-01-returning-to-the-table",
+    ),
+    pytest.param(
+        'def build():\n    return "Ranked by win rate, then order by games played"\n',
+        id="audit-02-ranked-by-win-rate-order-by",
+    ),
+    pytest.param(
+        'def build(title):\n    return f"Delete from your calendar: {title}"\n',
+        id="audit-03-delete-from-your-calendar",
+    ),
+    pytest.param(
+        'def build(a, b):\n    return f"Values ({a}, {b})"\n', id="audit-04-values-paren-titlecase"
+    ),
+    pytest.param(
+        'def build(x):\n    return f"Copy the link to {x} from the event"\n',
+        id="audit-05-copy-the-link-to-from-the-event",
+    ),
+    pytest.param(
+        'def build():\n    return "Group by table, " + "then order the snacks"\n',
+        id="audit-06-group-by-table-order-the-snacks",
+    ),
+    pytest.param(
+        'def build():\n    return "Drop table tennis night? React below".format()\n',
+        id="audit-07-drop-table-tennis-night",
+    ),
+    pytest.param(
+        'def build():\n    return "Truncate the description if it is too long".format()\n',
+        id="audit-08-truncate-the-description",
+    ),
+    pytest.param(
+        'def build(user):\n    return f"Grant {user} admin on the server? (yes/no)"\n',
+        id="audit-09-grant-admin-on-the-server",
+    ),
+    # --- Help text. ---
+    pytest.param(
+        'def build():\n    return "Use /season start to begin a season from today"\n',
+        id="help-01-season-start-from-today",
+    ),
+    pytest.param(
+        'def build():\n    return "Select a winner from the list"\n',
+        id="help-02-select-a-winner-from-the-list",
+    ),
+    pytest.param(
+        'def build(date):\n    return f"Update: the season ends on {date}"\n',
+        id="help-03-update-season-ends-on",
+    ),
+    pytest.param(
+        'def build():\n    return "Set the timezone with /config timezone"\n',
+        id="help-04-set-the-timezone-with-config",
+    ),
+    pytest.param(
+        'def build(location):\n    return f"Where is game night? {location}"\n',
+        id="help-05-where-is-game-night",
+    ),
+    # --- Error messages. ---
+    pytest.param(
+        "def build():\n"
+        '    return "That game has already been confirmed, rejected, or voided.".format()\n',
+        id="error-01-already-confirmed-rejected-voided",
+    ),
+    pytest.param(
+        'def build():\n    return "Only the event\'s creator " + "or an admin can cancel it."\n',
+        id="error-02-creator-or-admin-can-cancel",
+    ),
+    # --- Embed titles / leaderboard lines. ---
+    pytest.param(
+        "def build(rank, name, wins, losses, rate):\n"
+        '    return f"#{rank} {name} — {wins}W/{losses}L ({rate}%)"\n',
+        id="embed-01-rank-name-wins-losses-rate",
+    ),
+    pytest.param('def build():\n    return "Insert coin to continue"\n', id="embed-02-insert-coin"),
+    pytest.param(
+        'def build(date, place):\n    return f"Join us on {date} at {place}"\n',
+        id="embed-03-join-us-on-at",
+    ),
+    pytest.param(
+        'def build():\n    return "Create a season with /season start"\n',
+        id="embed-04-create-a-season-with",
+    ),
+    pytest.param(
+        'def build(start, end):\n    return f"From {start} to {end}"\n', id="embed-05-from-to"
+    ),
+    pytest.param(
+        'def build(names):\n    return f"Order of play: {names}"\n', id="embed-06-order-of-play"
+    ),
+    pytest.param(
+        'def build(n):\n    return f"Limit reached: {n} games"\n', id="embed-07-limit-reached"
+    ),
+    # --- Event descriptions. ---
+    pytest.param(
+        'def build():\n    return "Bring snacks; we start at 7"\n', id="event-01-bring-snacks"
+    ),
+    # --- Catan flavour. ---
+    pytest.param(
+        'def build(a, b):\n    return "Robber moved from %s to %s" % (a, b)\n',
+        id="catan-01-robber-moved-from-to-percent-form",
+    ),
+    pytest.param(
+        'def build():\n    return "Trade 2 wood for 1 ore"\n', id="catan-02-trade-wood-for-ore"
+    ),
+    # --- Extra realistic Discord bot strings, to comfortably clear the "at
+    # least ~25" bar with headroom and exercise more constructions/forms. ---
+    pytest.param(
+        "def build(name):\n    return f\"Season '{name}' has ended. Congrats to the winners!\"\n",
+        id="extra-01-season-has-ended",
+    ),
+    pytest.param(
+        'def build():\n    return "You must be an admin to run this command."\n',
+        id="extra-02-must-be-an-admin",
+    ),
+    pytest.param(
+        'def build():\n    return "React with your choice below."\n',
+        id="extra-03-react-with-your-choice",
+    ),
+    pytest.param(
+        'def build(admin):\n    return f"The game has been voided by {admin}."\n',
+        id="extra-04-voided-by-admin",
+    ),
+    pytest.param(
+        'def build(name):\n    return f"{name} confirmed the game."\n',
+        id="extra-05-confirmed-the-game",
+    ),
+    pytest.param(
+        'def build():\n    return "No active season right now. Start one with /season start."\n',
+        id="extra-06-no-active-season-right-now",
+    ),
+    pytest.param(
+        'def build(title):\n    return "Reminder: %s starts in 1 hour!" % title\n',
+        id="extra-07-reminder-starts-in-1-hour-percent-form",
+    ),
+    pytest.param(
+        'def build(user, status):\n    return f"RSVP updated: {user} is now {status}."\n',
+        id="extra-08-rsvp-updated",
+    ),
+    pytest.param(
+        'def build(season):\n    return f"Leaderboard for {season}"\n',
+        id="extra-09-leaderboard-for-season",
+    ),
+    pytest.param(
+        "def build(member, wins, losses):\n"
+        '    return f"Stats for {member}: {wins} wins, {losses} losses"\n',
+        id="extra-10-stats-for-member",
+    ),
+    pytest.param(
+        'def build(title):\n    return f"Cancelled: {title}"\n', id="extra-11-cancelled-title"
+    ),
+    pytest.param(
+        "def build():\n"
+        '    return "This command can only be used by the event creator or an admin."\n',
+        id="extra-12-command-only-creator-or-admin",
+    ),
+    pytest.param(
+        'def build():\n    return "Please select a valid member."\n',
+        id="extra-13-please-select-a-valid-member",
+    ),
+    pytest.param(
+        "def build(minutes):\n"
+        "    return (\n"
+        '        "The cooldown period has not elapsed yet. "\n'
+        '        f"Try again in {minutes} minutes."\n'
+        "    )\n",
+        id="extra-14-cooldown-not-elapsed",
+    ),
+    pytest.param(
+        'def build(channel):\n    return f"Config updated: channel set to {channel}"\n',
+        id="extra-15-config-updated-channel",
+    ),
+    pytest.param(
+        "def build(date, min_games):\n"
+        '    return f"Season ends on {date}, min games required: {min_games}"\n',
+        id="extra-16-season-ends-on-min-games",
+    ),
+    pytest.param(
+        'def build(member, n):\n    return f"History for {member} (last {n} games)"\n',
+        id="extra-17-history-for-member",
+    ),
+    pytest.param(
+        'def build(tz):\n    return "Set the timezone to {}".format(tz)\n',
+        id="extra-18-set-the-timezone-to-format",
+    ),
+    pytest.param(
+        'def build(names):\n    return "Order of play: " + names\n',
+        id="extra-19-order-of-play-plus-form",
+    ),
+]
+
+
+@pytest.mark.parametrize("source", _SQL_SHAPE_NEGATIVE)
+def test_sql_shape_negative_corpus_is_not_flagged(source: str) -> None:
+    assert find_violations_in_source(source, COG_PATH) == []
+
+
+# ---------------------------------------------------------------------------
+# Pre-M4 hardening: a positive corpus of real SQL construction forms that
+# must stay flagged after the layer-3 patterns were retuned for precision
+# on English. Each targets a different clause/keyword/construction shape
+# from DESIGN.md's Guard backlog.
+# ---------------------------------------------------------------------------
+
+_SQL_SHAPE_POSITIVE = [
+    pytest.param(
+        'def build(pid):\n    return f"SELECT * FROM players WHERE id = {pid}"\n',
+        id="pos-01-fstring-select-from-where",
+    ),
+    pytest.param(
+        "def build(pid, name):\n"
+        '    return f"INSERT INTO players (id, name) VALUES ({pid}, {name})"\n',
+        id="pos-02-fstring-insert-into-values",
+    ),
+    pytest.param(
+        "def build(name, pid):\n"
+        "    return f\"UPDATE players SET name = '{name}' WHERE id = {pid}\"\n",
+        id="pos-03-fstring-update-set-where",
+    ),
+    pytest.param(
+        'def build(pid):\n    return f"DELETE FROM players WHERE id = {pid}"\n',
+        id="pos-04-fstring-delete-from-where",
+    ),
+    pytest.param(
+        'def build(col):\n    return f"ORDER BY {col}"\n', id="pos-05-order-by-placeholder"
+    ),
+    pytest.param(
+        'def build(col):\n    return f"GROUP BY {col}"\n', id="pos-06-group-by-placeholder"
+    ),
+    pytest.param('def build(n):\n    return f"LIMIT {n}"\n', id="pos-07-limit-placeholder"),
+    pytest.param('def build(n):\n    return f"OFFSET {n}"\n', id="pos-08-offset-placeholder"),
+    pytest.param(
+        'def build(col):\n    return f"RETURNING {col}"\n', id="pos-09-returning-placeholder"
+    ),
+    pytest.param('def build(t):\n    return f"TRUNCATE {t}"\n', id="pos-10-truncate-placeholder"),
+    pytest.param(
+        'def build(a, b):\n    return f"VALUES ({a}, {b})"\n', id="pos-11-values-placeholder"
+    ),
+    pytest.param(
+        "def build(i):\n"
+        "    return (\n"
+        '        f"SELECT * FROM t WHERE id={i} "\n'
+        '        "UNION SELECT username, password FROM users"\n'
+        "    )\n",
+        id="pos-12-union-select-injection-shape",
+    ),
+    pytest.param(
+        'def build():\n    return f"SELECT a FROM x UNION ALL SELECT b FROM y"\n',
+        id="pos-13-union-all-select",
+    ),
+    pytest.param(
+        'def build(gid, t):\n    return f"SELECT * FROM games WHERE id = {gid}; DROP TABLE {t}"\n',
+        id="pos-14-stacked-drop-table",
+    ),
+    pytest.param(
+        'def build(cols):\n    return "SELECT " + cols + " FROM t"\n',
+        id="pos-15-dynamic-column-list-plus",
+    ),
+    pytest.param(
+        'def build(c, t):\n    return " ".join(["SELECT", c, "FROM", t])\n',
+        id="pos-16-dynamic-column-list-join",
+    ),
+    pytest.param(
+        "def build(name):\n    return \"SELECT * FROM players WHERE name = '%s'\" % name\n",
+        id="pos-17-percent-form",
+    ),
+    pytest.param(
+        "import string\n\n\n"
+        "def build(n):\n"
+        "    tmpl = string.Template(\"SELECT * FROM players WHERE name = '$n'\")\n"
+        "    return tmpl.substitute(n=n)\n",
+        id="pos-18-string-template-form",
+    ),
+    pytest.param(
+        'def build(t, i):\n    return f"select * from {t} where id = {i}"\n',
+        id="pos-19-lowercase-full-sql-still-flagged",
+    ),
+    pytest.param(
+        'def build():\n    return f"select a from x union select b from y"\n',
+        id="pos-20-lowercase-union-select",
+    ),
+    pytest.param(
+        'def build(t):\n    return f"DROP TABLE IF EXISTS {t}"\n',
+        id="pos-21-drop-table-if-exists-placeholder",
+    ),
+    pytest.param(
+        'def build(t):\n    return f"CREATE TABLE {t} (id serial)"\n',
+        id="pos-22-create-table-placeholder-paren",
+    ),
+    pytest.param(
+        'def build(t):\n    return "ALTER TABLE " + t\n',
+        id="pos-23-alter-table-plus-dynamic-tail",
+    ),
+    pytest.param(
+        'def build(role):\n    return f"DROP ROLE {role}"\n', id="pos-24-drop-role-placeholder"
+    ),
+    pytest.param(
+        "def build(pid):\n"
+        '    return f"INSERT INTO archive SELECT * FROM players WHERE id = {pid}"\n',
+        id="pos-25-insert-into-select-form",
+    ),
+    pytest.param(
+        'def build(pid):\n    return "SELECT * FROM players WHERE id = {}".format(pid)\n',
+        id="pos-26-format-select-from-where",
+    ),
+    pytest.param(
+        'def build(col):\n    return "ORDER BY {}".format(col)\n',
+        id="pos-27-format-order-by-placeholder",
+    ),
+    pytest.param(
+        'def build(t):\n    return str.__add__("DROP TABLE ", t)\n',
+        id="pos-28-dunder-add-drop-table",
+    ),
+    pytest.param(
+        'def build(col):\n    return "RETURNING " + col\n',
+        id="pos-29-plus-returning-dynamic-tail",
+    ),
+    pytest.param(
+        'def build(extra):\n    return f"SELECT id, {extra} FROM t"\n',
+        id="pos-30-partially-dynamic-column-list",
+    ),
+]
+
+
+@pytest.mark.parametrize("source", _SQL_SHAPE_POSITIVE)
+def test_sql_shape_positive_corpus_is_flagged(source: str) -> None:
+    assert find_violations_in_source(source, COG_PATH) != []
+
+
+# ---------------------------------------------------------------------------
 # Good samples: sound constants in the right place must stay clean.
 # ---------------------------------------------------------------------------
 
@@ -636,3 +976,142 @@ def test_sql_call_outside_repositories_is_flagged() -> None:
     )
     violations = find_violations_in_source(source, "catan_bot/bot.py")
     assert any("only allowed in" in v.message for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# Task 2 (DESIGN.md Guard backlog, Low items): close the remaining
+# sink-reachability bypasses. Each is flagged anywhere in src/, not just in
+# repositories/migrate.py -- these are all ways to reach an attribute or a
+# module by something other than a static, literal name, so the location
+# rule (rule 5) doesn't apply to them the way it does to sink calls.
+# ---------------------------------------------------------------------------
+
+_TASK2_BYPASS_SAMPLES = [
+    pytest.param(
+        'import sys\n\n\ndef f(x):\n    setattr(sys.modules[__name__], "Q", x)\n',
+        id="t2-01-setattr-onto-sys-modules-subscript",
+    ),
+    pytest.param(
+        'import os\n\n\ndef f(x):\n    setattr(os, "environ", x)\n',
+        id="t2-02-setattr-onto-imported-module",
+    ),
+    pytest.param(
+        "import sys\n\n\ndef f(x):\n    sys.modules[__name__].Q = x\n",
+        id="t2-03-attribute-store-on-sys-modules-subscript",
+    ),
+    pytest.param(
+        'def f(conn):\n    return conn.__dict__["execute"]\n',
+        id="t2-04-dunder-dict-subscript-sink-name",
+    ),
+    pytest.param(
+        "def f(conn, key):\n    return conn.__dict__[key]\n",
+        id="t2-05-dunder-dict-subscript-non-literal-key",
+    ),
+    pytest.param(
+        'import inspect\n\n\ndef f(conn):\n    return inspect.getattr_static(conn, "execute")\n',
+        id="t2-06a-inspect-getattr-static",
+    ),
+    pytest.param(
+        "from inspect import getattr_static\n\n\ndef f(conn):\n"
+        '    return getattr_static(conn, "execute")\n',
+        id="t2-06b-getattr-static-imported-bare",
+    ),
+    pytest.param(
+        "from inspect import getattr_static as gs\n\n\ndef f(conn, q):\n"
+        "    fn = gs(conn, 'fetch')\n    return fn(q)\n",
+        id="t2-06c-aliased-inspect-getattr-static",
+    ),
+    pytest.param(
+        "from inspect import getattr_static as gs\n\n\ndef f(conn, q):\n"
+        "    fn = gs\n    return fn(conn, 'fetch')(q)\n",
+        id="t2-06d-aliased-inspect-getattr-static-as-value",
+    ),
+    pytest.param(
+        'def f(conn):\n    return conn.__getattribute__("execute")\n',
+        id="t2-07-dunder-getattribute-call-on-sink-name",
+    ),
+    pytest.param(
+        "def f(conn):\n    return conn._protocol\n", id="t2-08-underscore-protocol-attribute"
+    ),
+    pytest.param(
+        'import sys as s\n\n\ndef f(fn):\n    setattr(s.modules["x"], "execute", fn)\n',
+        id="t2-08a-aliased-sys-modules-setattr",
+    ),
+    pytest.param(
+        'import sys as s\n\n\ndef f(fn):\n    s.modules["x"].fetch = fn\n',
+        id="t2-08b-aliased-sys-modules-attribute-store",
+    ),
+    pytest.param(
+        "from sys import modules as registry\n\n\ndef f(fn):\n"
+        '    setattr(registry["x"], "execute", fn)\n',
+        id="t2-08c-direct-sys-modules-setattr",
+    ),
+    pytest.param(
+        'from sys import modules as registry\n\n\ndef f(fn):\n    registry["x"].fetch = fn\n',
+        id="t2-08d-direct-sys-modules-attribute-store",
+    ),
+    pytest.param("from os import *\n", id="t2-09-star-import"),
+    pytest.param(
+        'from importlib import import_module as im\n\n\ndef f():\n    return im("os")\n',
+        id="t2-10-import-module-aliased-plus-call",
+    ),
+    pytest.param(
+        'import builtins\n\n\ndef f():\n    return builtins.__import__("os")\n',
+        id="t2-11-builtins-import-and-dunder-import-attr",
+    ),
+    pytest.param(
+        'from builtins import __import__ as imp\n\n\ndef f():\n    return imp("asyncpg")\n',
+        id="t2-11a-aliased-builtins-dunder-import",
+    ),
+    pytest.param(
+        "import importlib as il\n\n\ndef f():\n"
+        '    fn = il.import_module\n    return fn("asyncpg")\n',
+        id="t2-11b-aliased-importlib-import-module-as-value",
+    ),
+    pytest.param(
+        'def f():\n    return __builtins__["open"]\n', id="t2-12-dunder-builtins-subscript"
+    ),
+    pytest.param("def f():\n    return __builtins__.open\n", id="t2-13-dunder-builtins-attribute"),
+    pytest.param(
+        "def f(conn):\n    run = conn.__getattribute__\n    return run\n",
+        id="t2-14-dunder-getattribute-referenced-as-value",
+    ),
+    # `conn.__getattribute__` (the task's own bullet) is the call/reference
+    # forms above with `conn` as the receiver -- both are already covered.
+]
+
+
+@pytest.mark.parametrize("source", _TASK2_BYPASS_SAMPLES)
+def test_task2_bypass_sample_is_flagged(source: str) -> None:
+    violations = find_violations_in_source(source, COG_PATH)
+    assert violations, f"expected a violation for:\n{source}"
+
+
+# ---------------------------------------------------------------------------
+# Task 2: make sure the new checks don't over-flag ordinary code shapes that
+# merely resemble the bypasses above.
+# ---------------------------------------------------------------------------
+
+_TASK2_GOOD_SAMPLES = [
+    pytest.param(
+        'def f(self, val):\n    setattr(self, "x", val)\n',
+        id="t2-good-01-setattr-onto-self-is-not-a-module",
+    ),
+    pytest.param(
+        'def f(obj):\n    return obj.__dict__["some_field"]\n',
+        id="t2-good-02-dict-subscript-literal-non-sink-name",
+    ),
+    pytest.param(
+        "from typing import Optional\n\n\ndef f(x):\n    return x if x else None\n",
+        id="t2-good-03-plain-star-free-import",
+    ),
+    pytest.param(
+        'def f(obj):\n    return getattr(obj, "name", None)\n',
+        id="t2-good-04-plain-getattr-with-literal-non-sink-name",
+    ),
+]
+
+
+@pytest.mark.parametrize("source", _TASK2_GOOD_SAMPLES)
+def test_task2_good_sample_stays_clean(source: str) -> None:
+    assert find_violations_in_source(source, COG_PATH) == []

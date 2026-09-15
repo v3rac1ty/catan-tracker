@@ -21,14 +21,72 @@ module's source text. Three independent layers, each meant to fail *closed*
    migration file.
 2. **Indirect references** to a sink (aliasing `conn.execute`, reaching it
    via `getattr`/`operator.methodcaller`/`operator.attrgetter`, or via
-   `__import__`/`importlib.import_module`) are flagged everywhere, since
-   they can't be argument-checked statically.
+   `__import__`/`importlib.import_module` under its own name *or* any
+   alias) are flagged everywhere, since they can't be argument-checked
+   statically. This layer also bans every other way Python lets code reach
+   an attribute or a module without a literal, static name that
+   `_check_sink_call`'s soundness check could inspect: `setattr()` onto a
+   module object or `sys.modules[...]`, a direct attribute *store* on
+   `sys.modules[...]`, `obj.__dict__[...]` keyed by a sink name or a
+   non-literal key, `inspect.getattr_static(...)`, `obj.__getattribute__`
+   (called or merely referenced), `._protocol` access (asyncpg's internal
+   wire protocol -- one hop from every private sink this file knows about),
+   `from x import *`, `builtins.__import__` / `import builtins`, and
+   `__builtins__` access in any form (`__builtins__["open"]` or
+   `__builtins__.open`). None of these have a legitimate use in this
+   project's discord.py/asyncpg application code, so they're banned
+   outright, anywhere in `src/`, with no attempt to scope them to a
+   "risky" receiver -- see the comment on the `SQL_METHOD_NAMES`-as-value
+   check below for why that's true even for the pre-existing alias rule.
 3. **Build-time detection**: anywhere in the tree, string construction
    (f-string, `.format()`, `%`, `+`, `str.join` over a list/tuple literal,
-   `str.__add__`, `string.Template`) whose literal text is SQL-shaped
-   (`SELECT ... FROM`, `WHERE x =`, `DROP TABLE`, ...) is flagged, so a
-   query built outside a repository still gets caught even though it isn't
-   a sink call itself.
+   `str.__add__`, `string.Template`) whose literal text is SQL-*shaped* is
+   flagged, so a query built outside a repository still gets caught even
+   though it isn't a sink call itself.
+
+   This layer is a **heuristic tuned for precision on ordinary English**,
+   not recall on every conceivable SQL fragment -- Discord cog copy is full
+   of words like "select", "order", "table", "delete", "drop", "truncate",
+   "grant", and "values" used in their normal English sense, and an earlier
+   version of this layer flagged all of them. The patterns below instead
+   require actual SQL *structure*: two-or-more clause keywords in valid SQL
+   order with SQL-ish tokens between them (`SELECT ... FROM`, `UPDATE t SET
+   x =`, `DELETE FROM t WHERE`, ...), or a single clause keyword written in
+   UPPERCASE sitting directly against an interpolation placeholder (an
+   f-string's `{}`, a `.format()`/`%``-style token, or the empty seam left
+   behind when a `+`/`.join()` concatenation's dynamic operand resolves to
+   `""` -- see `_literal_text`). Requiring the keyword's *case* to match SQL
+   convention is deliberate: real SQL text is written `ORDER BY`/`LIMIT`/
+   `TRUNCATE`, while the equivalent English words in bot copy are lowercase
+   or Title Case ("Order of play", "Limit reached", "Truncate the
+   description"), so this one cheap signal resolves an otherwise-genuine
+   ambiguity for free.
+
+   **This means layer 3 can miss a contrived shape** -- e.g. a column list
+   built by concatenation with literal text surviving on *both* sides of
+   the dynamic part (`"SELECT " + cols + " FROM t"` is still caught,
+   because the dynamic part vanishes entirely and leaves "SELECT" touching
+   "FROM" with nothing between; a column list that's only *partially*
+   dynamic, like `f"SELECT id, {extra} FROM t"`, is caught too, because the
+   placeholder is accepted as a column token -- but not every partial shape
+   is guaranteed to be). **That asymmetry is intentional and safe**: layers
+   1 and 2 above are the real, structural control -- they gate every actual
+   sink call at the argument level and never rely on pattern-matching text.
+   Layer 3 exists only to catch SQL text assembled *outside* of a sink call
+   (see rule 1), as defense in depth; a miss here can never let untrusted
+   input reach the database, because rule 1 still gates the call itself.
+   Given that trade-off, this file deliberately chases down false positives
+   on English aggressively and does not chase every possible false
+   negative in hand-built SQL fragments -- and per the project's rules,
+   there is no `noqa` escape hatch to paper over either direction.
+
+   `GRANT`/`REVOKE ... ON` and `COPY ... TO/FROM` were dropped from this
+   layer entirely (they used to be bare-keyword patterns): they matched
+   ordinary sentences like "Grant {user} admin on the server?" and "Copy
+   the link to {x} from the event" far more often than real SQL, no
+   required test exercises them, and any real dynamic GRANT/COPY reaching
+   an actual sink call is still caught by layer 1 (the argument to that
+   call would never be a sound constant).
 """
 
 from __future__ import annotations
@@ -61,6 +119,7 @@ from ast import (
     Name,
     Nonlocal,
     Store,
+    Subscript,
     Tuple,
     arguments,
     iter_child_nodes,
@@ -153,36 +212,77 @@ class ScanResult:
 # SQL-shaped text patterns (build-time detection, rule 7)
 # --------------------------------------------------------------------------
 
+# --- Multi-clause SQL: two-or-more real clause keywords in valid SQL order,
+# with SQL-ish tokens (identifiers, '*', placeholders) between them. These
+# are case-INSENSITIVE: real SQL is still SQL in lowercase, and none of
+# these shapes occur in ordinary English by accident (they all require a
+# specific keyword *pair* in a specific order, not just one keyword).
+
+# The column list accepts a placeholder token ('{}' from an f-string's
+# FormattedValue, or a literal '%s') as well as real identifiers, so a
+# partially-dynamic column list (`f"SELECT id, {extra} FROM t"`) is still
+# caught, not just a fully-static or fully-empty one.
 _SELECT_FROM_RE = re.compile(
-    r"\bSELECT\s+(?:\*|(?:DISTINCT\s+)?[\w.*()]+(?:\s*,\s*[\w.*()]+)*)\s+FROM\b",
+    r"\bSELECT\s+(?:\*|(?:DISTINCT\s+)?(?:[\w.*()]+|\{\}|%s)"
+    r"(?:\s*,\s*(?:[\w.*()]+|\{\}|%s))*)\s+FROM\b",
     re.IGNORECASE,
 )
-_INSERT_INTO_RE = re.compile(r"\bINSERT\s+INTO\b", re.IGNORECASE)
-_UPDATE_SET_RE = re.compile(r"\bUPDATE\s+[A-Za-z_][\w.]*\s+SET\b", re.IGNORECASE)
-_DELETE_FROM_RE = re.compile(r"\bDELETE\s+FROM\b", re.IGNORECASE)
-_DDL_OBJECT_RE = re.compile(
-    r"\b(?:DROP|TRUNCATE|ALTER|CREATE)\s+"
-    r"(?:TABLE|ROLE|DATABASE|SCHEMA|INDEX|FUNCTION|EXTENSION|VIEW)\b",
-    re.IGNORECASE,
+# A bare 'INSERT INTO' matches ordinary English nowhere near as often as
+# 'SELECT'/'FROM' do, but still require the shape to continue toward
+# VALUES/SELECT so a stray "insert into" phrase can't match alone.
+_INSERT_INTO_RE = re.compile(
+    r"\bINSERT\s+INTO\s+[A-Za-z_][\w.]*\b.{0,120}?\b(?:VALUES|SELECT)\b",
+    re.IGNORECASE | re.DOTALL,
 )
-_BARE_TRUNCATE_RE = re.compile(r"\bTRUNCATE\b", re.IGNORECASE)
-_ORDER_GROUP_BY_RE = re.compile(r"\b(?:ORDER|GROUP)\s+BY\b", re.IGNORECASE)
+_UPDATE_SET_RE = re.compile(
+    r"\bUPDATE\s+[A-Za-z_][\w.]*\s+SET\s+[A-Za-z_][\w.]*\s*=", re.IGNORECASE
+)
+# Anchored so an English continuation ("Delete from your calendar: ...")
+# can't qualify: the identifier right after FROM must be followed
+# *immediately* (only whitespace between) by WHERE/RETURNING/';'/end-of-
+# string -- real SQL, not a sentence that happens to keep going.
+_DELETE_FROM_RE = re.compile(
+    r"\bDELETE\s+FROM\s+[A-Za-z_][\w.]*\s*(?:WHERE\b|RETURNING\b|;|$)", re.IGNORECASE
+)
 _UNION_SELECT_RE = re.compile(r"\bUNION\b(?:\s+ALL)?\s+SELECT\b", re.IGNORECASE)
 _WHERE_COND_RE = re.compile(
     r"\bWHERE\s+[A-Za-z_][\w.]*\s*(?:=|<|>|\bIN\b|\bIS\b|\bLIKE\b|\bBETWEEN\b)",
     re.IGNORECASE,
 )
-_LIMIT_OFFSET_RE = re.compile(r"\b(?:LIMIT|OFFSET)\s*(?:\{\}|\d|\$)", re.IGNORECASE)
-_VALUES_PAREN_RE = re.compile(r"\bVALUES\s*\(", re.IGNORECASE)
-_RETURNING_RE = re.compile(r"\bRETURNING\b", re.IGNORECASE)
-_COPY_TO_FROM_RE = re.compile(r"\bCOPY\b.{0,60}?\b(?:TO|FROM)\b", re.IGNORECASE | re.DOTALL)
-_GRANT_REVOKE_ON_RE = re.compile(r"\b(?:GRANT|REVOKE)\b.{0,60}?\bON\b", re.IGNORECASE | re.DOTALL)
-# Require an '=' shortly after JOIN ... ON, since "join us on <day>" is
-# ordinary English but a real join condition almost always compares columns.
-_JOIN_ON_RE = re.compile(
-    r"\bJOIN\s+[A-Za-z_][\w.]*(?:\s+[A-Za-z_]\w*)?\s+ON\b.{0,60}?=",
-    re.IGNORECASE | re.DOTALL,
+# CREATE|ALTER|DROP <object> [IF (NOT)? EXISTS] <ident>?, anchored the same
+# way as DELETE FROM: whatever follows the (optional) identifier must
+# immediately be '(', ';', 'IF EXISTS', 'CASCADE', a placeholder, or
+# end-of-string. "Drop table tennis night? React below" fails here because
+# real words ("night? React...") follow the identifier instead.
+_DDL_OBJECT_RE = re.compile(
+    r"\b(?:CREATE|ALTER|DROP)\s+(?:TABLE|ROLE|DATABASE|SCHEMA|INDEX|FUNCTION|EXTENSION|VIEW)\b"
+    r"\s*(?:IF\s+(?:NOT\s+)?EXISTS\b\s*)?"
+    r"(?:[A-Za-z_][\w.]*\s*)?"
+    r"(?:\(|;|IF\s+EXISTS\b|CASCADE\b|\{\}|%s|$)",
+    re.IGNORECASE,
 )
+
+# --- Single-clause fragment directly touching an interpolation placeholder.
+# Deliberately case-SENSITIVE (no re.IGNORECASE): real SQL text is written
+# in these exact keyword forms by convention, while the same words in
+# ordinary bot copy show up lowercase or Title-Case ("Truncate the
+# description", "Values ({a}, {b})", "Limit reached"). Matching only the
+# literal uppercase spelling is a free, cheap way to tell them apart -- it
+# costs nothing on real SQL (which is written this way anyway) and rules
+# out prose without needing a second signal.
+_CLAUSE_KEYWORD_RE = r"(?:ORDER\s+BY|GROUP\s+BY|LIMIT|OFFSET|RETURNING|TRUNCATE|VALUES)"
+_PLACEHOLDER_RE = r"(?:\{\}|%s)"
+_SINGLE_CLAUSE_PLACEHOLDER_RE = re.compile(
+    rf"\b{_CLAUSE_KEYWORD_RE}\b\s*\(?\s*(?:{_PLACEHOLDER_RE}|$)"
+)
+
+# --- Dynamic column list: SELECT ... FROM with *nothing but* whitespace
+# and/or placeholders between them -- the shape left behind when
+# `"SELECT " + cols + " FROM t"` or `" ".join(["SELECT", c, "FROM", t])`
+# collapses its dynamic operand to "" (see `_literal_text`). Case-sensitive
+# for the same reason as above; ordinary English never spells out
+# "SELECT ... FROM" fully uppercase with nothing but a placeholder between.
+_DYNAMIC_SELECT_FROM_RE = re.compile(r"\bSELECT\b(?:\s|\{\}|%s)*\bFROM\b")
 
 _SQL_SHAPE_PATTERNS: tuple[re.Pattern[str], ...] = (
     _SELECT_FROM_RE,
@@ -190,16 +290,10 @@ _SQL_SHAPE_PATTERNS: tuple[re.Pattern[str], ...] = (
     _UPDATE_SET_RE,
     _DELETE_FROM_RE,
     _DDL_OBJECT_RE,
-    _BARE_TRUNCATE_RE,
-    _ORDER_GROUP_BY_RE,
     _UNION_SELECT_RE,
     _WHERE_COND_RE,
-    _LIMIT_OFFSET_RE,
-    _VALUES_PAREN_RE,
-    _RETURNING_RE,
-    _COPY_TO_FROM_RE,
-    _GRANT_REVOKE_ON_RE,
-    _JOIN_ON_RE,
+    _SINGLE_CLAUSE_PLACEHOLDER_RE,
+    _DYNAMIC_SELECT_FROM_RE,
 )
 
 
@@ -490,6 +584,21 @@ def _dynamic_attr_name_message(node: AST, via: str) -> str | None:
     return f"{via}() uses a non-literal attribute/method name, which could resolve to a SQL sink"
 
 
+def _is_getattr_static_call(
+    func: AST, inspect_module_aliases: set[str], getattr_static_aliases: set[str]
+) -> bool:
+    if isinstance(func, Name) and func.id == "getattr_static":
+        return True
+    if isinstance(func, Name) and func.id in getattr_static_aliases:
+        return True
+    return (
+        isinstance(func, Attribute)
+        and func.attr == "getattr_static"
+        and isinstance(func.value, Name)
+        and func.value.id in inspect_module_aliases
+    )
+
+
 def _indirect_name_call_message(call: Call) -> str | None:
     func = call.func
     if isinstance(func, Name) and func.id == "getattr":
@@ -506,6 +615,136 @@ def _indirect_name_call_message(call: Call) -> str | None:
             if msg:
                 return msg
     return None
+
+
+# --------------------------------------------------------------------------
+# Sink-reachability backlog (rule 2 continued): every other way Python lets
+# code reach an attribute or a module by something other than a static,
+# literal name. Unlike `getattr`/`operator.methodcaller`/`attrgetter` above,
+# none of these have a legitimate use in this project's discord.py/asyncpg
+# application code, so each is banned outright, anywhere in `src/`, with no
+# attempt to check whether the *particular* call site looks dangerous.
+# --------------------------------------------------------------------------
+
+
+def _module_bound_names(tree: Module) -> set[str]:
+    """Names bound by a plain `import x` / `import y as x` anywhere in the
+    module -- i.e. names that are statically known to refer to a module
+    object. Used by `_is_dangerous_setattr_target`: `setattr()` onto one of
+    these can silently rebind an attribute (including an imported sink
+    alias) on a live module.
+    """
+    names: set[str] = set()
+    for node in walk(tree):
+        if isinstance(node, Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+    return names
+
+
+def _import_module_aliases(tree: Module) -> set[str]:
+    """Local names bound to `importlib.import_module` under an alias other
+    than its own name, e.g. `from importlib import import_module as im`
+    binds `im`. A call through that alias (`im("os")`) is exactly as
+    dynamic as calling `import_module` directly, but `_is_dynamic_import_call`
+    only recognizes the literal name -- this is what lets the guard follow
+    the alias too (see DESIGN.md's guard backlog).
+    """
+    names: set[str] = set()
+    for node in walk(tree):
+        if isinstance(node, ImportFrom) and node.module == "importlib":
+            for alias in node.names:
+                if alias.name == "import_module" and alias.asname:
+                    names.add(alias.asname)
+    return names
+
+
+def _inspect_aliases(tree: Module) -> tuple[set[str], set[str]]:
+    """Return local aliases for ``inspect`` and ``getattr_static``.
+
+    Imports are cheap to reject at the boundary, but recognizing aliases here
+    keeps the SQL guard fail-closed even when a caller hides the access behind
+    ``import inspect as i`` or ``from inspect import getattr_static as gs``.
+    """
+    module_names: set[str] = {"inspect"}
+    function_names: set[str] = {"getattr_static"}
+    for node in walk(tree):
+        if isinstance(node, Import):
+            for alias in node.names:
+                if alias.name == "inspect":
+                    module_names.add(alias.asname or "inspect")
+        elif isinstance(node, ImportFrom) and node.module == "inspect":
+            for alias in node.names:
+                if alias.name == "getattr_static":
+                    function_names.add(alias.asname or "getattr_static")
+    return module_names, function_names
+
+
+def _sys_modules_names(tree: Module) -> set[str]:
+    """Names that refer to the live ``sys.modules`` registry.
+
+    Include both module aliases (``import sys as s`` → ``s.modules``) and
+    direct registry imports (``from sys import modules as registry`` →
+    ``registry[...]``).
+    """
+    module_names: set[str] = {"sys"}
+    registry_names: set[str] = set()
+    for node in walk(tree):
+        if isinstance(node, Import):
+            for alias in node.names:
+                if alias.name == "sys":
+                    module_names.add(alias.asname or "sys")
+        elif isinstance(node, ImportFrom) and node.module == "sys":
+            for alias in node.names:
+                if alias.name == "modules":
+                    registry_names.add(alias.asname or "modules")
+    return module_names | registry_names
+
+
+def _is_import_module_alias_call(func: AST, aliases: set[str]) -> bool:
+    return isinstance(func, Name) and func.id in aliases
+
+
+def _is_sys_modules_subscript(node: AST, sys_modules_names: set[str]) -> bool:
+    """`sys.modules[...]` -- the live module registry, keyed by module name.
+
+    Both `setattr(sys.modules[...], ...)` and a direct attribute store
+    (`sys.modules[...].attr = value`) reach the same live object as
+    importing that module normally would.
+    """
+    if not isinstance(node, Subscript):
+        return False
+    if isinstance(node.value, Name):
+        return node.value.id in sys_modules_names
+    return (
+        isinstance(node.value, Attribute)
+        and node.value.attr == "modules"
+        and isinstance(node.value.value, Name)
+        and node.value.value.id in sys_modules_names
+    )
+
+
+def _is_dangerous_setattr_target(
+    node: AST, module_names: set[str], sys_modules_names: set[str]
+) -> bool:
+    if _is_sys_modules_subscript(node, sys_modules_names):
+        return True
+    return isinstance(node, Name) and node.id in module_names
+
+
+def _dict_subscript_violation_message(node: Subscript) -> str | None:
+    """`obj.__dict__[...]` -- flags a literal sink name or any non-literal
+    key. A literal key that isn't a sink name is left alone: plain
+    `obj.__dict__["some_field"]` has no bearing on SQL sinks.
+    """
+    if not (isinstance(node.value, Attribute) and node.value.attr == "__dict__"):
+        return None
+    key = node.slice
+    if isinstance(key, Constant) and isinstance(key.value, str):
+        if key.value in SQL_METHOD_NAMES:
+            return f"__dict__[{key.value!r}] names a SQL sink method indirectly"
+        return None
+    return "__dict__[...] uses a non-literal key, which could resolve to a SQL sink"
 
 
 # --------------------------------------------------------------------------
@@ -698,6 +937,10 @@ def find_violations_in_source(source: str, rel_path: str) -> list[Violation]:
     resolver = _NameResolver(tree, module_consts)
     comment_lines = _comment_marker_lines(source, MIGRATION_EXEC_ALLOWLIST_MARKER)
     allowlisted_ids = _resolve_migration_allowlist(tree, rel_path, comment_lines)
+    module_bound_names = _module_bound_names(tree)
+    import_module_aliases = _import_module_aliases(tree)
+    inspect_module_aliases, getattr_static_aliases = _inspect_aliases(tree)
+    sys_modules_names = _sys_modules_names(tree)
 
     call_func_attr_ids = {
         id(node.func)
@@ -732,6 +975,45 @@ def find_violations_in_source(source: str, rel_path: str) -> list[Violation]:
             indirect_msg = _indirect_name_call_message(node)
             if indirect_msg:
                 violations.append(Violation(rel_path, node.lineno, indirect_msg))
+
+            if _is_getattr_static_call(node.func, inspect_module_aliases, getattr_static_aliases):
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        "inspect.getattr_static() is not allowed anywhere in src/ -- it "
+                        "reads any attribute, including a SQL sink, bypassing the normal "
+                        "attribute-access machinery this guard can otherwise see through",
+                    )
+                )
+
+            if _is_import_module_alias_call(node.func, import_module_aliases):
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        "dynamic import via an aliased importlib.import_module() is not "
+                        "allowed anywhere in src/",
+                    )
+                )
+
+            if (
+                isinstance(node.func, Name)
+                and node.func.id == "setattr"
+                and node.args
+                and _is_dangerous_setattr_target(
+                    node.args[0], module_bound_names, sys_modules_names
+                )
+            ):
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        "setattr() onto a module or sys.modules[...] is not allowed "
+                        "anywhere in src/ -- it can silently rebind an imported SQL sink "
+                        "or import hook",
+                    )
+                )
 
             if isinstance(node.func, Attribute):
                 attr = node.func.attr
@@ -792,6 +1074,17 @@ def find_violations_in_source(source: str, rel_path: str) -> list[Violation]:
                     )
 
         elif isinstance(node, Attribute):
+            # Fail-closed and deliberately *unscoped*: this flags `.execute`/
+            # `.fetch`/`.cursor`/`.prepare` used as a value anywhere in src/,
+            # not just on asyncpg-typed receivers. An earlier audit flagged
+            # this as a possible false positive on discord.py objects that
+            # use attributes of the same name as callbacks -- but discord.py
+            # doesn't expose attributes named exactly `fetch`, `execute`,
+            # `cursor`, or `prepare` (checked against discord.py 2.7's public
+            # API), so there is nothing to scope this to and no accuracy
+            # gained by trying. Narrowing it to "asyncpg-typed receivers"
+            # would also require type inference this file doesn't do, and
+            # would only reduce coverage for no measured benefit.
             if node.attr in SQL_METHOD_NAMES and id(node) not in call_func_attr_ids:
                 violations.append(
                     Violation(
@@ -800,6 +1093,108 @@ def find_violations_in_source(source: str, rel_path: str) -> list[Violation]:
                         f"reference to .{node.attr} as a value (alias/callback/partial) is not "
                         "allowed -- SQL sinks must be called directly so their arguments "
                         "can be checked",
+                    )
+                )
+            if node.attr == "__getattribute__":
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        ".__getattribute__ is not allowed anywhere in src/ -- it can "
+                        "resolve to any attribute, including a SQL sink, whether it's "
+                        "called directly or just referenced as a value",
+                    )
+                )
+            if node.attr == "_protocol":
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        "._protocol access is not allowed anywhere in src/ -- it reaches "
+                        "asyncpg's internal wire protocol, one hop from every private "
+                        "sink this guard knows about",
+                    )
+                )
+            if node.attr == "__import__":
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        ".__import__ access is not allowed anywhere in src/ (e.g. "
+                        "builtins.__import__), whether it's called or just referenced",
+                    )
+                )
+            if isinstance(node.ctx, Store) and _is_sys_modules_subscript(
+                node.value, sys_modules_names
+            ):
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        "attribute assignment on sys.modules[...] is not allowed anywhere "
+                        "in src/ -- it can rebind anything on a live module, including an "
+                        "imported SQL sink alias",
+                    )
+                )
+
+        elif isinstance(node, Subscript):
+            dict_msg = _dict_subscript_violation_message(node)
+            if dict_msg:
+                violations.append(Violation(rel_path, node.lineno, dict_msg))
+
+        elif isinstance(node, Name):
+            if node.id == "__builtins__":
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        "__builtins__ access is not allowed anywhere in src/ (covers both "
+                        "__builtins__['name'] and __builtins__.name forms)",
+                    )
+                )
+
+        elif isinstance(node, ImportFrom):
+            if any(alias.name == "*" for alias in node.names):
+                violations.append(
+                    Violation(
+                        rel_path, node.lineno, "'from x import *' is not allowed anywhere in src/"
+                    )
+                )
+            if node.module == "importlib" and any(a.name == "import_module" for a in node.names):
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        "importing importlib.import_module (aliased or not) is not "
+                        "allowed anywhere in src/ -- calling it can resolve any "
+                        "module/attribute, including a SQL sink",
+                    )
+                )
+            if node.module == "builtins" and any(a.name == "__import__" for a in node.names):
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        "importing builtins.__import__ is not allowed anywhere in src/",
+                    )
+                )
+            if node.module == "inspect" and any(a.name == "getattr_static" for a in node.names):
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        "importing inspect.getattr_static is not allowed anywhere in src/",
+                    )
+                )
+
+        elif isinstance(node, Import):
+            if any(alias.name in {"builtins", "importlib"} for alias in node.names):
+                violations.append(
+                    Violation(
+                        rel_path,
+                        node.lineno,
+                        "'import builtins/importlib' is not allowed anywhere in src/ "
+                        "(it exposes dynamic import hooks)",
                     )
                 )
 
