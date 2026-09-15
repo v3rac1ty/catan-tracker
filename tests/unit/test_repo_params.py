@@ -496,6 +496,41 @@ async def test_lock_due_seasons_validates_now_before_conn(conn: _ExplodingConnec
         await seasons.lock_due_seasons(conn, _NAIVE_DATETIME)
 
 
+async def test_lock_active_season_validates_guild_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="guild_id"):
+        await seasons.lock_active_season(conn, 0)
+
+
+async def test_lock_next_due_season_validates_now_before_conn(conn: _ExplodingConnection) -> None:
+    with pytest.raises(ValueError, match="now"):
+        await seasons.lock_next_due_season(conn, _NAIVE_DATETIME, [])
+
+
+async def test_lock_next_due_season_validates_exclude_ids_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match=r"exclude_season_ids\[1\]"):
+        await seasons.lock_next_due_season(conn, _AWARE_DATETIME, [1, "bad"])
+
+
+async def test_lock_next_due_season_rejects_bool_exclude_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    # `bool` is an `int` subclass -- a stray `True` must not silently
+    # encode as season_id 1.
+    with pytest.raises(ValueError, match=r"exclude_season_ids\[0\]"):
+        await seasons.lock_next_due_season(conn, _AWARE_DATETIME, [True])
+
+
+async def test_lock_next_due_season_empty_exclude_list_still_validates_now_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="now"):
+        await seasons.lock_next_due_season(conn, _NAIVE_DATETIME, [])
+
+
 async def test_complete_season_validates_guild_id_before_conn(conn: _ExplodingConnection) -> None:
     with pytest.raises(ValueError, match="guild_id"):
         await seasons.complete_season(conn, 0, 1, [])

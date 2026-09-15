@@ -39,6 +39,36 @@ FROM seasons
 WHERE guild_id = $1 AND status = 'active'
 """
 
+# L2 audit finding: `end_season_now` must hold this guild's active-season
+# row locked for the rest of its transaction, so a concurrent
+# `set_active_min_games` can't change `min_games` between this read and
+# `complete_season` freezing results computed from it -- it blocks on this
+# row lock until the locking transaction commits or rolls back.
+_LOCK_ACTIVE_SEASON_SQL = """
+SELECT season_id, guild_id, name, starts_on, ends_on, ends_at, min_games, status,
+       resolved_at, announced_at, created_by, created_at
+FROM seasons
+WHERE guild_id = $1 AND status = 'active'
+FOR UPDATE
+"""
+
+# L3 audit finding: the scheduler must be able to lock *one* due season at
+# a time (excluding ones it already knows have failed this pass) instead of
+# every due season across every guild in one transaction -- so a slow or
+# paused resolution never also holds an unrelated guild's due season
+# locked. `SKIP LOCKED` lets a concurrent caller move on to the next
+# candidate instead of blocking on a row this query's caller is still
+# holding.
+_LOCK_NEXT_DUE_SEASON_SQL = """
+SELECT season_id, guild_id, name, starts_on, ends_on, ends_at, min_games, status,
+       resolved_at, announced_at, created_by, created_at
+FROM seasons
+WHERE status = 'active' AND ends_at <= $1 AND NOT (season_id = ANY($2::bigint[]))
+ORDER BY season_id
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+"""
+
 _INSERT_SEASON_SQL = """
 INSERT INTO seasons (guild_id, name, starts_on, ends_on, ends_at, min_games, created_by)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -203,6 +233,44 @@ def _row_to_season_result(row: asyncpg.Record) -> SeasonResultRow:
 async def get_active_season(conn: asyncpg.Connection, guild_id: int) -> Season | None:
     require_id(guild_id, name="guild_id")
     row = await conn.fetchrow(_SELECT_ACTIVE_SEASON_SQL, guild_id)
+    return _row_to_season(row) if row is not None else None
+
+
+async def lock_active_season(conn: asyncpg.Connection, guild_id: int) -> Season | None:
+    """`guild_id`'s active season, row-locked (`FOR UPDATE`) for the caller's transaction.
+
+    Callers must hold a transaction: the lock is released on commit or
+    rollback. A concurrent `set_active_min_games`/`set_active_end` on the
+    same row blocks until then, rather than racing a read this transaction
+    already made.
+    """
+    require_id(guild_id, name="guild_id")
+    row = await conn.fetchrow(_LOCK_ACTIVE_SEASON_SQL, guild_id)
+    return _row_to_season(row) if row is not None else None
+
+
+async def lock_next_due_season(
+    conn: asyncpg.Connection, now: datetime, exclude_season_ids: Sequence[int]
+) -> Season | None:
+    """The lowest-`season_id` active season whose `ends_at` has passed, excluding some ids.
+
+    System-wide scheduler query (no `guild_id` scoping), matching
+    `lock_due_seasons` -- but locks at most *one* row (`FOR UPDATE SKIP
+    LOCKED LIMIT 1`) instead of every due season in one pass, so a resolver
+    working on one candidate never also holds an unrelated guild's due
+    season locked. Callers must hold a transaction, exactly like
+    `lock_due_seasons`.
+
+    `exclude_season_ids` is materialized and validated (`require_id`, one
+    call per id, matching `complete_season`'s per-row validation) before
+    any SQL runs; an empty sequence excludes nothing.
+    """
+    now = require_aware(now, name="now")
+    excluded = [
+        require_id(season_id, name=f"exclude_season_ids[{i}]")
+        for i, season_id in enumerate(exclude_season_ids)
+    ]
+    row = await conn.fetchrow(_LOCK_NEXT_DUE_SEASON_SQL, now, excluded)
     return _row_to_season(row) if row is not None else None
 
 

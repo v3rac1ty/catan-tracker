@@ -516,6 +516,95 @@ async def test_mark_announced_on_active_season_leaves_announced_at_null(
     assert unchanged.announced_at is None
 
 
+async def test_lock_active_season_returns_guilds_active_season(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    """L2: `lock_active_season` returns the same row as `get_active_season`,
+    just row-locked -- see `test_races.py` for proof it actually blocks."""
+    created = await _create_season(app_conn, guild_id)
+    async with app_conn.transaction():
+        locked = await seasons.lock_active_season(app_conn, guild_id)
+    assert locked is not None
+    assert locked.season_id == created.season_id
+
+
+async def test_lock_active_season_returns_none_for_a_different_guild(
+    app_conn: asyncpg.Connection, guild_id: int, other_guild_id: int
+) -> None:
+    await _create_season(app_conn, guild_id)
+    async with app_conn.transaction():
+        locked = await seasons.lock_active_season(app_conn, other_guild_id)
+    assert locked is None
+
+
+async def test_lock_active_season_returns_none_without_an_active_season(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    async with app_conn.transaction():
+        locked = await seasons.lock_active_season(app_conn, guild_id)
+    assert locked is None
+
+
+async def test_lock_next_due_season_returns_the_lowest_due_season_id(
+    app_conn: asyncpg.Connection, guild_id: int, other_guild_id: int
+) -> None:
+    """L3: due seasons across guilds are picked in `season_id` order."""
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    first = await _create_season(app_conn, guild_id, ends_at=now - timedelta(days=2))
+    second = await _create_season(app_conn, other_guild_id, ends_at=now - timedelta(days=1))
+    assert first.season_id < second.season_id
+
+    async with app_conn.transaction():
+        locked = await seasons.lock_next_due_season(app_conn, now, [])
+    assert locked is not None
+    assert locked.season_id == first.season_id
+
+
+async def test_lock_next_due_season_skips_excluded_ids(
+    app_conn: asyncpg.Connection, guild_id: int, other_guild_id: int
+) -> None:
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    first = await _create_season(app_conn, guild_id, ends_at=now - timedelta(days=2))
+    second = await _create_season(app_conn, other_guild_id, ends_at=now - timedelta(days=1))
+
+    async with app_conn.transaction():
+        locked = await seasons.lock_next_due_season(app_conn, now, [first.season_id])
+    assert locked is not None
+    assert locked.season_id == second.season_id
+
+    async with app_conn.transaction():
+        # Excluding both leaves nothing.
+        none_left = await seasons.lock_next_due_season(
+            app_conn, now, [first.season_id, second.season_id]
+        )
+    assert none_left is None
+
+
+async def test_lock_next_due_season_excludes_completed_and_not_yet_due_seasons(
+    app_conn: asyncpg.Connection, guild_id: int, other_guild_id: int
+) -> None:
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    completed = await _create_season(app_conn, guild_id, ends_at=now - timedelta(days=2))
+    await seasons.complete_season(app_conn, guild_id, completed.season_id, [])
+    not_due = await _create_season(app_conn, other_guild_id, ends_at=now + timedelta(days=2))
+
+    async with app_conn.transaction():
+        locked = await seasons.lock_next_due_season(app_conn, now, [])
+    assert locked is None
+    assert not_due.status == "active"  # sanity: it exists, it's just not due yet
+
+
+async def test_lock_next_due_season_empty_exclude_list_excludes_nothing(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    due = await _create_season(app_conn, guild_id, ends_at=now - timedelta(days=1))
+    async with app_conn.transaction():
+        locked = await seasons.lock_next_due_season(app_conn, now, [])
+    assert locked is not None
+    assert locked.season_id == due.season_id
+
+
 async def test_mark_announced_twice_on_completed_season_keeps_first_timestamp(
     app_conn: asyncpg.Connection, guild_id: int
 ) -> None:

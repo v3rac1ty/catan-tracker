@@ -15,6 +15,7 @@ import asyncpg
 import pytest
 
 from catan_bot.db.migrate import run_migrations as _run_migrations
+from catan_bot.db.pool import create_pool as _create_pool
 from catan_bot.db.repositories.guilds import ensure_guild as _ensure_guild
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
@@ -89,6 +90,23 @@ async def app_conn() -> AsyncIterator[asyncpg.Connection]:
         yield conn
     finally:
         await conn.close()
+
+
+@pytest.fixture
+async def pool() -> AsyncIterator[asyncpg.Pool]:
+    """A connection pool using the least-privilege `catan_app` role, for the
+    services layer under test (services take a `Pool`, never a bare `conn`).
+
+    Matches `app_conn`'s safety net: refuses to proceed if `TEST_DATABASE_URL`
+    doesn't actually point at `catan_test`.
+    """
+    created = await _create_pool(TEST_DATABASE_URL)
+    try:
+        async with created.acquire() as conn:
+            await _assert_connected_to_test_database(conn)
+        yield created
+    finally:
+        await created.close()
 
 
 async def _truncate_app_tables() -> None:

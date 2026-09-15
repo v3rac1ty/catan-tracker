@@ -220,6 +220,70 @@ async def test_two_concurrent_lock_and_complete_season_each_completes_once(
     assert final_b.status == "completed"
 
 
+async def test_lock_active_season_blocks_concurrent_set_active_min_games_until_commit(
+    app_conn: asyncpg.Connection,
+    guild_id: int,
+    two_conns: tuple[asyncpg.Connection, asyncpg.Connection],
+) -> None:
+    """L2: `lock_active_season`'s `FOR UPDATE` must block a concurrent
+    `set_active_min_games` on the same row until the locking transaction
+    ends -- proving this takes a real row lock, not just a plain SELECT."""
+    await seasons.create_season(
+        app_conn, guild_id, "Locked", STARTS_ON, ENDS_ON, datetime(2027, 1, 1, tzinfo=UTC), 2, 1
+    )
+    conn_a, conn_b = two_conns
+
+    tx_a = conn_a.transaction()
+    await tx_a.start()
+    locked = await seasons.lock_active_season(conn_a, guild_id)
+    assert locked is not None
+
+    set_task = asyncio.create_task(seasons.set_active_min_games(conn_b, guild_id, 9))
+    try:
+        done, _pending = await asyncio.wait({set_task}, timeout=0.5)
+        assert set_task not in done  # still blocked on tx_a's FOR UPDATE lock
+    finally:
+        await tx_a.commit()
+
+    updated = await asyncio.wait_for(set_task, timeout=2)
+    assert updated is not None
+    assert updated.min_games == 9
+
+
+async def test_lock_next_due_season_skip_locked_returns_next_candidate_without_blocking(
+    app_conn: asyncpg.Connection,
+    guild_id: int,
+    other_guild_id: int,
+    two_conns: tuple[asyncpg.Connection, asyncpg.Connection],
+) -> None:
+    """L3: `lock_next_due_season`'s `FOR UPDATE SKIP LOCKED` must let a
+    concurrent caller move on to the *next* due season (by `season_id`)
+    instead of blocking on the first one, which conn A is already holding."""
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    season_x = await seasons.create_season(
+        app_conn, guild_id, "X", STARTS_ON, ENDS_ON, now - timedelta(days=2), 2, 1
+    )
+    season_y = await seasons.create_season(
+        app_conn, other_guild_id, "Y", STARTS_ON, ENDS_ON, now - timedelta(days=1), 2, 1
+    )
+    conn_a, conn_b = two_conns
+
+    tx_a = conn_a.transaction()
+    await tx_a.start()
+    try:
+        locked_by_a = await seasons.lock_next_due_season(conn_a, now, [])
+        assert locked_by_a is not None
+        assert locked_by_a.season_id == season_x.season_id
+
+        locked_by_b = await asyncio.wait_for(
+            seasons.lock_next_due_season(conn_b, now, []), timeout=2
+        )
+        assert locked_by_b is not None
+        assert locked_by_b.season_id == season_y.season_id
+    finally:
+        await tx_a.rollback()
+
+
 async def test_complete_season_with_generator_results_stores_all_rows(
     app_conn: asyncpg.Connection, guild_id: int
 ) -> None:
