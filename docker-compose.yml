@@ -1,6 +1,12 @@
 x-app-image: &app_image
   build: .
   image: catan-tracker:local
+  read_only: true
+  init: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
 
 x-logging: &default_logging
   driver: json-file

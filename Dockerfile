@@ -9,7 +9,7 @@ COPY src ./src
 
 RUN pip install --no-cache-dir .
 
-RUN useradd --create-home --shell /usr/sbin/nologin appuser
+RUN useradd --create-home --no-log-init --shell /usr/sbin/nologin appuser
 USER appuser
 
 CMD ["python", "-m", "catan_bot"]

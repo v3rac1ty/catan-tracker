@@ -9,4 +9,5 @@ htmlcov/
 *.egg-info/
 build/
 dist/
+backups/
 .DS_Store

@@ -55,6 +55,49 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_SQLSTATE_PATTERN = re.compile(r"[0-9A-Z]{5}", re.ASCII)
+
+
+def _safe_sqlstate(exc: BaseException) -> str:
+    """Return a validated SQLSTATE from an exception chain, if present.
+
+    Exception text and traceback data can contain connection details, SQL,
+    filesystem paths, or values from configuration.  The migration entry
+    point only needs the stable five-character PostgreSQL status code when it
+    reports a failure, so walk the chain and discard everything else.
+    """
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+
+        sqlstate = getattr(current, "sqlstate", None)
+        if (
+            isinstance(current, asyncpg.PostgresError)
+            and isinstance(sqlstate, str)
+            and _SQLSTATE_PATTERN.fullmatch(sqlstate) is not None
+        ):
+            return sqlstate
+
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None and id(linked) not in seen:
+                pending.append(linked)
+    return "unknown"
+
+
+def _log_migration_failure(exc: BaseException) -> None:
+    """Log only safe, machine-readable migration failure metadata."""
+    logger.error(
+        "Migration run failed: exception_type=%s sqlstate=%s",
+        type(exc).__name__,
+        _safe_sqlstate(exc),
+    )
+
+
 _MIGRATIONS_PACKAGE = "catan_bot.db.migrations"
 
 # Deliberately ASCII-only: Unicode digits (e.g. Arabic-indic) satisfy `\d`
@@ -269,6 +312,6 @@ async def _main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(_main())
-    except Exception:
-        logger.exception("Migration run failed")
+    except Exception as exc:
+        _log_migration_failure(exc)
         sys.exit(1)

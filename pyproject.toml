@@ -21,6 +21,7 @@ dev = [
   "pytest-cov",
   "ruff>=0.16",
   "bandit>=1.9",
+  "pip-audit>=2.10,<3",
   "hypothesis>=6",
 ]
 

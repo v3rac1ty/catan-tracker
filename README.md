@@ -4,14 +4,40 @@ A Discord bot for a friend group that tracks Catan wins and losses and ranks pla
 
 ## Status
 
-Early development, built milestone by milestone.
+Feature-complete through the events and scheduler milestone, with deployment
+and CI configuration ready for review. The project has not been verified on a
+live OCI host.
 
 - [x] Foundation — git/Docker setup, database schema and migrations, bot skeleton, `/help`
 - [x] Domain logic — dates, ranking, bet resolution, reminders, validation
 - [x] Repositories, services, and SQL injection tests
 - [x] Core commands — config, season, game reporting, leaderboard, stats
 - [x] Events + scheduler
-- [ ] CI + deployment docs
+- [x] CI configuration
+- [x] Deployment documentation
+
+## Features
+
+- Multi-server season tracking with configurable end dates and eligibility
+- Confirmed game reports, voiding, history, leaderboards, and player stats
+- Game-night events with RSVP buttons and targeted reminders
+- Automatic season resolution with frozen result announcements
+- Least-privilege PostgreSQL roles, bounded output, and mention-safe responses
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Discord[Discord users] -->|commands and buttons| Bot[Catan bot]
+    Bot --> Services[Services and domain rules]
+    Bot -->|starts and stops| Scheduler[Scheduler]
+    Scheduler --> Services
+    Services --> Repositories[Repositories]
+    Repositories --> Postgres[(PostgreSQL)]
+    Migrations[One-shot migrations] --> Postgres
+    Bot -->|responses| Discord
+    Scheduler -->|announcements and reminders| Discord
+```
 
 ## Commands
 
@@ -45,6 +71,9 @@ Early development, built milestone by milestone.
 - A server-side `statement_timeout` applied to every pooled connection, plus a client-side command timeout, bound query run time.
 - The database port is bound to `localhost` only; it is never exposed publicly.
 - Discord mentions are disabled by default (`AllowedMentions.none()`); only specific, intentional pings are ever allowed through.
+
+See the [security guide](docs/SECURITY.md) for the threat model, operational
+controls, incident response, and disclosure process.
 
 ## Getting started (local)
 
@@ -89,6 +118,8 @@ Integration tests run against a real Postgres database and are skipped automatic
 
 ```
 catan-tracker/
+├── .github/workflows/ci.yml # lint, static checks, and test jobs
+├── docs/                    # deployment and security guides
 ├── src/catan_bot/
 │   ├── __main__.py     # entry point: python -m catan_bot
 │   ├── bot.py          # CatanBot: pool + cog loading + command sync
@@ -100,6 +131,7 @@ catan-tracker/
 │   │   ├── migrations/     # SQL migration files
 │   │   └── repositories/   # all application SQL lives here
 │   ├── domain/         # pure dates, validation, ranking, bet, and reminder logic
+│   ├── scheduler.py    # season resolution, announcements, and event reminders
 │   ├── services/       # transactions and application workflows
 │   └── views/          # persistent game confirmation and event RSVP buttons
 ├── db/roles.sql, db/init/   # least-privilege role setup
@@ -112,4 +144,7 @@ catan-tracker/
 
 ## Deployment
 
-The bot is designed to run 24/7 on a small always-on machine, such as an Oracle Cloud Always Free ARM VM, using `docker compose up -d`. It only makes outbound connections to Discord and the database, so no inbound ports need to be opened. A full deployment guide is planned for a later milestone.
+The bot is designed to run 24/7 on a small always-on machine, such as an Oracle
+Cloud Always Free ARM VM. Follow the [deployment guide](docs/DEPLOYMENT.md) for
+Discord setup, host hardening, Docker installation, command sync, updates,
+backups, and restore-rehearsal procedures.

@@ -10,11 +10,41 @@ is exercised by the integration suite (see
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
+import asyncpg
 import pytest
 
-from catan_bot.db.migrate import _FILENAME_PATTERN, _discover_migrations
+from catan_bot.db.migrate import (
+    _FILENAME_PATTERN,
+    _discover_migrations,
+    _log_migration_failure,
+)
+
+
+def test_migration_failure_log_uses_safe_metadata_from_chained_postgres_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    detail = "dsn=postgresql://secret@example.invalid/catan; path=/private/config"
+    postgres_error = asyncpg.CheckViolationError(detail)
+    try:
+        raise postgres_error
+    except asyncpg.PostgresError as caught:
+        try:
+            raise asyncpg.InterfaceError(detail) from caught
+        except asyncpg.InterfaceError as outer:
+            with caplog.at_level(logging.ERROR, logger="catan_bot.db.migrate"):
+                _log_migration_failure(outer)
+
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.getMessage() == (
+        "Migration run failed: exception_type=InterfaceError sqlstate=23514"
+    )
+    assert detail not in caplog.text
+    assert record.exc_info is None
+    assert record.exc_text is None
 
 
 def test_filename_pattern_rejects_unicode_digits() -> None:

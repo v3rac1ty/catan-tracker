@@ -30,38 +30,24 @@ DO $$ BEGIN RAISE EXCEPTION 'MIGRATOR_PASSWORD not set'; END $$;
 DO $$ BEGIN RAISE EXCEPTION 'APP_PASSWORD not set'; END $$;
 \endif
 
--- `\getenv` only tells us the variable was present; an empty string (e.g.
--- MIGRATOR_PASSWORD="") still satisfies :{?var} above but must not silently
--- create a password-less role.
-SELECT :'migrator_password' = '' AS migrator_password_empty
+-- Compose embeds these values in database URLs, so require at least 16
+-- URL-safe characters. This rejects empty, whitespace-only, padded, and
+-- punctuation-containing values before a role can be created. `openssl rand
+-- -hex 24` (recommended in .env.example) produces 48 valid characters.
+SELECT length(:'migrator_password') < 16
+    OR :'migrator_password' ~ '[^A-Za-z0-9_-]' AS migrator_password_invalid
 \gset
 
-\if :migrator_password_empty
-DO $$ BEGIN RAISE EXCEPTION 'MIGRATOR_PASSWORD is empty'; END $$;
+\if :migrator_password_invalid
+DO $$ BEGIN RAISE EXCEPTION 'MIGRATOR_PASSWORD must contain at least 16 URL-safe characters'; END $$;
 \endif
 
-SELECT :'app_password' = '' AS app_password_empty
+SELECT length(:'app_password') < 16
+    OR :'app_password' ~ '[^A-Za-z0-9_-]' AS app_password_invalid
 \gset
 
-\if :app_password_empty
-DO $$ BEGIN RAISE EXCEPTION 'APP_PASSWORD is empty'; END $$;
-\endif
-
--- A short password is still a weak password even though it's non-empty.
--- 16 chars is a conservative floor; `openssl rand -hex 24` (recommended in
--- .env.example) produces 48.
-SELECT length(:'migrator_password') < 16 AS migrator_password_too_short
-\gset
-
-\if :migrator_password_too_short
-DO $$ BEGIN RAISE EXCEPTION 'MIGRATOR_PASSWORD is too short (must be at least 16 characters)'; END $$;
-\endif
-
-SELECT length(:'app_password') < 16 AS app_password_too_short
-\gset
-
-\if :app_password_too_short
-DO $$ BEGIN RAISE EXCEPTION 'APP_PASSWORD is too short (must be at least 16 characters)'; END $$;
+\if :app_password_invalid
+DO $$ BEGIN RAISE EXCEPTION 'APP_PASSWORD must contain at least 16 URL-safe characters'; END $$;
 \endif
 
 -- ---------------------------------------------------------------------------
