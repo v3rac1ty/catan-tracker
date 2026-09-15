@@ -7,8 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 
 # (command, description) pairs shown in the help embed, matching what's
-# actually registered in M4. Event scheduling (`/event`, RSVP buttons)
-# lands in M5 and isn't listed here yet.
+# actually registered through M5.
 _COMMANDS: tuple[tuple[str, str], ...] = (
     ("/config channel|timezone|admin-role|show", "View or change this server's settings."),
     ("/season start|min-games|end-date|end|cancel|info|history", "Manage this server's season."),
@@ -17,6 +16,7 @@ _COMMANDS: tuple[tuple[str, str], ...] = (
     ("/game history", "Show recent games."),
     ("/leaderboard", "Show season or all-time rankings."),
     ("/stats", "Show a player's win/loss record."),
+    ("/event create|list|cancel", "Schedule and manage game nights with RSVPs."),
 )
 
 

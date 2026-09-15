@@ -10,7 +10,7 @@ Early development, built milestone by milestone.
 - [x] Domain logic — dates, ranking, bet resolution, reminders, validation
 - [x] Repositories, services, and SQL injection tests
 - [x] Core commands — config, season, game reporting, leaderboard, stats
-- [ ] Events + scheduler
+- [x] Events + scheduler
 - [ ] CI + deployment docs
 
 ## Commands
@@ -24,8 +24,8 @@ Early development, built milestone by milestone.
 | Confirm / Reject buttons | Confirm or reject a pending report | Other participants; reporter may retract | Available |
 | `/game void`, `/game history` | Void a game / view game history | Admin / anyone | Available |
 | `/leaderboard`, `/stats` | View rankings and player stats | Anyone | Available |
-| `/event create [date] ...`, `/event list`, `/event cancel` | Schedule and manage game nights | Anyone / creator or admin | Planned |
-| RSVP buttons | Going / Maybe / Not going | Anyone | Planned |
+| `/event create [date] ...`, `/event list`, `/event cancel` | Schedule and manage game nights | Anyone / creator or admin | Available |
+| RSVP buttons | Going / Maybe / Not going | Anyone | Available |
 
 ## Tech stack
 
@@ -93,7 +93,7 @@ catan-tracker/
 │   ├── __main__.py     # entry point: python -m catan_bot
 │   ├── bot.py          # CatanBot: pool + cog loading + command sync
 │   ├── config.py       # settings (BotSettings, MigrateSettings)
-│   ├── cogs/           # config, season, game, stats, and help commands
+│   ├── cogs/           # config, season, game, stats, event, and help commands
 │   ├── db/
 │   │   ├── pool.py         # asyncpg pool factory
 │   │   ├── migrate.py      # versioned migration runner
@@ -101,7 +101,7 @@ catan-tracker/
 │   │   └── repositories/   # all application SQL lives here
 │   ├── domain/         # pure dates, validation, ranking, bet, and reminder logic
 │   ├── services/       # transactions and application workflows
-│   └── views/          # persistent game confirmation buttons
+│   └── views/          # persistent game confirmation and event RSVP buttons
 ├── db/roles.sql, db/init/   # least-privilege role setup
 ├── tests/static/            # AST-based SQL injection guard
 ├── tests/integration/       # tests against a real Postgres instance

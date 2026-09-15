@@ -188,10 +188,8 @@ def _log_resolution_failure(season_id: int, exc: Exception) -> None:
     `asyncpg.PostgresError.__str__` (`PostgresMessage.__str__`) appends the
     server's DETAIL/HINT text, which can contain row contents (e.g. a
     season name via a CHECK violation message) -- so this never calls
-    `str(exc)`, and never passes `exc_info` for a `PostgresError` (a
-    traceback ends with that same leaky `str()`). For any other exception
-    type, `exc_info` is kept: the traceback helps debugging and carries no
-    row data. `sqlstate` is always safe to log: a fixed 5-character error
+    `str(exc)` or passes `exc_info` (a chained traceback can end with that
+    same leaky `str()`). `sqlstate` is always safe to log: a fixed 5-character error
     class code, not server-supplied text.
     """
     if isinstance(exc, asyncpg.PostgresError):
@@ -206,7 +204,6 @@ def _log_resolution_failure(season_id: int, exc: Exception) -> None:
             "Season resolution failed for season_id=%s: %s",
             season_id,
             type(exc).__name__,
-            exc_info=exc,
         )
 
 
@@ -251,13 +248,42 @@ async def pending_announcements(pool: asyncpg.Pool, limit: int) -> list[Announce
     n = _clamp(limit, _ANNOUNCEMENTS_MIN_LIMIT, _ANNOUNCEMENTS_MAX_LIMIT)
     async with pool.acquire() as conn:
         due_seasons = await seasons.list_unannounced_completed(conn, n)
-        return [
-            Announcement(
-                season=season,
-                results=await seasons.get_season_results(conn, season.guild_id, season.season_id),
-            )
-            for season in due_seasons
-        ]
+    announcements: list[Announcement] = []
+    for season in due_seasons:
+        announcement = await _read_pending_announcement(pool, season)
+        if announcement is not None:
+            announcements.append(announcement)
+    return announcements
+
+
+def _log_announcement_read_failure(season: Season, exc: Exception) -> None:
+    """Log only identifiers and an exception class for one announcement read."""
+    if isinstance(exc, asyncpg.PostgresError):
+        logger.error(
+            "Season announcement read failed for season_id=%s guild_id=%s: %s (sqlstate=%s)",
+            season.season_id,
+            season.guild_id,
+            type(exc).__name__,
+            exc.sqlstate,
+        )
+    else:
+        logger.error(
+            "Season announcement read failed for season_id=%s guild_id=%s: %s",
+            season.season_id,
+            season.guild_id,
+            type(exc).__name__,
+        )
+
+
+async def _read_pending_announcement(pool: asyncpg.Pool, season: Season) -> Announcement | None:
+    """Read one frozen result set so a guild failure does not block its peers."""
+    try:
+        async with pool.acquire() as conn:
+            results = await seasons.get_season_results(conn, season.guild_id, season.season_id)
+    except Exception as exc:
+        _log_announcement_read_failure(season, exc)
+        return None
+    return Announcement(season=season, results=results)
 
 
 async def mark_announced(pool: asyncpg.Pool, guild_id: int, season_id: int) -> None:

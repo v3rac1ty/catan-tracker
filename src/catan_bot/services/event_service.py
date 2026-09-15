@@ -92,6 +92,24 @@ async def create_event(
         )
 
 
+async def record_event_message(
+    pool: asyncpg.Pool,
+    guild_id: int,
+    event_id: int,
+    channel_id: int,
+    message_id: int,
+) -> None:
+    """Persist the Discord message used to announce an event."""
+    async with pool.acquire() as conn:
+        await events.set_event_message(conn, guild_id, event_id, channel_id, message_id)
+
+
+async def get_event(pool: asyncpg.Pool, guild_id: int, event_id: int) -> Event | None:
+    """Load one event through its guild-scoped repository query."""
+    async with pool.acquire() as conn:
+        return await events.get_event(conn, guild_id, event_id)
+
+
 def _cancel_result_error(result: TransitionResult) -> ServiceError:
     if result == "not_found":
         return NotFoundError(_EVENT_NOT_FOUND)

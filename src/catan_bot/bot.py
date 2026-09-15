@@ -11,17 +11,19 @@ from discord.ext import commands
 from catan_bot.config import BotSettings
 from catan_bot.db.pool import create_pool
 from catan_bot.errors import on_tree_error
+from catan_bot.scheduler import CatanScheduler
+from catan_bot.views.event_rsvp import EventRsvpButton
 from catan_bot.views.game_confirm import GameActionButton
 
 logger = logging.getLogger(__name__)
 
-# Cogs to load at startup, in order. Extended in later milestones (M5 adds
-# event_cog).
+# Cogs to load at startup, in order.
 INITIAL_COGS: tuple[str, ...] = (
     "catan_bot.cogs.config_cog",
     "catan_bot.cogs.season_cog",
     "catan_bot.cogs.game_cog",
     "catan_bot.cogs.stats_cog",
+    "catan_bot.cogs.event_cog",
     "catan_bot.cogs.help_cog",
 )
 
@@ -48,17 +50,22 @@ class CatanBot(commands.Bot):
         )
         self.settings = settings
         self.pool: asyncpg.Pool | None = None
+        self.scheduler: CatanScheduler | None = None
 
     async def setup_hook(self) -> None:
         self.pool = await create_pool(self.settings.database_url.get_secret_value())
         logger.info("Database pool created")
 
         self.tree.on_error = on_tree_error
-        self.add_dynamic_items(GameActionButton)
+        self.add_dynamic_items(GameActionButton, EventRsvpButton)
 
         for extension in INITIAL_COGS:
             await self.load_extension(extension)
             logger.info("Loaded extension %s", extension)
+
+        self.scheduler = CatanScheduler(self)
+        self.scheduler.start()
+        logger.info("Scheduler started")
 
         if not self.settings.sync_commands:
             logger.info("Command sync skipped (SYNC_COMMANDS is not set)")
@@ -76,7 +83,12 @@ class CatanBot(commands.Bot):
             logger.info("Synced %d command(s) globally", len(synced))
 
     async def close(self) -> None:
+        if self.scheduler is not None:
+            await self.scheduler.close()
+            self.scheduler = None
+            logger.info("Scheduler stopped")
         if self.pool is not None:
             await self.pool.close()
+            self.pool = None
             logger.info("Database pool closed")
         await super().close()

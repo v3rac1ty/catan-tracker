@@ -102,12 +102,21 @@ _CLOCK_ATTR_NAMES = frozenset(
     }
 )
 
-# Attribute names that are dangerous regardless of receiver, call or not:
-# every clock name, plus a bare reference to `__import__` (e.g.
-# `builtins.__import__`, not just a call to it).
-_DANGEROUS_ATTR_NAMES = _CLOCK_ATTR_NAMES | {"__import__"}
+# Attribute names that are dangerous regardless of receiver, call or not.
+# These names are common stepping stones from an otherwise permitted object
+# to imports, process modules, or hidden runtime state.
+_DANGEROUS_ATTR_NAMES = _CLOCK_ATTR_NAMES | {
+    "__import__",
+    "__builtins__",
+    "__dict__",
+    "sys",
+    "os",
+    "modules",
+}
 
-_FORBIDDEN_BUILTIN_CALLS = frozenset({"open", "__import__", "exec", "eval", "compile"})
+_FORBIDDEN_BUILTIN_CALLS = frozenset(
+    {"open", "__import__", "exec", "eval", "compile", "breakpoint"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +184,8 @@ def _getattr_violation(call: Call) -> str | None:
     attr_arg = call.args[1]
     if not (isinstance(attr_arg, Constant) and isinstance(attr_arg.value, str)):
         return "getattr() with a non-literal attribute name"
-    if attr_arg.value in _CLOCK_ATTR_NAMES:
-        return f"getattr() names a clock attribute ({attr_arg.value!r}) indirectly"
+    if attr_arg.value in _DANGEROUS_ATTR_NAMES:
+        return f"getattr() names a forbidden attribute ({attr_arg.value!r}) indirectly"
     return None
 
 
@@ -220,6 +229,11 @@ def find_boundary_violations(source: str, rel_path: str) -> list[str]:
                 )
             elif _is_sys_modules_access(node):
                 violations.append(f"{rel_path}:{node.lineno}: 'sys.modules' access is not allowed")
+        elif isinstance(node, Name) and node.id in {"__builtins__", "__import__"}:
+            violations.append(
+                f"{rel_path}:{node.lineno}: reference to {node.id!r} is not allowed "
+                "in the services layer"
+            )
 
     return violations
 
@@ -295,6 +309,14 @@ _BAD_SAMPLES = [
     ),
     pytest.param("builtins.__import__\n", id="28-builtins-dunder-import-ref"),
     pytest.param("import exceptions\n", id="29-import-of-unknown-module"),
+    pytest.param("breakpoint()\n", id="30-breakpoint-call"),
+    pytest.param("obj.__builtins__\n", id="31-dunder-builtins-attribute"),
+    pytest.param("obj.__dict__\n", id="32-dunder-dict-attribute"),
+    pytest.param("obj.sys\n", id="33-sys-hop-attribute"),
+    pytest.param("obj.os\n", id="34-os-hop-attribute"),
+    pytest.param("obj.modules\n", id="35-modules-hop-attribute"),
+    pytest.param('getattr(obj, "__dict__")\n', id="36-getattr-dunder-dict"),
+    pytest.param('getattr(obj, "modules")\n', id="37-getattr-modules"),
 ]
 
 

@@ -21,15 +21,18 @@ _EXPECTED_FILES = frozenset(
     {
         "cogs/__init__.py",
         "cogs/config_cog.py",
+        "cogs/event_cog.py",
         "cogs/game_cog.py",
         "cogs/help_cog.py",
         "cogs/season_cog.py",
         "cogs/stats_cog.py",
         "views/__init__.py",
         "views/game_confirm.py",
+        "views/event_rsvp.py",
         "errors.py",
         "formatting.py",
         "permissions.py",
+        "scheduler.py",
     }
 )
 
@@ -204,7 +207,9 @@ def find_boundary_violations(source: str, rel_path: str) -> list[str]:
 
 def _boundary_files() -> list[Path]:
     files = list(COGS_ROOT.rglob("*.py")) + list(VIEWS_ROOT.rglob("*.py"))
-    files.extend(SRC_ROOT / name for name in ("errors.py", "formatting.py", "permissions.py"))
+    files.extend(
+        SRC_ROOT / name for name in ("errors.py", "formatting.py", "permissions.py", "scheduler.py")
+    )
     return sorted(files)
 
 

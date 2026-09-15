@@ -5,7 +5,8 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import asyncpg
 import pytest
@@ -106,6 +107,39 @@ async def test_create_event_dst_gap_time_is_refused_with_domain_message(
             now=NOW,
         )
     assert "clock change" in exc_info.value.user_message
+
+
+async def test_create_event_default_date_uses_guild_timezone(
+    pool: asyncpg.Pool, guild_id: int
+) -> None:
+    """An omitted date follows the guild's local calendar, not UTC's date."""
+    await config_service.set_timezone(pool, guild_id, _actor(1, admin=True), "America/Chicago")
+    local_late_evening = datetime(2026, 9, 14, 4, 30, tzinfo=UTC)  # Sep 13, 23:30 in Chicago
+    created = await _create(
+        pool,
+        guild_id,
+        creator=1,
+        date_text=None,
+        time_text="23:45",
+        now=local_late_evening,
+    )
+    assert created.starts_at == datetime(2026, 9, 14, 4, 45, tzinfo=UTC)
+    assert created.starts_at.astimezone(ZoneInfo("America/Chicago")).date() == date(2026, 9, 13)
+
+
+async def test_event_message_wrappers_are_guild_scoped(
+    pool: asyncpg.Pool, guild_id: int, other_guild_id: int
+) -> None:
+    created = await _create(pool, guild_id, creator=1, **_at(timedelta(hours=3)))
+
+    assert await event_service.get_event(pool, guild_id, created.event_id) == created
+    await event_service.record_event_message(pool, guild_id, created.event_id, 111, 222)
+
+    recorded = await event_service.get_event(pool, guild_id, created.event_id)
+    assert recorded is not None
+    assert recorded.channel_id == 111
+    assert recorded.message_id == 222
+    assert await event_service.get_event(pool, other_guild_id, created.event_id) is None
 
 
 async def test_create_event_stores_title_location_description(
@@ -389,21 +423,28 @@ async def test_due_reminders_isolates_one_guilds_read_failure_from_another(
 
 
 async def test_due_reminders_logs_non_postgres_read_failure_without_exc_info_leak(
-    pool: asyncpg.Pool, guild_id: int, monkeypatch: pytest.MonkeyPatch
+    pool: asyncpg.Pool,
+    guild_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """`_log_reminder_read_failure`'s non-`PostgresError` branch (a plain
-    `RuntimeError`, e.g. a bug or a connection-level failure) must still be
-    logged and the reminder still dropped -- covering the branch the
-    PostgresError-based isolation test above doesn't reach."""
+    """A chained non-Postgres error must not expose its Postgres cause."""
     created = await _create(pool, guild_id, creator=1, **_at(timedelta(hours=2)))
+    marker = "MARKER_chained_postgres_detail_MUST_NOT_LEAK"
 
     async def _boom(conn, guild_id_arg, event_id_arg):
-        raise RuntimeError("simulated connection failure")
+        cause = asyncpg.CheckViolationError("simulated")
+        cause.detail = f"row detail {marker}"
+        try:
+            raise cause
+        except asyncpg.PostgresError as exc:
+            raise asyncpg.InterfaceError("simulated connection failure") from exc
 
     monkeypatch.setattr(event_service.events, "get_event", _boom)
 
     due_time = NOW + timedelta(hours=1)
-    reminders = await event_service.due_reminders(pool, due_time)
+    with caplog.at_level(logging.ERROR):
+        reminders = await event_service.due_reminders(pool, due_time)
     assert reminders == []
 
     async with pool.acquire() as conn:
@@ -412,6 +453,15 @@ async def test_due_reminders_logs_non_postgres_read_failure_without_exc_info_lea
             created.event_id,
         )
     assert sent_at is not None
+    assert caplog.records
+    for record in caplog.records:
+        assert marker not in record.getMessage()
+        assert marker not in repr(record.args)
+        assert marker not in (record.exc_text or "")
+    assert marker not in caplog.text
+    combined = "\n".join(record.getMessage() for record in caplog.records)
+    assert str(created.event_id) in combined
+    assert "InterfaceError" in combined
 
 
 async def test_complete_past_events_marks_stale_scheduled_events(

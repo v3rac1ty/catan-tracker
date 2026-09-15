@@ -488,6 +488,51 @@ async def test_pending_announcements_and_mark_announced(pool: asyncpg.Pool, guil
     assert resolution.season.season_id not in {a.season.season_id for a in pending_after}
 
 
+async def test_pending_announcements_isolates_frozen_read_failure_and_retries(
+    pool: asyncpg.Pool,
+    guild_id: int,
+    other_guild_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    first = await _start(pool, guild_id)
+    second = await _start(pool, other_guild_id)
+    first_resolution = await season_service.end_season_now(pool, guild_id, _admin(), NOW)
+    second_resolution = await season_service.end_season_now(pool, other_guild_id, _admin(), NOW)
+    assert first.season_id == first_resolution.season.season_id
+    assert second.season_id == second_resolution.season.season_id
+
+    marker = "MARKER_announcement_result_detail_MUST_NOT_LEAK"
+    real_results = season_service.seasons.get_season_results
+
+    async def _maybe_fail(conn, guild_id_arg, season_id_arg):
+        if guild_id_arg == guild_id:
+            exc = asyncpg.CheckViolationError("simulated")
+            exc.detail = f"row detail {marker}"
+            raise exc
+        return await real_results(conn, guild_id_arg, season_id_arg)
+
+    monkeypatch.setattr(season_service.seasons, "get_season_results", _maybe_fail)
+    with caplog.at_level(logging.ERROR):
+        pending = await season_service.pending_announcements(pool, 10)
+
+    assert {announcement.season.season_id for announcement in pending} == {
+        second_resolution.season.season_id
+    }
+    assert marker not in caplog.text
+    combined = "\n".join(record.getMessage() for record in caplog.records)
+    assert str(first_resolution.season.season_id) in combined
+    assert "CheckViolationError" in combined
+
+    # The failed row was never marked announced and remains retryable.
+    monkeypatch.setattr(season_service.seasons, "get_season_results", real_results)
+    retry = await season_service.pending_announcements(pool, 10)
+    assert {announcement.season.season_id for announcement in retry} == {
+        first_resolution.season.season_id,
+        second_resolution.season.season_id,
+    }
+
+
 async def test_pending_announcements_clamps_limit(pool: asyncpg.Pool, guild_id: int) -> None:
     announcements = await season_service.pending_announcements(pool, 1000)
     assert len(announcements) <= 50
@@ -766,6 +811,48 @@ async def test_resolve_due_seasons_failure_log_never_contains_detail_text(
     assert "CheckViolationError" in combined
 
 
+async def test_resolve_due_seasons_chained_failure_has_no_traceback_detail(
+    pool: asyncpg.Pool,
+    guild_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-Postgres outer error can still chain a leaky Postgres cause."""
+    due_now = datetime(2026, 6, 1, tzinfo=UTC)
+    season = await _start(
+        pool,
+        guild_id,
+        start_date_text="2026-01-01",
+        end_date_text="2026-05-31",
+        now=due_now - timedelta(days=200),
+    )
+    marker = "MARKER_chained_postgres_detail_MUST_NOT_LEAK"
+
+    async def _boom(conn, guild_id_arg, season_id_arg):
+        cause = asyncpg.CheckViolationError("simulated")
+        cause.detail = f"row detail {marker}"
+        try:
+            raise cause
+        except asyncpg.PostgresError as exc:
+            raise asyncpg.InterfaceError("simulated connection failure") from exc
+
+    monkeypatch.setattr(season_service.seasons, "season_player_stats", _boom)
+
+    with caplog.at_level(logging.ERROR):
+        resolved = await season_service.resolve_due_seasons(pool, due_now)
+
+    assert resolved == []
+    assert caplog.records
+    for record in caplog.records:
+        assert marker not in record.getMessage()
+        assert marker not in repr(record.args)
+        assert marker not in (record.exc_text or "")
+    assert marker not in caplog.text
+    combined = "\n".join(record.getMessage() for record in caplog.records)
+    assert str(season.season_id) in combined
+    assert "InterfaceError" in combined
+
+
 # ---------------------------------------------------------------------------
 # M3b item 2c: `end_season_now` locks the active season row, so a
 # concurrent `set_min_games` can't change `min_games` mid-resolution.
@@ -796,23 +883,34 @@ async def test_end_season_now_locks_active_season_blocking_concurrent_set_min_ga
 
     monkeypatch.setattr(season_service.seasons, "season_player_stats", _paused_stats)
 
-    end_task = asyncio.create_task(season_service.end_season_now(pool, guild_id, _admin(), NOW))
-    await asyncio.wait_for(reached_lock.wait(), timeout=2)
+    end_task: asyncio.Task | None = None
+    set_task: asyncio.Task | None = None
+    try:
+        end_task = asyncio.create_task(season_service.end_season_now(pool, guild_id, _admin(), NOW))
+        await asyncio.wait_for(reached_lock.wait(), timeout=2)
 
-    set_task = asyncio.create_task(season_service.set_min_games(pool, guild_id, _admin(), 5))
-    done, _pending = await asyncio.wait({set_task}, timeout=0.3)
-    assert set_task not in done  # blocked behind end_season_now's row lock
+        set_task = asyncio.create_task(season_service.set_min_games(pool, guild_id, _admin(), 5))
+        done, _pending = await asyncio.wait({set_task}, timeout=0.3)
+        assert set_task not in done  # blocked behind end_season_now's row lock
 
-    release_lock.set()
-    resolution = await asyncio.wait_for(end_task, timeout=2)
-    season_after, config_after = await asyncio.wait_for(set_task, timeout=2)
+        release_lock.set()
+        resolution = await asyncio.wait_for(end_task, timeout=2)
+        season_after, config_after = await asyncio.wait_for(set_task, timeout=2)
 
-    assert resolution.season.min_games == 2
-    ranked_by_id = {p.user_id: p for p in resolution.ranked}
-    assert ranked_by_id[4].eligible is True  # 2 games, min_games=2 (the locked value)
+        assert resolution.season.min_games == 2
+        ranked_by_id = {p.user_id: p for p in resolution.ranked}
+        assert ranked_by_id[4].eligible is True  # 2 games, min_games=2 (the locked value)
 
-    assert season_after is None  # no longer active by the time this runs
-    assert config_after.default_min_games == 5
+        assert season_after is None  # no longer active by the time this runs
+        assert config_after.default_min_games == 5
+    finally:
+        release_lock.set()
+        tasks = [task for task in (end_task, set_task) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -860,18 +958,26 @@ async def test_resolve_due_seasons_locks_only_one_candidate_leaving_other_guilds
 
     monkeypatch.setattr(season_service.seasons, "season_player_stats", _paused_stats)
 
-    resolve_task = asyncio.create_task(season_service.resolve_due_seasons(pool, due_now))
-    await asyncio.wait_for(reached.wait(), timeout=2)
+    resolve_task: asyncio.Task | None = None
+    try:
+        resolve_task = asyncio.create_task(season_service.resolve_due_seasons(pool, due_now))
+        await asyncio.wait_for(reached.wait(), timeout=2)
 
-    # The unrelated guild's own due-season resolution must not block.
-    other_resolution = await asyncio.wait_for(
-        season_service.end_season_now(pool, other_guild_id, _admin(), due_now), timeout=1
-    )
-    assert other_resolution.season.season_id == other_due_season.season_id
+        # The unrelated guild's own due-season resolution must not block.
+        other_resolution = await asyncio.wait_for(
+            season_service.end_season_now(pool, other_guild_id, _admin(), due_now), timeout=1
+        )
+        assert other_resolution.season.season_id == other_due_season.season_id
 
-    release.set()
-    resolved = await asyncio.wait_for(resolve_task, timeout=2)
-    assert {r.season.season_id for r in resolved} == {paused_season.season_id}
+        release.set()
+        resolved = await asyncio.wait_for(resolve_task, timeout=2)
+        assert {r.season.season_id for r in resolved} == {paused_season.season_id}
+    finally:
+        release.set()
+        if resolve_task is not None:
+            if not resolve_task.done():
+                resolve_task.cancel()
+            await asyncio.gather(resolve_task, return_exceptions=True)
 
 
 async def test_two_concurrent_resolve_due_seasons_calls_complete_three_seasons_once_each(

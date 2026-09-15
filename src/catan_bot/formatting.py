@@ -25,13 +25,20 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Sequence
+from datetime import datetime
 from fractions import Fraction
 
 import discord
 
-from catan_bot.db.models import Game, GameWithParticipants, GuildConfig, Season
+from catan_bot.db.models import Event, Game, GameWithParticipants, GuildConfig, RsvpCounts, Season
 from catan_bot.domain.ranking import RankedPlayer
-from catan_bot.services.results import Leaderboard, PlayerStatsView, SeasonInfo, SeasonResolution
+from catan_bot.services.results import (
+    Announcement,
+    Leaderboard,
+    PlayerStatsView,
+    SeasonInfo,
+    SeasonResolution,
+)
 
 # ---------------------------------------------------------------------------
 # Discord embed limits (see DESIGN.md's M4 display notes).
@@ -219,6 +226,12 @@ def role_mention(role_id: int) -> str:
 
 def format_win_rate(win_rate: Fraction) -> str:
     return f"{float(win_rate) * 100:.1f}%"
+
+
+def _discord_timestamp(value: datetime, style: str) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Discord timestamps require an aware datetime")
+    return f"<t:{int(value.timestamp())}:{style}>"
 
 
 def _add_field(
@@ -496,6 +509,123 @@ def build_season_announcement_embed(resolution: SeasonResolution) -> discord.Emb
     return embed
 
 
+def build_frozen_season_announcement_embed(announcement: Announcement) -> discord.Embed:
+    """Render a scheduler announcement exclusively from frozen result rows."""
+    season = announcement.season
+    title = truncate(f"Season Complete: {escape_user_text(season.name)}", EMBED_TITLE_MAX)
+    embed = discord.Embed(title=title, color=discord.Color.gold())
+
+    payers = [mention(row.user_id) for row in announcement.results if row.outcome == "payer"]
+    payees = [mention(row.user_id) for row in announcement.results if row.outcome == "payee"]
+    if payers and payees:
+        _set_description(embed, f"{', '.join(payers)} buys food for {', '.join(payees)}!")
+    else:
+        _set_description(embed, "There is no bet this season.")
+
+    rows: list[tuple[str, str]] = []
+    for result in sorted(announcement.results, key=lambda row: (row.rank, row.user_id))[:25]:
+        win_rate = Fraction(result.wins, result.games) if result.games else Fraction()
+        eligibility = "Eligible" if result.eligible else "Not eligible"
+        outcome = {
+            "payer": "Pays",
+            "payee": "Gets fed",
+            None: eligibility,
+        }[result.outcome]
+        rows.append(
+            (
+                f"#{result.rank} {mention(result.user_id)}",
+                f"{result.wins}-{result.games - result.wins} "
+                f"({format_win_rate(win_rate)}) -- {outcome}",
+            )
+        )
+    if rows:
+        _add_field_rows(embed, rows)
+    else:
+        _add_field(embed, "Final Standings", "No confirmed games were recorded.", inline=False)
+    return embed
+
+
+# ---------------------------------------------------------------------------
+# Event embeds.
+# ---------------------------------------------------------------------------
+
+_EVENT_STATUS_LABELS = {
+    "scheduled": "Scheduled",
+    "cancelled": "Cancelled",
+    "completed": "Completed",
+}
+
+
+def build_event_embed(event: Event, counts: RsvpCounts | None = None) -> discord.Embed:
+    title = truncate(f"Event: {escape_user_text(event.title)}", EMBED_TITLE_MAX)
+    colors = {
+        "scheduled": discord.Color.blurple(),
+        "cancelled": discord.Color.red(),
+        "completed": discord.Color.dark_grey(),
+    }
+    embed = discord.Embed(title=title, color=colors[event.status])
+    if event.description:
+        _set_description(embed, escape_user_text(event.description))
+    embed.add_field(name="Status", value=_EVENT_STATUS_LABELS[event.status], inline=True)
+    embed.add_field(
+        name="When",
+        value=(
+            f"{_discord_timestamp(event.starts_at, 'F')} "
+            f"({_discord_timestamp(event.starts_at, 'R')})"
+        ),
+        inline=False,
+    )
+    if event.location:
+        _add_field(embed, "Location", escape_user_text(event.location), inline=False)
+    embed.add_field(name="Created by", value=mention(event.created_by), inline=True)
+    if counts is not None:
+        embed.add_field(
+            name="RSVPs",
+            value=(
+                f"Going: {counts.going} | Maybe: {counts.maybe} | Not going: {counts.not_going}"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text=f"Event #{event.event_id}")
+    return embed
+
+
+def build_event_list_embed(events: Sequence[Event]) -> discord.Embed:
+    embed = discord.Embed(title="Upcoming Events", color=discord.Color.blurple())
+    if not events:
+        _set_description(embed, "No game nights are scheduled.")
+        return embed
+    rows: list[tuple[str, str]] = []
+    for event in events[:10]:
+        details = [
+            _discord_timestamp(event.starts_at, "F"),
+            f"Created by {mention(event.created_by)}",
+        ]
+        if event.location:
+            details.append(f"Location: {escape_user_text(event.location)}")
+        rows.append((f"#{event.event_id} {escape_user_text(event.title)}", " | ".join(details)))
+    _add_field_rows(embed, rows)
+    return embed
+
+
+def build_event_reminder_embed(event: Event, offset_minutes: int) -> discord.Embed:
+    heading = {1440: "Tomorrow", 60: "In one hour"}.get(offset_minutes, "Coming up")
+    title = truncate(f"{heading}: {escape_user_text(event.title)}", EMBED_TITLE_MAX)
+    embed = discord.Embed(title=title, color=discord.Color.gold())
+    embed.add_field(
+        name="When",
+        value=(
+            f"{_discord_timestamp(event.starts_at, 'F')} "
+            f"({_discord_timestamp(event.starts_at, 'R')})"
+        ),
+        inline=False,
+    )
+    if event.location:
+        _add_field(embed, "Location", escape_user_text(event.location), inline=False)
+    embed.set_footer(text=f"Event #{event.event_id}")
+    return embed
+
+
 # ---------------------------------------------------------------------------
 # Config embed.
 # ---------------------------------------------------------------------------
@@ -526,6 +656,10 @@ __all__ = [
     "EMBED_TITLE_MAX",
     "EMBED_TOTAL_MAX",
     "build_config_show_embed",
+    "build_event_embed",
+    "build_event_list_embed",
+    "build_event_reminder_embed",
+    "build_frozen_season_announcement_embed",
     "build_game_history_embed",
     "build_game_report_embed",
     "build_game_status_embed",
