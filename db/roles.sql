@@ -85,14 +85,24 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'catan_app')
 ALTER ROLE catan_app SET statement_timeout = '5s';
 
 -- ---------------------------------------------------------------------------
--- Databases, owned by the migrator role (idempotent create-if-not-exists)
+-- Databases, owned by the migrator role (idempotent create-if-not-exists).
+--
+-- ENCODING 'UTF8' TEMPLATE template0 is pinned explicitly (rather than
+-- inheriting whatever template1 happens to have) so Python `len()` always
+-- matches Postgres `char_length()` on stored text -- required for the
+-- CHECK (char_length(...) BETWEEN ...) constraints in 0001_init.sql to mean
+-- what the application code assumes. LC_COLLATE/LC_CTYPE are left at the
+-- cluster's initdb defaults (UTF8 is compatible with any locale), so this
+-- only pins encoding, not collation/ctype.
 -- ---------------------------------------------------------------------------
 
-SELECT format('CREATE DATABASE catan OWNER catan_migrator')
+SELECT format('CREATE DATABASE catan OWNER catan_migrator ENCODING %L TEMPLATE template0', 'UTF8')
 WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'catan')
 \gexec
 
-SELECT format('CREATE DATABASE catan_test OWNER catan_migrator')
+SELECT format(
+    'CREATE DATABASE catan_test OWNER catan_migrator ENCODING %L TEMPLATE template0', 'UTF8'
+)
 WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'catan_test')
 \gexec
 

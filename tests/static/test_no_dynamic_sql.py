@@ -64,14 +64,27 @@ def test_scan_tree_catches_a_planted_violation(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _is_dunder(name: str) -> bool:
+    return name.startswith("__") and name.endswith("__")
+
+
 def test_asyncpg_sinks_cover_every_query_bearing_method() -> None:
-    """Every public Connection/Pool method with a query/command/where/sql
-    parameter must be one of the guard's known sink names."""
-    interesting = {"query", "command", "where", "sql"}
+    """Every Connection/Pool/PoolConnectionProxy method -- public *or*
+    private, but not a dunder -- with a query/command/where/sql/copy_stmt
+    parameter must be one of the guard's known sink names.
+
+    Private asyncpg methods are real sinks reachable straight off a
+    `conn`/`pool` object (e.g. `conn._execute(...)`); skipping every
+    underscore-prefixed name (as an earlier version of this test did) let
+    `_execute` and friends bypass the guard entirely. `copy_stmt` is
+    `_copy_in`/`_copy_out`'s raw-SQL parameter -- differently named from the
+    other four, but the same shape of sink, so it's included here too.
+    """
+    interesting = {"query", "command", "where", "sql", "copy_stmt"}
     missing: set[str] = set()
-    for cls in (asyncpg.Connection, asyncpg.pool.Pool):
+    for cls in (asyncpg.Connection, asyncpg.Pool, asyncpg.pool.PoolConnectionProxy):
         for name, member in inspect.getmembers(cls):
-            if name.startswith("_") or not callable(member):
+            if _is_dunder(name) or not callable(member):
                 continue
             try:
                 sig = inspect.signature(member)
@@ -304,6 +317,55 @@ _BAD_SINGLE_FILE = [
         '    return await conn.execute("SELECT 1")\n',
         id="13b-connect-and-execute-const-outside-repositories",
     ),
+    # ------------------------------------------------------------------
+    # M3a audit: bypass 1 -- `**`/`*` unpacking into a sink hides the
+    # query-carrying argument from the query=/command=/positional checks.
+    # ------------------------------------------------------------------
+    pytest.param(
+        REPO_PATH,
+        'async def f(conn, q):\n    return await conn.fetch(**{"query": q})\n',
+        id="m3a1-01-double-star-dict-into-fetch",
+    ),
+    pytest.param(
+        REPO_PATH,
+        "async def f(conn, kwargs):\n    return await conn.execute(**kwargs)\n",
+        id="m3a1-02-double-star-kwargs-into-execute",
+    ),
+    pytest.param(
+        REPO_PATH,
+        "async def f(conn, args):\n    return await conn.fetchrow(*args)\n",
+        id="m3a1-03-star-args-into-fetchrow",
+    ),
+    pytest.param(
+        REPO_PATH,
+        "async def f(conn, kw):\n    return await conn.copy_records_to_table(**kw)\n",
+        id="m3a1-04-double-star-into-copy-records-to-table",
+    ),
+    # ------------------------------------------------------------------
+    # M3a audit: bypass 2 -- private asyncpg sinks (`_execute` etc.) were
+    # invisible to the location rule, the constant-argument rule, and the
+    # alias rule alike, since `_execute` wasn't in SQL_METHOD_NAMES.
+    # ------------------------------------------------------------------
+    pytest.param(
+        REPO_PATH,
+        "async def f(conn, q):\n    return await conn._execute(q, 1, 1, False)\n",
+        id="m3a2-01-private-execute-dynamic-positional",
+    ),
+    pytest.param(
+        REPO_PATH,
+        "async def f(conn, untrusted):\n    run = conn._execute\n    return await run(untrusted)\n",
+        id="m3a2-02-alias-conn-private-execute",
+    ),
+    pytest.param(
+        REPO_PATH,
+        'async def f(conn, q):\n    return await getattr(conn, "_execute")(q)\n',
+        id="m3a2-03-getattr-private-execute",
+    ),
+    pytest.param(
+        COG_PATH,
+        'async def f(conn):\n    return await conn._execute("SELECT 1", (), None, None)\n',
+        id="m3a2-04-private-execute-outside-repositories-const",
+    ),
 ]
 
 
@@ -474,6 +536,43 @@ def test_table_sink_with_sound_constants_is_clean() -> None:
         "    )\n"
     )
     assert find_violations_in_source(source, REPO_PATH) == []
+
+
+# ---------------------------------------------------------------------------
+# M3a audit: private-sink lookalikes must stay clean -- adding `_execute`
+# and friends to the sink sets must not turn into "flag every underscore
+# attribute". Domain/repository helper names and plain private-attribute
+# access on non-connection objects are unaffected.
+# ---------------------------------------------------------------------------
+
+_GOOD_SINGLE_FILE = [
+    pytest.param(
+        REPO_PATH,
+        '_SELECT_SQL = "SELECT * FROM guilds WHERE guild_id = $1"\n\n\n'
+        "async def f(conn, guild_id):\n    return await conn.fetchrow(_SELECT_SQL, guild_id)\n",
+        id="m3a-good-01-sound-fetchrow-in-repository",
+    ),
+    pytest.param(
+        REPO_PATH,
+        "def build(row):\n    return _row_to_game(row)\n",
+        id="m3a-good-02-row-mapper-helper-call",
+    ),
+    pytest.param(
+        REPO_PATH,
+        "class R:\n    def pool(self):\n        return self._pool\n",
+        id="m3a-good-03-private-pool-attribute-access",
+    ),
+    pytest.param(
+        REPO_PATH,
+        "def build(obj):\n    return obj._private_helper()\n",
+        id="m3a-good-04-private-helper-call",
+    ),
+]
+
+
+@pytest.mark.parametrize(("rel_path", "source"), _GOOD_SINGLE_FILE)
+def test_m3a_good_sample_stays_clean(rel_path: str, source: str) -> None:
+    assert find_violations_in_source(source, rel_path) == []
 
 
 def test_non_sql_fstring_elsewhere_is_clean() -> None:

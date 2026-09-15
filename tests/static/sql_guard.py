@@ -4,15 +4,21 @@ Enforces the project's hard SQL rules (see CLAUDE.md) against any Python
 module's source text. Three independent layers, each meant to fail *closed*
 (when in doubt, flag it):
 
-1. **Sink calls** (`execute`, `fetch`, `copy_to_table`, ...) may only appear
-   in `catan_bot/db/repositories/*.py` or `catan_bot/db/migrate.py`, and
-   every query-carrying / identifier-carrying argument they take must be a
-   *sound* string constant: a module-level `NAME = "literal"` that is bound
-   exactly once, anywhere, in any form (see `_sound_module_constants`). A
-   resolved constant may also not contain a stacked statement (`;` before
-   the end), since asyncpg's simple-protocol `execute()` runs those.
-   `catan_bot/db/migrate.py` gets exactly one narrowly-scoped exception for
-   executing the contents of a trusted migration file.
+1. **Sink calls** (`execute`, `fetch`, `copy_to_table`, ..., including
+   private asyncpg internals reachable off a `conn`/`pool` object such as
+   `_execute` -- see `SQL_METHOD_NAMES`) may only appear in
+   `catan_bot/db/repositories/*.py` or `catan_bot/db/migrate.py`, and every
+   query-carrying / identifier-carrying argument they take must be a *sound*
+   string constant: a module-level `NAME = "literal"` that is bound exactly
+   once, anywhere, in any form (see `_sound_module_constants`). A resolved
+   constant may also not contain a stacked statement (`;` before the end),
+   since asyncpg's simple-protocol `execute()` runs those. Any `**`
+   keyword-unpacking passed into a sink call is rejected outright, since its
+   contents can't be inspected statically (`conn.fetch(**{"query": q})`
+   would otherwise smuggle a dynamic query past the `query=`/`command=`
+   keyword check). `catan_bot/db/migrate.py` gets exactly one
+   narrowly-scoped exception for executing the contents of a trusted
+   migration file.
 2. **Indirect references** to a sink (aliasing `conn.execute`, reaching it
    via `getattr`/`operator.methodcaller`/`operator.attrgetter`, or via
    `__import__`/`importlib.import_module`) are flagged everywhere, since
@@ -84,12 +90,34 @@ QUERY_SINK_NAMES = frozenset(
         "prepare",
         "cursor",
         "copy_from_query",
+        # Private asyncpg.Connection internals (asyncpg 0.31) that still
+        # carry raw SQL text and are reachable straight off a `conn`/`pool`
+        # object, e.g. `conn._execute(...)`. Not public API, but a sink is a
+        # sink -- see test_asyncpg_sinks_cover_every_query_bearing_method,
+        # which fails if a future asyncpg upgrade adds another one of these.
+        "_execute",
+        "_executemany",
+        "_do_execute",
+        "_get_statement",
+        "_prepare",
+        "_time_and_log",
+        "_Connection__execute",  # name-mangled form of Connection.__execute
+        "_copy_in",  # takes `copy_stmt`, not `query`, but is the same sink
+        "_copy_out",  # shape: a raw SQL/COPY statement string, no params
     }
 )
 
 # Methods that carry raw SQL identifiers/predicates as `table_name`,
 # `schema_name`, `where`, or `columns` instead of a `query` string.
-TABLE_SINK_NAMES = frozenset({"copy_from_table", "copy_to_table", "copy_records_to_table"})
+TABLE_SINK_NAMES = frozenset(
+    {
+        "copy_from_table",
+        "copy_to_table",
+        "copy_records_to_table",
+        # Private: asyncpg.Connection's internal COPY ... WHERE formatter.
+        "_format_copy_where",
+    }
+)
 
 # Union, used for the location rule and for indirect-reference detection.
 SQL_METHOD_NAMES = QUERY_SINK_NAMES | TABLE_SINK_NAMES
@@ -562,20 +590,28 @@ def _resolved_text(node: AST, names: dict[str, str]) -> str:
 
 
 def _query_sink_arg_nodes(call: Call) -> list[tuple[str, AST]]:
-    """Every query-carrying argument: the first positional, plus query=/command=."""
+    """Every query-carrying argument: the first positional, plus
+    query=/command=/copy_stmt= (the latter is what `_copy_in`/`_copy_out`
+    name their raw-SQL parameter)."""
     nodes: list[tuple[str, AST]] = []
     if call.args:
         nodes.append(("positional", call.args[0]))
     for kw in call.keywords:
-        if kw.arg in ("query", "command"):
+        if kw.arg in ("query", "command", "copy_stmt"):
             nodes.append((kw.arg, kw.value))
     return nodes
 
 
-def _table_sink_arg_nodes(call: Call) -> list[tuple[str, AST]]:
+# `_format_copy_where`'s only parameter is `where`, not `table_name`; every
+# other table-style sink's first positional parameter is `table_name`.
+_TABLE_SINK_POSITIONAL_LABEL = {"_format_copy_where": "where"}
+
+
+def _table_sink_arg_nodes(call: Call, attr: str) -> list[tuple[str, AST]]:
     nodes: list[tuple[str, AST]] = []
     if call.args:
-        nodes.append(("table_name", call.args[0]))
+        label = _TABLE_SINK_POSITIONAL_LABEL.get(attr, "table_name")
+        nodes.append((label, call.args[0]))
     for kw in call.keywords:
         if kw.arg in ("table_name", "schema_name", "where", "columns"):
             nodes.append((kw.arg, kw.value))
@@ -596,6 +632,20 @@ def _check_sink_call(
             )
         )
         return out
+    star_kwargs = [kw for kw in call.keywords if kw.arg is None]
+    if star_kwargs:
+        # A `**mapping` keyword can smuggle a `query=`/`command=`/`where=`/
+        # etc. key past every other check here -- its contents (whatever
+        # they are) can never be resolved statically, so it's rejected
+        # outright, for query-style and table-style sinks alike.
+        out.append(
+            Violation(
+                rel_path,
+                call.lineno,
+                f"call to .{attr}() uses ** keyword-unpacking; its contents can't be "
+                "checked statically, so it's not allowed on a SQL sink",
+            )
+        )
     if is_allowlisted:
         return out
     if attr in QUERY_SINK_NAMES:
@@ -619,7 +669,7 @@ def _check_sink_call(
                     )
                 )
     elif attr in TABLE_SINK_NAMES:
-        for label, node in _table_sink_arg_nodes(call):
+        for label, node in _table_sink_arg_nodes(call, attr):
             sound = (
                 _is_sound_columns_value(node, names)
                 if label == "columns"

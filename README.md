@@ -38,6 +38,7 @@ command set for later milestones.
 - PostgreSQL 16
 - Docker Compose
 - pytest, ruff, bandit
+- Oracle Cloud (OCI)
 
 ## Security: SQL injection prevention
 
