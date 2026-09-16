@@ -125,6 +125,19 @@ def test_score_sheet_is_player_column_oriented_with_six_player_legend() -> None:
     assert game_scores._BLANK in description
 
 
+def test_score_sheet_submit_button_lookup_skips_select_children() -> None:
+    sheet = _sheet()
+
+    select = next(child for child in sheet.children if isinstance(child, discord.ui.Select))
+    assert not hasattr(select, "label")
+
+    submit_button = next(
+        child for child in sheet.children if getattr(child, "label", None) == "Submit report"
+    )
+    assert isinstance(submit_button, discord.ui.Button)
+    assert callable(submit_button.callback)
+
+
 def test_game_type_catalog_controls_score_rows() -> None:
     normal_pages = game_scores.score_pages(GameRules("normal", target_points=10))
     normal = [source.key for source in normal_pages[0]]

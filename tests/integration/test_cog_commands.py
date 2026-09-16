@@ -115,7 +115,9 @@ async def test_game_commands_buttons_and_stats_complete_the_interaction_flow(
     report_embed = _embed_from(report_interaction)
     assert report_embed.title == "Game score sheet"
     score_sheet = report_interaction.edit_original_response.await_args.kwargs["view"]
-    submit_button = next(item for item in score_sheet.children if item.label == "Submit report")
+    submit_button = next(
+        item for item in score_sheet.children if getattr(item, "label", None) == "Submit report"
+    )
     submit_interaction = InteractionStub(guild_id, reporter.user_id, pool=pool)
     await submit_button.callback(submit_interaction)
     submit_interaction.response.defer.assert_awaited_once_with()
