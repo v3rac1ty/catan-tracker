@@ -381,6 +381,32 @@ async def test_create_game_validates_loser_ids_before_conn(conn: _ExplodingConne
         await games.create_game(conn, 1, None, PLAYED_ON, 1, 1, [True])
 
 
+async def test_create_game_validates_game_type_before_conn(conn: _ExplodingConnection) -> None:
+    with pytest.raises(ValueError, match="game_type"):
+        await games.create_game(conn, 1, None, PLAYED_ON, 1, 1, [2], game_type="unknown")
+
+
+async def test_create_game_validates_target_points_before_conn(conn: _ExplodingConnection) -> None:
+    with pytest.raises(ValueError, match="target_points"):
+        await games.create_game(conn, 1, None, PLAYED_ON, 1, 1, [2], target_points=True)
+
+
+async def test_create_game_requires_paired_played_time_fields_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="played_at and played_timezone"):
+        await games.create_game(
+            conn,
+            1,
+            None,
+            PLAYED_ON,
+            1,
+            1,
+            [2],
+            played_at=_AWARE_DATETIME,
+        )
+
+
 async def test_set_game_message_validates_game_id_before_conn(conn: _ExplodingConnection) -> None:
     with pytest.raises(ValueError, match="game_id"):
         await games.set_game_message(conn, 1, 0, 1, 1)

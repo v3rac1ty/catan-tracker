@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Literal
 
+from catan_bot.domain.scoring import PlayerScore
+
 GameStatus = Literal["pending", "confirmed", "rejected", "voided"]
 SeasonStatus = Literal["active", "completed", "cancelled"]
 EventStatus = Literal["scheduled", "cancelled", "completed"]
@@ -104,6 +106,14 @@ class Game:
     channel_id: int | None
     message_id: int | None
     created_at: datetime
+    # Defaults keep existing callers and historical rows compatible while new
+    # reports may opt into a detailed ruleset and score sheet.
+    game_type: str = "normal"
+    extension_5_6: bool = False
+    scenario: str | None = None
+    target_points: int | None = None
+    played_at: datetime | None = None
+    played_timezone: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +121,7 @@ class GameWithParticipants:
     game: Game
     winner_id: int
     loser_ids: tuple[int, ...]
+    scores: tuple[PlayerScore, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

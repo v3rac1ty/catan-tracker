@@ -12,26 +12,43 @@ a separate constant per transition (never a shared dynamic query).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime
 
 import asyncpg
 
 from catan_bot.db.models import Game, GameWithParticipants, TransitionResult
-from catan_bot.db.repositories._params import require_id, require_limit, require_optional_id
+from catan_bot.db.repositories._params import (
+    require_aware,
+    require_id,
+    require_int,
+    require_limit,
+    require_optional_id,
+)
+from catan_bot.domain.scoring import GameRules, PlayerScore, ScoreEntry, score_sources
+
+_GAME_TYPES = frozenset({"normal", "seafarers", "cities_knights", "seafarers_cities_knights"})
 
 _INSERT_GAME_SQL = """
-INSERT INTO games (guild_id, season_id, played_on, reported_by)
-VALUES ($1, $2, $3, $4)
+INSERT INTO games (
+    guild_id, season_id, played_on, reported_by, game_type, extension_5_6,
+    scenario, target_points, played_at, played_timezone
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
           confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
-          channel_id, message_id, created_at
+          channel_id, message_id, created_at, game_type, extension_5_6, scenario,
+          target_points, played_at, played_timezone
 """
 
 _INSERT_GAME_PARTICIPANTS_SQL = """
-INSERT INTO game_participants (game_id, user_id, guild_id, is_winner)
-SELECT $1, u, $2, w
-FROM unnest($3::bigint[], $4::boolean[]) AS t(u, w)
+INSERT INTO game_participants (
+    game_id, user_id, guild_id, is_winner, total_points, score_breakdown
+)
+SELECT $1, u, $2, w, points, breakdown::jsonb
+FROM unnest($3::bigint[], $4::boolean[], $5::smallint[], $6::text[])
+    AS t(u, w, points, breakdown)
 """
 
 _UPDATE_GAME_MESSAGE_SQL = """
@@ -40,21 +57,24 @@ SET channel_id = $3, message_id = $4
 WHERE guild_id = $1 AND game_id = $2
 RETURNING game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
           confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
-          channel_id, message_id, created_at
+          channel_id, message_id, created_at, game_type, extension_5_6, scenario,
+          target_points, played_at, played_timezone
 """
 
 _SELECT_GAME_SQL = """
 SELECT game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
        confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
-       channel_id, message_id, created_at
+       channel_id, message_id, created_at, game_type, extension_5_6, scenario,
+       target_points, played_at, played_timezone
 FROM games
 WHERE guild_id = $1 AND game_id = $2
 """
 
 _SELECT_GAME_PARTICIPANTS_SQL = """
-SELECT user_id, is_winner
+SELECT user_id, is_winner, total_points, score_breakdown
 FROM game_participants
 WHERE guild_id = $1 AND game_id = $2
+ORDER BY is_winner DESC, user_id ASC
 """
 
 _CONFIRM_GAME_SQL = """
@@ -118,21 +138,24 @@ WHERE guild_id = $1 AND game_id = $2
 _LIST_RECENT_GAMES_SQL = """
 SELECT game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
        confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
-       channel_id, message_id, created_at
+       channel_id, message_id, created_at, game_type, extension_5_6, scenario,
+       target_points, played_at, played_timezone
 FROM games
 WHERE guild_id = $1
-ORDER BY game_id DESC
+ORDER BY played_on DESC, played_at DESC NULLS LAST, game_id DESC
 LIMIT $2
 """
 
 _LIST_RECENT_GAMES_FOR_PLAYER_SQL = """
 SELECT g.game_id, g.guild_id, g.season_id, g.played_on, g.status, g.reported_by,
        g.confirmed_by, g.confirmed_at, g.voided_by, g.voided_at, g.void_reason,
-       g.rejected_by, g.rejected_at, g.channel_id, g.message_id, g.created_at
+       g.rejected_by, g.rejected_at, g.channel_id, g.message_id, g.created_at,
+       g.game_type, g.extension_5_6, g.scenario, g.target_points, g.played_at,
+       g.played_timezone
 FROM games g
 JOIN game_participants p ON p.game_id = g.game_id AND p.guild_id = g.guild_id
 WHERE g.guild_id = $1 AND p.user_id = $2
-ORDER BY g.game_id DESC
+ORDER BY g.played_on DESC, g.played_at DESC NULLS LAST, g.game_id DESC
 LIMIT $3
 """
 
@@ -155,6 +178,154 @@ def _row_to_game(row: asyncpg.Record) -> Game:
         channel_id=row["channel_id"],
         message_id=row["message_id"],
         created_at=row["created_at"],
+        game_type=row["game_type"],
+        extension_5_6=row["extension_5_6"],
+        scenario=row["scenario"],
+        target_points=row["target_points"],
+        played_at=row["played_at"],
+        played_timezone=row["played_timezone"],
+    )
+
+
+def _require_game_type(value: object) -> str:
+    if not isinstance(value, str) or value not in _GAME_TYPES:
+        raise ValueError(f"game_type must be one of {sorted(_GAME_TYPES)!r}, got {value!r}")
+    return value
+
+
+def _require_extension(value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"extension_5_6 must be a bool, got {value!r} ({type(value).__name__})")
+    return value
+
+
+def _require_optional_bounded_str(
+    value: object, *, name: str, min_length: int, max_length: int
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not min_length <= len(value) <= max_length:
+        raise ValueError(
+            f"{name} must be a str with length between {min_length} and {max_length}, got {value!r}"
+        )
+    return value
+
+
+def _validate_played_time(
+    played_at: datetime | None, played_timezone: str | None
+) -> tuple[datetime | None, str | None]:
+    if (played_at is None) != (played_timezone is None):
+        raise ValueError("played_at and played_timezone must either both be set or both be None")
+    if played_at is None:
+        return None, None
+    return (
+        require_aware(played_at, name="played_at"),
+        _require_optional_bounded_str(
+            played_timezone, name="played_timezone", min_length=1, max_length=64
+        ),
+    )
+
+
+def _score_breakdown_json(value: object, *, name: str) -> str:
+    """Turn the immutable domain representation into a JSON object string.
+
+    asyncpg's JSONB codec returns text by default, and accepting only
+    string-keyed, integer-valued pairs here makes persistence explicit and
+    prevents a mutable caller mapping from being passed through implicitly.
+    Rule-specific keys and totals are deliberately validated by the domain
+    layer; this repository only enforces the durable JSONB-object boundary.
+    """
+    if not isinstance(value, tuple):
+        raise ValueError(f"{name} must be a tuple of ScoreEntry values")
+    breakdown: dict[str, int] = {}
+    for index, item in enumerate(value):
+        if type(item) is not ScoreEntry:
+            raise ValueError(f"{name}[{index}] must be a ScoreEntry")
+        key, points = item.key, item.points
+        if points > 99:
+            raise ValueError(f"{name}[{index}].points must be an int between 0 and 99")
+        if key in breakdown:
+            raise ValueError(f"{name} contains duplicate key {key!r}")
+        breakdown[key] = points
+    return json.dumps(breakdown, separators=(",", ":"), ensure_ascii=False)
+
+
+def _scores_for_participants(
+    scores: Sequence[PlayerScore] | None, user_ids: Sequence[int]
+) -> tuple[list[int | None], list[str | None]]:
+    if scores is None:
+        return [None] * len(user_ids), [None] * len(user_ids)
+    if not isinstance(scores, (list, tuple)):
+        raise ValueError("scores must be a list or tuple of PlayerScore")
+    # An unfinished/omitted score sheet has no durable score data.  This is
+    # intentionally different from a full sheet whose rows all happen to be
+    # zero: that one is represented by non-NULL totals and JSON objects.
+    if not scores:
+        return [None] * len(user_ids), [None] * len(user_ids)
+
+    by_user_id: dict[int, PlayerScore] = {}
+    for index, score in enumerate(scores):
+        if not isinstance(score, PlayerScore):
+            raise ValueError(f"scores[{index}] must be a PlayerScore")
+        user_id = require_id(score.user_id, name=f"scores[{index}].user_id")
+        if user_id in by_user_id:
+            raise ValueError(f"scores contains duplicate user_id {user_id}")
+        require_int(
+            score.total_points,
+            name=f"scores[{index}].total_points",
+            min_value=0,
+            max_value=99,
+        )
+        _score_breakdown_json(score.breakdown, name=f"scores[{index}].breakdown")
+        by_user_id[user_id] = score
+
+    if set(by_user_id) != set(user_ids) or len(by_user_id) != len(user_ids):
+        raise ValueError("scores must contain exactly one score for every game participant")
+
+    return (
+        [by_user_id[user_id].total_points for user_id in user_ids],
+        [
+            _score_breakdown_json(by_user_id[user_id].breakdown, name="score.breakdown")
+            for user_id in user_ids
+        ],
+    )
+
+
+def _row_to_player_score(row: asyncpg.Record, game: Game) -> PlayerScore | None:
+    total_points = row["total_points"]
+    score_breakdown = row["score_breakdown"]
+    if total_points is None and score_breakdown is None:
+        return None
+    # pragma: no cover -- DB CHECK enforces pairing.
+    if total_points is None or score_breakdown is None:
+        raise RuntimeError("game participant has incomplete score data")
+    decoded = json.loads(score_breakdown)
+    if not isinstance(decoded, dict):  # pragma: no cover -- DB CHECK enforces JSON object.
+        raise RuntimeError("game participant score_breakdown is not a JSON object")
+    source_order = {
+        source.key: index
+        for index, source in enumerate(
+            score_sources(
+                GameRules(
+                    game_type=game.game_type,
+                    extension_5_6=game.extension_5_6,
+                    scenario=game.scenario,
+                    target_points=game.target_points,
+                )
+            )
+        )
+    }
+    entries = sorted(
+        decoded.items(),
+        key=lambda item: (source_order.get(item[0], len(source_order)), item[0]),
+    )
+    breakdown: list[ScoreEntry] = []
+    for key, points in entries:
+        if not isinstance(key, str) or type(points) is not int:
+            raise RuntimeError("game participant score_breakdown has invalid entries")
+        breakdown.append(ScoreEntry(key=key, points=points))
+    return PlayerScore(
+        user_id=row["user_id"], total_points=total_points, breakdown=tuple(breakdown)
     )
 
 
@@ -166,6 +337,14 @@ async def create_game(
     reported_by: int,
     winner_id: int,
     loser_ids: Sequence[int],
+    *,
+    game_type: str = "normal",
+    extension_5_6: bool = False,
+    scenario: str | None = None,
+    target_points: int | None = None,
+    played_at: datetime | None = None,
+    played_timezone: str | None = None,
+    scores: Sequence[PlayerScore] | None = None,
 ) -> Game:
     """Insert a pending game and its participants in one transaction.
 
@@ -178,6 +357,16 @@ async def create_game(
     require_optional_id(season_id, name="season_id")
     require_id(reported_by, name="reported_by")
     require_id(winner_id, name="winner_id")
+    game_type = _require_game_type(game_type)
+    extension_5_6 = _require_extension(extension_5_6)
+    scenario = _require_optional_bounded_str(
+        scenario, name="scenario", min_length=1, max_length=100
+    )
+    if target_points is not None:
+        target_points = require_int(
+            target_points, name="target_points", min_value=1, max_value=99
+        )
+    played_at, played_timezone = _validate_played_time(played_at, played_timezone)
     # Materialize exactly once: `loser_ids` may be a one-shot iterable (e.g. a
     # generator), and validating it here must not be the thing that consumes
     # it before `len(loser_ids)`/the SQL call below ever see it (N1 audit
@@ -185,18 +374,35 @@ async def create_game(
     loser_ids = list(loser_ids)
     for i, loser_id in enumerate(loser_ids):
         require_id(loser_id, name=f"loser_ids[{i}]")
+    user_ids = [winner_id, *loser_ids]
+    total_points, score_breakdowns = _scores_for_participants(scores, user_ids)
     async with conn.transaction():
         game_row = await conn.fetchrow(
-            _INSERT_GAME_SQL, guild_id, season_id, played_on, reported_by
+            _INSERT_GAME_SQL,
+            guild_id,
+            season_id,
+            played_on,
+            reported_by,
+            game_type,
+            extension_5_6,
+            scenario,
+            target_points,
+            played_at,
+            played_timezone,
         )
         if game_row is None:  # pragma: no cover -- INSERT ... RETURNING always returns a row.
             raise RuntimeError("INSERT INTO games did not return a row")
         game = _row_to_game(game_row)
 
-        user_ids = [winner_id, *loser_ids]
         is_winner_flags = [True, *([False] * len(loser_ids))]
         await conn.execute(
-            _INSERT_GAME_PARTICIPANTS_SQL, game.game_id, guild_id, user_ids, is_winner_flags
+            _INSERT_GAME_PARTICIPANTS_SQL,
+            game.game_id,
+            guild_id,
+            user_ids,
+            is_winner_flags,
+            total_points,
+            score_breakdowns,
         )
     return game
 
@@ -225,14 +431,20 @@ async def get_game(
     participant_rows = await conn.fetch(_SELECT_GAME_PARTICIPANTS_SQL, guild_id, game_id)
     winner_id: int | None = None
     loser_ids: list[int] = []
+    scores: list[PlayerScore] = []
     for row in participant_rows:
         if row["is_winner"]:
             winner_id = row["user_id"]
         else:
             loser_ids.append(row["user_id"])
+        score = _row_to_player_score(row, game)
+        if score is not None:
+            scores.append(score)
     if winner_id is None:  # pragma: no cover -- a game always has exactly one winner.
         raise RuntimeError(f"game {game_id} in guild {guild_id} has no winner participant")
-    return GameWithParticipants(game=game, winner_id=winner_id, loser_ids=tuple(loser_ids))
+    return GameWithParticipants(
+        game=game, winner_id=winner_id, loser_ids=tuple(loser_ids), scores=tuple(scores)
+    )
 
 
 async def confirm_game(

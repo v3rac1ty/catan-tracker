@@ -27,6 +27,7 @@ import unicodedata
 from collections.abc import Sequence
 from datetime import datetime
 from fractions import Fraction
+from zoneinfo import ZoneInfo
 
 import discord
 
@@ -40,6 +41,7 @@ from catan_bot.db.models import (
     Season,
 )
 from catan_bot.domain.ranking import RankedPlayer
+from catan_bot.domain.scoring import GameRules, ScoreSource, score_sources
 from catan_bot.services.results import (
     Announcement,
     Leaderboard,
@@ -295,6 +297,149 @@ def _status_label(status: str) -> str:
     return _STATUS_LABELS.get(status, status.capitalize())
 
 
+_GAME_TYPE_LABELS = {
+    "normal": "Normal",
+    "seafarers": "Seafarers",
+    "cities_knights": "Cities & Knights",
+    "seafarers_cities_knights": "Seafarers + Cities & Knights",
+}
+
+
+def _game_type_label(game_type: str) -> str:
+    """Return a safe, human-friendly label for a stored game type."""
+
+    return _GAME_TYPE_LABELS.get(game_type, escape_user_text(game_type))
+
+
+def _game_rules(game: Game) -> GameRules | None:
+    """Build display rules from a game, tolerating legacy/corrupt metadata."""
+
+    try:
+        return GameRules(
+            game_type=game.game_type,
+            extension_5_6=game.extension_5_6,
+            scenario=game.scenario,
+            target_points=game.target_points,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _played_label(game: Game) -> str:
+    """Render the stable game date and, when available, its local time."""
+
+    date_label = game.played_on.isoformat()
+    if game.played_at is None or not game.played_timezone:
+        return f"{date_label}\nTime not recorded"
+    try:
+        zone = ZoneInfo(game.played_timezone)
+        if game.played_at.tzinfo is None or game.played_at.utcoffset() is None:
+            return f"{date_label}\nTime not recorded"
+        local_time = game.played_at.astimezone(zone)
+    except (KeyError, TypeError, ValueError):
+        return f"{date_label}\nTime not recorded"
+    timezone = escape_user_text(game.played_timezone)
+    return f"{date_label} at {local_time:%H:%M} ({timezone})"
+
+
+def _history_played_label(game: Game) -> str:
+    """Keep history field names single-line while retaining missing-time detail."""
+
+    return _played_label(game).replace("\n", " — ")
+
+
+def _add_game_details(embed: discord.Embed, game: Game) -> None:
+    """Add rule metadata shared by pending and lifecycle game embeds."""
+
+    _add_field(embed, "Game type", _game_type_label(game.game_type), inline=True)
+    if game.extension_5_6:
+        _add_field(embed, "Extension", "5–6 Player Extension", inline=True)
+    if game.scenario:
+        _add_field(embed, "Scenario", escape_user_text(game.scenario), inline=True)
+    if game.target_points is not None:
+        _add_field(embed, "Target", f"{game.target_points} points", inline=True)
+    # Keep the historical field name while including optional local time and
+    # timezone in the value for newer reports.
+    _add_field(embed, "Date", _played_label(game), inline=True)
+
+
+_SCORE_LABELS = {
+    "settlements": "Houses",
+    "cities": "Cities",
+    "longest_road": "Longest road",
+    "longest_trade_route": "Trade route",
+    "largest_army": "Largest army",
+    "vp_cards": "VP cards",
+    "metropolis_bonus": "Metropolis",
+    "defender_of_catan": "Defender",
+    "merchant": "Merchant",
+    "constitution": "Constitution",
+    "printer": "Printer",
+    "scenario_points": "Scenario",
+}
+
+
+def _score_source_label(source: ScoreSource) -> str:
+    return _SCORE_LABELS.get(source.key, source.label)
+
+
+def format_game_score_table(created: GameWithParticipants) -> str:
+    """Render a compact P1..P6 score table, preserving NULL as an em dash.
+
+    Discord member mentions are kept in the legend rather than the table so
+    long display names never widen or truncate the score columns.  The
+    returned text is safe to put in an embed delivered with AllowedMentions.none().
+    """
+
+    if not created.scores:
+        return "Points not recorded"
+
+    player_ids = (created.winner_id, *created.loser_ids)
+    labels = [f"P{index}" for index in range(1, len(player_ids) + 1)]
+    legend = "Players: " + " • ".join(
+        f"{label} {mention(user_id)}" for label, user_id in zip(labels, player_ids, strict=True)
+    )
+    rules = _game_rules(created.game)
+    sources = score_sources(rules) if rules is not None else ()
+    score_by_player = {score.user_id: score for score in created.scores}
+    entries_by_player = {
+        user_id: {entry.key: entry.points for entry in score.breakdown}
+        for user_id, score in score_by_player.items()
+    }
+
+    row_labels = [_score_source_label(source)[:12] for source in sources]
+    row_labels.append("Total")
+    row_label_width = max((len(label) for label in row_labels), default=5)
+    separator = " | "
+    header_cells = [f"{label:>3}" for label in labels]
+    table_rows = [separator.join((f"{'':<{row_label_width}}", *header_cells))]
+    for source in sources:
+        cells = [
+            str(entries_by_player.get(user_id, {}).get(source.key, "—"))
+            for user_id in player_ids
+        ]
+        value_cells = [f"{cell:>3}" for cell in cells]
+        table_rows.append(
+            separator.join(
+                (f"{_score_source_label(source)[:12]:<{row_label_width}}", *value_cells)
+            )
+        )
+    total_cells = [
+        str(score_by_player[user_id].total_points)
+        if user_id in score_by_player
+        else "—"
+        for user_id in player_ids
+    ]
+    table_rows.append(
+        separator.join((f"{'Total':<{row_label_width}}", *[f"{cell:>3}" for cell in total_cells]))
+    )
+    return legend + "\n```text\n" + "\n".join(table_rows) + "\n```"
+
+
+def _add_game_scores(embed: discord.Embed, created: GameWithParticipants) -> None:
+    _add_field(embed, "Point breakdown", format_game_score_table(created), inline=False)
+
+
 def _standings_lines(
     players: Sequence[RankedPlayer], *, needs_more: bool, min_games: int = 0
 ) -> list[str]:
@@ -326,7 +471,8 @@ def build_game_report_embed(created: GameWithParticipants) -> discord.Embed:
     embed.add_field(name="Winner", value=mention(created.winner_id), inline=True)
     losers_text = ", ".join(mention(uid) for uid in created.loser_ids)
     embed.add_field(name="Loser(s)", value=losers_text, inline=True)
-    embed.add_field(name="Date", value=game.played_on.isoformat(), inline=True)
+    _add_game_details(embed, game)
+    _add_game_scores(embed, created)
     embed.set_footer(text=f"Game #{game.game_id}")
     return embed
 
@@ -346,7 +492,8 @@ def build_game_status_embed(updated: GameWithParticipants) -> discord.Embed:
     embed.add_field(name="Winner", value=mention(updated.winner_id), inline=True)
     losers_text = ", ".join(mention(uid) for uid in updated.loser_ids) or "None"
     embed.add_field(name="Loser(s)", value=losers_text, inline=True)
-    embed.add_field(name="Date", value=game.played_on.isoformat(), inline=True)
+    _add_game_details(embed, game)
+    _add_game_scores(embed, updated)
     embed.add_field(name="Status", value=_status_label(game.status), inline=True)
     if game.status == "confirmed" and game.confirmed_by is not None:
         embed.add_field(name="Confirmed by", value=mention(game.confirmed_by), inline=True)
@@ -380,7 +527,10 @@ def build_game_history_embed(games: Sequence[Game], *, member_id: int | None) ->
                 parts.append(f"Voided by {mention(game.voided_by)}")
             if game.void_reason:
                 parts.append(f"Reason: {escape_user_text(game.void_reason)}")
-        field_name = f"Game #{game.game_id} -- {game.played_on.isoformat()}"
+        field_name = (
+            f"Game #{game.game_id} -- {_game_type_label(game.game_type)} -- "
+            f"{_history_played_label(game)}"
+        )
         rows.append((field_name, " | ".join(parts)))
     _add_field_rows(embed, rows)
     return embed
@@ -721,6 +871,7 @@ __all__ = [
     "build_stats_embed",
     "channel_mention",
     "escape_user_text",
+    "format_game_score_table",
     "format_win_rate",
     "mention",
     "role_mention",

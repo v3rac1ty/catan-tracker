@@ -401,6 +401,69 @@ async def test_season_name_length_out_of_range_raises_check_violation(
         await _insert_season(app_conn, name=bad_name)
 
 
+async def test_game_scoring_metadata_defaults_and_time_pair_constraint(
+    app_conn: asyncpg.Connection,
+) -> None:
+    await _insert_guild(app_conn)
+    row = await app_conn.fetchrow(
+        "INSERT INTO games (guild_id, played_on, reported_by) VALUES ($1, $2, $3) "
+        "RETURNING game_type, extension_5_6, target_points, played_at, played_timezone",
+        GUILD_ID,
+        date(2026, 1, 5),
+        1,
+    )
+    assert row["game_type"] == "normal"
+    assert row["extension_5_6"] is False
+    assert row["target_points"] is None
+    assert row["played_at"] is None
+    assert row["played_timezone"] is None
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await app_conn.execute(
+            "INSERT INTO games (guild_id, played_on, reported_by, played_at) "
+            "VALUES ($1, $2, $3, $4)",
+            GUILD_ID,
+            date(2026, 1, 6),
+            1,
+            datetime(2026, 1, 6, tzinfo=UTC),
+        )
+
+
+async def test_game_participant_scores_must_be_an_object_and_paired(
+    app_conn: asyncpg.Connection,
+) -> None:
+    await _insert_guild(app_conn)
+    await app_conn.execute("INSERT INTO players (guild_id, user_id) VALUES ($1, $2)", GUILD_ID, 1)
+    game_id = await app_conn.fetchval(
+        "INSERT INTO games (guild_id, played_on, reported_by) VALUES ($1, $2, $3) "
+        "RETURNING game_id",
+        GUILD_ID,
+        date(2026, 1, 5),
+        1,
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await app_conn.execute(
+            "INSERT INTO game_participants (game_id, user_id, guild_id, total_points) "
+            "VALUES ($1, $2, $3, $4)",
+            game_id,
+            1,
+            GUILD_ID,
+            10,
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await app_conn.execute(
+            "INSERT INTO game_participants "
+            "(game_id, user_id, guild_id, total_points, score_breakdown) "
+            "VALUES ($1, $2, $3, $4, $5::jsonb)",
+            game_id,
+            1,
+            GUILD_ID,
+            10,
+            "[]",
+        )
+
+
 async def test_migrations_are_idempotent() -> None:
     migrator_dsn = os.environ["TEST_MIGRATOR_DATABASE_URL"]
     # The session-scoped `run_migrations` fixture already applied every

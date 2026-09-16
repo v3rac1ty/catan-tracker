@@ -8,6 +8,7 @@ import pytest
 
 from catan_bot.cogs import config_cog, game_cog, season_cog, stats_cog
 from catan_bot.domain.errors import DomainValidationError
+from catan_bot.domain.scoring import GameRules
 from catan_bot.permissions import actor_from_interaction, guild_id_from_interaction
 from catan_bot.services.context import Actor
 
@@ -59,7 +60,7 @@ def test_group_cogs_expose_every_m4_subcommand() -> None:
         "history",
     }
     assert game.name == "game"
-    assert {command.name for command in game.commands} == {"report", "void", "history"}
+    assert {command.name for command in game.commands} == {"report", "void", "history", "show"}
 
 
 def test_config_exposes_player_role_command() -> None:
@@ -88,11 +89,17 @@ def test_player_role_validation_rejects_everyone_and_cross_guild() -> None:
 def test_command_options_publish_required_bounds() -> None:
     start = season_cog.SeasonCog.season_group.get_command("start")
     void = game_cog.GameCog.game_group.get_command("void")
+    report = game_cog.GameCog.game_group.get_command("report")
+    show = game_cog.GameCog.game_group.get_command("show")
     assert start is not None
     assert void is not None
+    assert report is not None
+    assert show is not None
 
     start_options = {parameter.name: parameter for parameter in start.parameters}
     void_options = {parameter.name: parameter for parameter in void.parameters}
+    report_options = {parameter.name: parameter for parameter in report.parameters}
+    show_options = {parameter.name: parameter for parameter in show.parameters}
     assert (start_options["name"].min_value, start_options["name"].max_value) == (1, 100)
     assert (start_options["end_date"].min_value, start_options["end_date"].max_value) == (
         1,
@@ -107,6 +114,26 @@ def test_command_options_publish_required_bounds() -> None:
         2**53 - 1,
     )
     assert (void_options["reason"].min_value, void_options["reason"].max_value) == (1, 200)
+    assert (report_options["scenario"].min_value, report_options["scenario"].max_value) == (1, 100)
+    target_bounds = (
+        report_options["target_points"].min_value,
+        report_options["target_points"].max_value,
+    )
+    assert target_bounds == (
+        1,
+        99,
+    )
+    assert (report_options["time"].min_value, report_options["time"].max_value) == (1, 32)
+    assert [choice.value for choice in report_options["game_type"].choices] == [
+        "normal",
+        "seafarers",
+        "cities_knights",
+        "seafarers_cities_knights",
+    ]
+    assert (show_options["game_id"].min_value, show_options["game_id"].max_value) == (
+        1,
+        2**53 - 1,
+    )
 
 
 def test_bundled_timezone_choices_exclude_host_only_names() -> None:
@@ -180,7 +207,7 @@ async def test_season_start_defers_before_service_and_edits_original(
 
 
 @pytest.mark.asyncio
-async def test_game_report_persists_the_message_returned_by_original_edit(
+async def test_game_report_prepares_a_private_score_sheet_before_creating_a_game(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     interaction = _interaction()
@@ -189,27 +216,52 @@ async def test_game_report_persists_the_message_returned_by_original_edit(
     pool = object()
     cog = game_cog.GameCog(SimpleNamespace(pool=pool))
     actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
-    created = SimpleNamespace(game=SimpleNamespace(game_id=42))
+    prepared = SimpleNamespace(
+        winner_id=456,
+        loser_ids=(789,),
+        rules=GameRules(game_type="normal", target_points=10),
+    )
     winner = SimpleNamespace(id=456, bot=False)
     loser = SimpleNamespace(id=789, bot=False)
 
     monkeypatch.setattr(game_cog, "actor_from_interaction", lambda _: actor)
-    report = AsyncMock(return_value=created)
-    record = AsyncMock()
-    monkeypatch.setattr(game_cog.game_service, "report_game", report)
-    monkeypatch.setattr(game_cog.game_service, "record_game_message", record)
-    monkeypatch.setattr(game_cog.formatting, "build_game_report_embed", lambda _: discord.Embed())
+    prepare = AsyncMock(return_value=prepared)
+    submit = AsyncMock()
+    monkeypatch.setattr(game_cog.game_service, "prepare_game_report", prepare)
+    monkeypatch.setattr(game_cog.game_service, "submit_game_report", submit)
     command = game_cog.GameCog.game_group.get_command("report")
     assert command is not None
 
     await command.callback(cog, interaction, winner, loser, None, None, None, None, None)
 
-    interaction.response.defer.assert_awaited_once_with(thinking=True)
-    report.assert_awaited_once()
-    record.assert_awaited_once_with(pool, 123, 42, 700, 800)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+    prepare.assert_awaited_once()
+    submit.assert_not_awaited()
     edited = interaction.edit_original_response.await_args
-    assert edited.kwargs["view"].timeout is None
+    assert edited.kwargs["view"].timeout == 900
     _assert_no_mentions(edited)
+
+
+@pytest.mark.asyncio
+async def test_game_show_reads_one_guild_scoped_complete_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    cog = game_cog.GameCog(SimpleNamespace(pool="pool"))
+    loaded = object()
+    get_game = AsyncMock(return_value=loaded)
+    monkeypatch.setattr(game_cog.game_service, "get_game", get_game)
+    monkeypatch.setattr(
+        game_cog.formatting, "build_game_status_embed", lambda _: discord.Embed(title="Game")
+    )
+    command = game_cog.GameCog.game_group.get_command("show")
+    assert command is not None
+
+    await command.callback(cog, interaction, 42)
+
+    interaction.response.defer.assert_awaited_once_with(thinking=True)
+    get_game.assert_awaited_once_with("pool", 123, 42)
+    _assert_no_mentions(interaction.edit_original_response.await_args)
 
 
 @pytest.mark.asyncio

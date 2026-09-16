@@ -6,6 +6,8 @@ A Discord bot for a friend group that tracks Catan wins and losses and ranks pla
 
 - Multi-server season tracking with configurable end dates and eligibility
 - Confirmed game reports, voiding, history, leaderboards, and player stats
+- Rules-aware game reports for Normal, Seafarers, Cities & Knights, and combined games
+  with optional 5–6 Player Extension, scenario, target score, local played time, and point breakdowns
 - Game-night events with grouped RSVP buttons, optional role-only pings, and targeted reminders
 - Automatic season resolution with frozen result announcements
 - Least-privilege PostgreSQL roles, bounded output, and mention-safe responses
@@ -32,12 +34,33 @@ flowchart LR
 | `/help` | List available commands | Anyone | Available |
 | `/config channel` / `timezone` / `admin-role` / `player-role` / `show` | View or change the server configuration. `player-role` is the optional role pinged for new events and reminders. | Manage Server | Available |
 | `/season start` / `min-games` / `end-date` / `end` / `cancel` / `info` / `history` | Manage seasons and the win/loss eligibility threshold (default 2) | Admin (`info`/`history`: anyone) | Available |
-| `/game report winner loser1 [...] [date]` | Report a game; `date` defaults to today | Anyone | Available |
+| `/game report` | Report a game through the guided form: winner/losers, ruleset, optional extension/scenario/target/time, and point breakdown | Anyone | Available |
 | Confirm / Reject buttons | Confirm or reject a pending report | Other participants; reporter may retract | Available |
-| `/game void`, `/game history` | Void a game / view game history | Admin / anyone | Available |
+| `/game void`, `/game history`, `/game show` | Void a game / view chronological history / show one game's full details | Admin / anyone | Available |
 | `/leaderboard [channel]`, `/stats` | View rankings and player stats. A selected leaderboard channel receives the public board; otherwise it posts here. | Anyone | Available |
 | `/event create [date] [channel] ...`, `/event list`, `/event cancel` | Schedule and manage game nights. A selected channel receives the event; otherwise it posts here. | Anyone / creator or admin | Available |
 | RSVP buttons | Going / Maybe / Not going | Anyone | Available |
+
+### Detailed game reports
+
+The score sheet changes with the selected ruleset. It includes the applicable
+ways to score, such as settlements (houses), cities, Longest Road or Longest
+Trade Route, Largest Army, victory-point cards, Cities & Knights progress-card
+awards, metropolis bonuses, and scenario points. Reports display players as
+compact `P1`–`P6` columns with a mention legend so long Discord names do not
+make the table unwieldy.
+
+Leaving the entire score sheet untouched records points as **unrecorded**
+(database `NULL`) and displays `Points not recorded`; it is not treated as a
+zero. Entering `0` records an explicit zero. Once any score is entered, the
+sheet must be completed for every player. The report also shows its humanized
+game type, 5–6 Player Extension, scenario and target when applicable, and the
+local played date/time with the configured timezone. Older reports without a
+time show `Time not recorded`.
+
+Game history is indexed newest-first by played date, then played local time
+when available, with the game id as a stable tie-breaker for games sharing a
+date and time.
 
 ## Tech stack
 

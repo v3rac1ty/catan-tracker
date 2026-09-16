@@ -15,7 +15,9 @@ import asyncpg
 
 from catan_bot.db.models import Game, GameWithParticipants, TransitionResult
 from catan_bot.db.repositories import games, guilds, players, seasons
-from catan_bot.domain.dates import parse_date, today_in_timezone
+from catan_bot.domain.dates import combine_local, parse_date, parse_time, today_in_timezone
+from catan_bot.domain.errors import DomainValidationError
+from catan_bot.domain.scoring import GameType, PlayerScore, build_rules, validate_game_scores
 from catan_bot.domain.validation import (
     VOID_REASON_MAX,
     ParticipantRef,
@@ -31,6 +33,7 @@ from catan_bot.services.errors import (
     PermissionDeniedError,
     ServiceError,
 )
+from catan_bot.services.results import PreparedGameReport
 
 _HISTORY_MIN_LIMIT, _HISTORY_MAX_LIMIT = 1, 25
 
@@ -60,7 +63,54 @@ async def report_game(
 
     The reporter (`actor.user_id`) need not be one of `winner`/`losers`.
     """
+    prepared = await prepare_game_report(
+        pool,
+        guild_id,
+        actor,
+        winner=winner,
+        losers=losers,
+        date_text=date_text,
+        time_text=None,
+        now=now,
+    )
+    return await submit_game_report(pool, guild_id, actor, prepared, scores=None, now=now)
+
+
+async def prepare_game_report(
+    pool: asyncpg.Pool,
+    guild_id: int,
+    actor: Actor,
+    *,
+    winner: ParticipantRef,
+    losers: Sequence[ParticipantRef],
+    date_text: str | None,
+    time_text: str | None,
+    now: datetime,
+    game_type: GameType = "normal",
+    extension_5_6: bool | None = None,
+    scenario: str | None = None,
+    target_points: int | None = None,
+) -> PreparedGameReport:
+    """Validate game metadata before displaying a score sheet.
+
+    This operation deliberately creates no player or game rows.  Guild
+    configuration may be initialized for a first-time guild, matching the
+    other services' ``ensure_guild`` behavior.
+    """
     winner_id, loser_ids = validate_participants(winner, losers)
+    player_count = 1 + len(loser_ids)
+    if extension_5_6 is None:
+        extension_5_6 = player_count >= 5
+    elif player_count >= 5 and extension_5_6 is False:
+        raise DomainValidationError("Games with 5 or 6 players require the 5–6 Player Extension.")
+    clean_scenario = clean_text(scenario, field="Scenario", max_len=100, min_len=0)
+    rules = build_rules(
+        game_type,
+        extension_5_6=extension_5_6,
+        scenario=clean_scenario,
+        target_points=target_points,
+        player_count=player_count,
+    )
     async with pool.acquire() as conn, conn.transaction():
         config = await guilds.ensure_guild(conn, guild_id)
         timezone = require_valid_timezone(config)
@@ -69,18 +119,98 @@ async def report_game(
         validate_game_date(played_on, today=today)
 
         active_season = await seasons.get_active_season(conn, guild_id)
-        season_id: int | None = None
         if active_season is not None:
             validate_game_in_season(
                 played_on, starts_on=active_season.starts_on, ends_on=active_season.ends_on
             )
+        played_at = None
+        played_timezone = None
+        if time_text is not None and time_text.strip():
+            played_at = combine_local(played_on, parse_time(time_text), timezone)
+            played_timezone = timezone
+    return PreparedGameReport(
+        guild_id=guild_id,
+        reporter_id=actor.user_id,
+        winner_id=winner_id,
+        loser_ids=loser_ids,
+        played_on=played_on,
+        played_at=played_at,
+        played_timezone=played_timezone,
+        rules=rules,
+    )
+
+
+async def submit_game_report(
+    pool: asyncpg.Pool,
+    guild_id: int,
+    actor: Actor,
+    prepared: PreparedGameReport,
+    *,
+    scores: Sequence[PlayerScore] | None,
+    now: datetime,
+) -> GameWithParticipants:
+    """Commit a prepared report and its optional complete score sheet."""
+    if type(prepared) is not PreparedGameReport:
+        raise ValueError("prepared must be a PreparedGameReport")
+    if guild_id != prepared.guild_id or actor.user_id != prepared.reporter_id:
+        raise PermissionDeniedError("Only the player who started this game report can submit it.")
+    participant_ids = (prepared.winner_id, *prepared.loser_ids)
+    validated_scores = validate_game_scores(
+        prepared.rules,
+        scores,
+        participant_ids=participant_ids,
+        winner_id=prepared.winner_id,
+    )
+    async with pool.acquire() as conn, conn.transaction():
+        config = await guilds.ensure_guild(conn, guild_id)
+        timezone = require_valid_timezone(config)
+        today = today_in_timezone(timezone, now=now)
+        validate_game_date(prepared.played_on, today=today)
+
+        active_season = await seasons.get_active_season(conn, guild_id)
+        season_id: int | None = None
+        if active_season is not None:
+            validate_game_in_season(
+                prepared.played_on,
+                starts_on=active_season.starts_on,
+                ends_on=active_season.ends_on,
+            )
             season_id = active_season.season_id
 
-        await players.ensure_players(conn, guild_id, (winner_id, *loser_ids))
+        await players.ensure_players(conn, guild_id, participant_ids)
         game = await games.create_game(
-            conn, guild_id, season_id, played_on, actor.user_id, winner_id, loser_ids
+            conn,
+            guild_id,
+            season_id,
+            prepared.played_on,
+            actor.user_id,
+            prepared.winner_id,
+            prepared.loser_ids,
+            game_type=prepared.rules.game_type,
+            extension_5_6=prepared.rules.extension_5_6,
+            scenario=prepared.rules.scenario,
+            target_points=prepared.rules.target_points,
+            played_at=prepared.played_at,
+            played_timezone=prepared.played_timezone,
+            scores=validated_scores,
         )
-        return GameWithParticipants(game=game, winner_id=winner_id, loser_ids=loser_ids)
+        return GameWithParticipants(
+            game=game,
+            winner_id=prepared.winner_id,
+            loser_ids=prepared.loser_ids,
+            scores=validated_scores,
+        )
+
+
+async def get_game(
+    pool: asyncpg.Pool, guild_id: int, game_id: int
+) -> GameWithParticipants:
+    """Load one game through the guild-scoped repository query."""
+    async with pool.acquire() as conn:
+        loaded = await games.get_game(conn, guild_id, game_id)
+    if loaded is None:
+        raise NotFoundError(_GAME_NOT_FOUND)
+    return loaded
 
 
 def _confirm_result_error(result: TransitionResult) -> ServiceError:

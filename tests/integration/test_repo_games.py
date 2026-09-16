@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import UTC, date, datetime
 
 import asyncpg
 import pytest
 
 from catan_bot.db.repositories import games, players
+from catan_bot.domain.scoring import PlayerScore, ScoreEntry
 
 pytestmark = [
     pytest.mark.integration,
@@ -386,3 +387,149 @@ async def test_list_recent_games_for_player_only_includes_their_games(
     listed = await games.list_recent_games_for_player(app_conn, guild_id, 1, 10)
 
     assert [g.game_id for g in listed] == [involving_1.game_id]
+
+
+async def test_create_game_round_trips_rules_time_and_scores(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    scores = (
+        PlayerScore(
+            user_id=1,
+            total_points=10,
+            breakdown=(
+                ScoreEntry("settlements", 4),
+                ScoreEntry("cities", 4),
+                ScoreEntry("longest_road", 2),
+                ScoreEntry("largest_army", 0),
+                ScoreEntry("vp_cards", 0),
+            ),
+        ),
+        PlayerScore(
+            user_id=2,
+            total_points=8,
+            breakdown=(
+                ScoreEntry("settlements", 4),
+                ScoreEntry("cities", 4),
+                ScoreEntry("longest_road", 0),
+                ScoreEntry("largest_army", 0),
+                ScoreEntry("vp_cards", 0),
+            ),
+        ),
+    )
+    played_at = datetime(2026, 3, 1, 20, 30, tzinfo=UTC)
+
+    created = await games.create_game(
+        app_conn,
+        guild_id,
+        None,
+        PLAYED_ON,
+        1,
+        1,
+        [2],
+        game_type="normal",
+        extension_5_6=False,
+        scenario="League night",
+        target_points=10,
+        played_at=played_at,
+        played_timezone="America/Chicago",
+        scores=scores,
+    )
+
+    assert created.scenario == "League night"
+    assert created.played_at == played_at
+    fetched = await games.get_game(app_conn, guild_id, created.game_id)
+    assert fetched is not None
+    assert fetched.game.game_type == "normal"
+    assert fetched.game.target_points == 10
+    assert fetched.game.played_timezone == "America/Chicago"
+    assert fetched.scores == scores
+
+
+async def test_absent_scores_stay_null_while_explicit_zero_scores_round_trip(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    absent = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2], scores=[])
+    zero_scores = (
+        PlayerScore(user_id=1, total_points=0, breakdown=(ScoreEntry("settlements", 0),)),
+        PlayerScore(user_id=2, total_points=0, breakdown=(ScoreEntry("settlements", 0),)),
+    )
+    recorded = await games.create_game(
+        app_conn, guild_id, None, PLAYED_ON, 1, 1, [2], scores=zero_scores
+    )
+
+    absent_rows = await app_conn.fetch(
+        "SELECT total_points, score_breakdown FROM game_participants WHERE game_id = $1",
+        absent.game_id,
+    )
+    recorded_rows = await app_conn.fetch(
+        "SELECT total_points, score_breakdown FROM game_participants WHERE game_id = $1",
+        recorded.game_id,
+    )
+    assert all(
+        row["total_points"] is None and row["score_breakdown"] is None for row in absent_rows
+    )
+    assert all(
+        row["total_points"] == 0 and row["score_breakdown"] is not None
+        for row in recorded_rows
+    )
+    absent_fetched = await games.get_game(app_conn, guild_id, absent.game_id)
+    recorded_fetched = await games.get_game(app_conn, guild_id, recorded.game_id)
+    assert absent_fetched is not None
+    assert recorded_fetched is not None
+    assert absent_fetched.scores == ()
+    assert recorded_fetched.scores == zero_scores
+
+
+async def test_recent_history_orders_by_date_then_time_then_game_id_and_scopes_guild(
+    app_conn: asyncpg.Connection, guild_id: int, other_guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    await players.ensure_players(app_conn, other_guild_id, [1, 2])
+    legacy = await games.create_game(app_conn, guild_id, None, date(2026, 3, 2), 1, 1, [2])
+    earlier_time = await games.create_game(
+        app_conn,
+        guild_id,
+        None,
+        date(2026, 3, 2),
+        1,
+        1,
+        [2],
+        played_at=datetime(2026, 3, 3, 1, 0, tzinfo=UTC),
+        played_timezone="America/Chicago",
+    )
+    later_time = await games.create_game(
+        app_conn,
+        guild_id,
+        None,
+        date(2026, 3, 2),
+        1,
+        1,
+        [2],
+        played_at=datetime(2026, 3, 3, 2, 0, tzinfo=UTC),
+        played_timezone="America/Chicago",
+    )
+    same_time = await games.create_game(
+        app_conn,
+        guild_id,
+        None,
+        date(2026, 3, 2),
+        1,
+        1,
+        [2],
+        played_at=datetime(2026, 3, 3, 2, 0, tzinfo=UTC),
+        played_timezone="America/Chicago",
+    )
+    older_day = await games.create_game(app_conn, guild_id, None, date(2026, 3, 1), 1, 1, [2])
+    await games.create_game(app_conn, other_guild_id, None, date(2026, 3, 4), 1, 1, [2])
+
+    listed = await games.list_recent_games(app_conn, guild_id, 10)
+
+    assert [game.game_id for game in listed] == [
+        same_time.game_id,
+        later_time.game_id,
+        earlier_time.game_id,
+        legacy.game_id,
+        older_day.game_id,
+    ]

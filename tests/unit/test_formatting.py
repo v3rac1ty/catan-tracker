@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 
-from catan_bot.db.models import Game, GuildConfig, Season
+from catan_bot.db.models import Game, GameWithParticipants, GuildConfig, Season
+from catan_bot.domain.scoring import GameRules, PlayerScore, ScoreEntry, score_sources
 from catan_bot.formatting import (
     EMBED_DESCRIPTION_MAX,
     EMBED_FIELD_NAME_MAX,
@@ -14,8 +15,11 @@ from catan_bot.formatting import (
     EMBED_TOTAL_MAX,
     build_config_show_embed,
     build_game_history_embed,
+    build_game_report_embed,
+    build_game_status_embed,
     build_season_history_embed,
     escape_user_text,
+    format_game_score_table,
 )
 
 
@@ -168,3 +172,125 @@ def test_config_show_escapes_stored_timezone_text() -> None:
     timezone_field = next(field for field in embed.fields if field.name == "Timezone")
     assert "@everyone" not in timezone_field.value
     assert r"\*\*UTC\*\*" in timezone_field.value
+
+
+def _detailed_game(*, game_type: str = "normal", scenario: str | None = None) -> Game:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    return Game(
+        game_id=99,
+        guild_id=1,
+        season_id=None,
+        played_on=date(2026, 1, 1),
+        status="confirmed",
+        reported_by=10,
+        confirmed_by=11,
+        confirmed_at=now,
+        voided_by=None,
+        voided_at=None,
+        void_reason=None,
+        rejected_by=None,
+        rejected_at=None,
+        channel_id=None,
+        message_id=None,
+        created_at=now,
+        game_type=game_type,
+        extension_5_6=True,
+        scenario=scenario,
+        target_points=13,
+        played_at=datetime(2026, 1, 1, 19, 30, tzinfo=UTC),
+        played_timezone="America/Chicago",
+    )
+
+
+def _zero_score(user_id: int, rules: GameRules) -> PlayerScore:
+    entries = tuple(ScoreEntry(source.key, 0) for source in score_sources(rules))
+    return PlayerScore(user_id=user_id, total_points=0, breakdown=entries)
+
+
+def test_game_score_table_distinguishes_unrecorded_from_explicit_zero() -> None:
+    game = _detailed_game()
+    absent = GameWithParticipants(game=game, winner_id=10, loser_ids=(20,))
+    assert format_game_score_table(absent) == "Points not recorded"
+
+    rules = GameRules("normal", extension_5_6=False, target_points=10)
+    recorded = GameWithParticipants(
+        game=game,
+        winner_id=10,
+        loser_ids=(20,),
+        scores=(_zero_score(10, rules), _zero_score(20, rules)),
+    )
+    table = format_game_score_table(recorded)
+    assert "P1 <@10>" in table
+    assert "P2 <@20>" in table
+    assert "Total" in table
+    assert "  0" in table
+    assert "—" not in table
+    table_lines = table.splitlines()
+    header, first_source, total = table_lines[2], table_lines[3], table_lines[-2]
+    assert header.index("|  P1") == first_source.index("|   0")
+    assert header.index("|  P2") == first_source.index("|   0", first_source.index("|   0") + 1)
+    assert header.index("|  P1") == total.index("|   0")
+
+
+def test_six_player_combined_score_table_stays_compact_and_uses_player_labels() -> None:
+    game = _detailed_game(
+        game_type="seafarers_cities_knights", scenario="@everyone **Hidden Scenario**"
+    )
+    rules = GameRules(
+        "seafarers_cities_knights",
+        extension_5_6=True,
+        scenario="@everyone **Hidden Scenario**",
+        target_points=15,
+    )
+    player_ids = (10, 20, 30, 40, 50, 60)
+    report = GameWithParticipants(
+        game=game,
+        winner_id=player_ids[0],
+        loser_ids=player_ids[1:],
+        scores=tuple(_zero_score(user_id, rules) for user_id in player_ids),
+    )
+    table = format_game_score_table(report)
+    assert all(f"P{index}" in table for index in range(1, 7))
+    assert "<@60>" in table  # only compact P labels widen the score columns
+    assert len(table) < EMBED_FIELD_VALUE_MAX
+    table_lines = table.splitlines()
+    header, first_source = table_lines[2], table_lines[3]
+    value_start = 0
+    for player_index in range(1, 7):
+        header_marker = f"|  P{player_index}"
+        value_marker = "|   0"
+        value_index = first_source.index(value_marker, value_start)
+        assert header.index(header_marker) == value_index
+        value_start = value_index + 1
+    embed = build_game_status_embed(report)
+    assert len(embed) <= EMBED_TOTAL_MAX
+    assert any(
+        field.name == "Game type" and "Seafarers + Cities & Knights" in field.value
+        for field in embed.fields
+    )
+    assert any(field.name == "Extension" for field in embed.fields)
+    assert any(field.name == "Date" and "13:30" in field.value for field in embed.fields)
+    assert any(
+        field.name == "Scenario" and "@everyone" not in field.value
+        and r"\*\*Hidden Scenario\*\*" in field.value
+        for field in embed.fields
+    )
+
+
+def test_game_report_and_status_preserve_score_details_and_legacy_time_message() -> None:
+    game = _detailed_game(scenario="Scenario")
+    report = GameWithParticipants(game=game, winner_id=10, loser_ids=(20,))
+    pending = build_game_report_embed(report)
+    assert any(
+        field.name == "Point breakdown" and "Points not recorded" in field.value
+        for field in pending.fields
+    )
+
+    legacy = _game(7, "reason")
+    status = build_game_status_embed(
+        GameWithParticipants(game=legacy, winner_id=10, loser_ids=(20,))
+    )
+    assert any(
+        field.name == "Date" and "Time not recorded" in field.value
+        for field in status.fields
+    )

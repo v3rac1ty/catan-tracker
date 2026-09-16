@@ -46,6 +46,7 @@ _EXPECTED_RELATIVE_PATHS = frozenset(
         "ranking.py",
         "bet.py",
         "reminders.py",
+        "scoring.py",
     }
 )
 

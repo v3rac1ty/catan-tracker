@@ -9,11 +9,13 @@ needs to render a response.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Literal
 
 from catan_bot.db.models import Event, Season, SeasonResultRow
 from catan_bot.domain.bet import BetOutcome
 from catan_bot.domain.ranking import PlayerStats, RankedPlayer
+from catan_bot.domain.scoring import GameRules
 
 LeaderboardScope = Literal["season", "all_time"]
 
@@ -86,3 +88,22 @@ class EventCreation:
 
     event: Event
     player_role_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedGameReport:
+    """Validated, stable game metadata awaiting score-sheet submission.
+
+    Preparation intentionally contains no database identity.  In particular,
+    ``played_on`` is resolved before a Discord form is shown, so a submission
+    after midnight cannot silently move a game to the next local day.
+    """
+
+    guild_id: int
+    reporter_id: int
+    winner_id: int
+    loser_ids: tuple[int, ...]
+    played_on: date
+    played_at: datetime | None
+    played_timezone: str | None
+    rules: GameRules

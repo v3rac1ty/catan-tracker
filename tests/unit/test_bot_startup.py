@@ -67,6 +67,7 @@ async def test_all_commands_register_in_an_offline_tree() -> None:
             "report",
             "void",
             "history",
+            "show",
         }
         assert {command.name for command in top_level["event"].commands} == {
             "create",

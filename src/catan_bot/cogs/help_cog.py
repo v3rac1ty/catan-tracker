@@ -14,12 +14,23 @@ _COMMANDS: tuple[tuple[str, str], ...] = (
         "View or change this server's settings.",
     ),
     ("/season start|min-games|end-date|end|cancel|info|history", "Manage this server's season."),
-    ("/game report", "Report a game's winner and losers for confirmation."),
+    (
+        "/game report",
+        "Report a game's winner, losers, type, optional extension/scenario/time, "
+        "and score sheet for confirmation.",
+    ),
     ("/game void", "Void a reported game (admin)."),
-    ("/game history", "Show recent games."),
+    (
+        "/game history",
+        "Show recent games in chronological date/time order, including their ruleset.",
+    ),
+    ("/game show", "Show one game's full ruleset, participants, and point breakdown."),
     ("/leaderboard [channel]", "Show rankings here or post them to a chosen channel."),
     ("/stats", "Show a player's win/loss record."),
-    ("/event create [channel]|list|cancel", "Schedule and manage game nights with RSVPs."),
+    (
+        "/event create [channel]|list|cancel",
+        "Schedule and manage game nights with RSVPs; event posts show Going/Maybe/Not Going.",
+    ),
 )
 
 
@@ -32,7 +43,11 @@ class HelpCog(commands.Cog):
     async def help_command(self, interaction: discord.Interaction) -> None:
         embed = discord.Embed(
             title="Catan Tracker",
-            description="Tracks Catan wins/losses and ranks players by win rate.",
+            description=(
+                "Tracks Catan wins/losses and ranks players by win rate. "
+                "Game reports can include a ruleset-aware point table: blank cells "
+                "are unrecorded (NULL), while 0 is an explicitly recorded zero."
+            ),
             color=discord.Color.blurple(),
         )
         for name, description in _COMMANDS:
