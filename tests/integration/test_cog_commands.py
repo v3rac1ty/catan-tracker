@@ -33,6 +33,14 @@ class InteractionStub:
         self.guild_id = guild_id
         self.user = SimpleNamespace(id=user_id)
         self.client = SimpleNamespace(pool=pool)
+        self.channel = SimpleNamespace(id=700)
+        self.channel.send = AsyncMock(
+            return_value=SimpleNamespace(
+                channel=self.channel,
+                id=801,
+                jump_url="https://discord.com/channels/900001/700/801",
+            )
+        )
         self.response = SimpleNamespace(defer=AsyncMock())
         self.followup = SimpleNamespace(send=AsyncMock())
         self.edit_original_response = AsyncMock(
@@ -103,9 +111,19 @@ async def test_game_commands_buttons_and_stats_complete_the_interaction_flow(
         None,
     )
 
+    report_interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
     report_embed = _embed_from(report_interaction)
-    assert report_embed.title == "Game Reported"
-    game_id = int((report_embed.footer.text or "").removeprefix("Game #"))
+    assert report_embed.title == "Game score sheet"
+    score_sheet = report_interaction.edit_original_response.await_args.kwargs["view"]
+    submit_button = next(item for item in score_sheet.children if item.label == "Submit report")
+    submit_interaction = InteractionStub(guild_id, reporter.user_id, pool=pool)
+    await submit_button.callback(submit_interaction)
+    submit_interaction.response.defer.assert_awaited_once_with()
+    assert score_sheet.created_report is not None
+    assert score_sheet.completed
+    assert score_sheet.message_recorded
+    report_interaction.channel.send.assert_awaited_once()
+    game_id = score_sheet.created_report.game.game_id
 
     error_handler = AsyncMock()
     monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: reporter)
