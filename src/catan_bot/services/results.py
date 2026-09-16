@@ -12,10 +12,10 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Literal
 
-from catan_bot.db.models import Event, Season, SeasonResultRow
+from catan_bot.db.models import Event, GameWithParticipants, Season, SeasonResultRow
 from catan_bot.domain.bet import BetOutcome
 from catan_bot.domain.ranking import PlayerStats, RankedPlayer
-from catan_bot.domain.scoring import GameRules
+from catan_bot.domain.scoring import GameRules, PlayerScore
 
 LeaderboardScope = Literal["season", "all_time"]
 
@@ -107,3 +107,29 @@ class PreparedGameReport:
     played_at: datetime | None
     played_timezone: str | None
     rules: GameRules
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedGameUpdate:
+    """Validated, immutable draft for editing one confirmed game.
+
+    The original row and revision are retained as the optimistic-concurrency
+    token. No database identity is created by preparation; the draft can be
+    safely discarded if the editor abandons the Discord form.
+    """
+
+    guild_id: int
+    game_id: int
+    editor_id: int
+    expected_revision: int
+    original: GameWithParticipants
+    winner_id: int
+    loser_ids: tuple[int, ...]
+    played_on: date
+    played_at: datetime | None
+    played_timezone: str | None
+    rules: GameRules
+    target_points_to_store: int | None
+    initial_scores: tuple[PlayerScore, ...]
+    update_reason: str | None
+    season_id: int | None

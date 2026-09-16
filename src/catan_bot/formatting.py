@@ -440,6 +440,42 @@ def _add_game_scores(embed: discord.Embed, created: GameWithParticipants) -> Non
     _add_field(embed, "Point breakdown", format_game_score_table(created), inline=False)
 
 
+def _updated_at_label(value: datetime | None) -> str:
+    """Render an audit timestamp without trusting or exposing user text."""
+
+    if value is None:
+        return "Time not recorded"
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        try:
+            return _discord_timestamp(value, "f")
+        except (OverflowError, OSError, ValueError):
+            pass
+    # A naive value is legacy/corrupt data, but ISO formatting is still a
+    # bounded, non-user-controlled fallback that is useful to administrators.
+    return value.isoformat()
+
+
+def _add_game_audit(embed: discord.Embed, game: Game) -> None:
+    """Show the current correction metadata for revised confirmed games."""
+
+    revision = getattr(game, "revision", 0)
+    if type(revision) is not int or revision <= 0:
+        return
+    updated_by = getattr(game, "updated_by", None)
+    updated_by_text = mention(updated_by) if type(updated_by) is int else "Unknown"
+    _add_field(embed, "Revision", str(revision), inline=True)
+    _add_field(embed, "Updated by", updated_by_text, inline=True)
+    _add_field(
+        embed,
+        "Updated at",
+        _updated_at_label(getattr(game, "updated_at", None)),
+        inline=True,
+    )
+    reason = getattr(game, "update_reason", None)
+    if reason:
+        _add_field(embed, "Update reason", escape_user_text(reason), inline=False)
+
+
 def _standings_lines(
     players: Sequence[RankedPlayer], *, needs_more: bool, min_games: int = 0
 ) -> list[str]:
@@ -504,6 +540,7 @@ def build_game_status_embed(updated: GameWithParticipants) -> discord.Embed:
             embed.add_field(name="Voided by", value=mention(game.voided_by), inline=True)
         if game.void_reason:
             _add_field(embed, "Reason", escape_user_text(game.void_reason), inline=False)
+    _add_game_audit(embed, game)
     embed.set_footer(text=f"Game #{game.game_id}")
     return embed
 
@@ -527,6 +564,11 @@ def build_game_history_embed(games: Sequence[Game], *, member_id: int | None) ->
                 parts.append(f"Voided by {mention(game.voided_by)}")
             if game.void_reason:
                 parts.append(f"Reason: {escape_user_text(game.void_reason)}")
+        revision = getattr(game, "revision", 0)
+        if type(revision) is int and revision > 0:
+            updated_by = getattr(game, "updated_by", None)
+            editor = mention(updated_by) if type(updated_by) is int else "unknown editor"
+            parts.append(f"Updated r{revision} by {editor}")
         field_name = (
             f"Game #{game.game_id} -- {_game_type_label(game.game_type)} -- "
             f"{_history_played_label(game)}"

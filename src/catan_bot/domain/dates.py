@@ -170,6 +170,20 @@ def combine_local(d: date, t: time, tz_name: str) -> datetime:
     return utc_dt
 
 
+def preserve_local_time(value: datetime, target_date: date, tz_name: str) -> datetime:
+    """Move an aware instant to ``target_date`` while retaining local wall time.
+
+    This is used when editing a dated event or game: changing the calendar
+    date should not unexpectedly change the entered local clock time.  The
+    returned value is normalized to UTC and receives the same nonexistent or
+    ambiguous-time validation as :func:`combine_local`.
+    """
+    ensure_aware(value, name="value")
+    zone = ZoneInfo(validate_timezone(tz_name))
+    local_time = value.astimezone(zone).timetz().replace(tzinfo=None)
+    return combine_local(target_date, local_time, tz_name)
+
+
 def _first_instant_of_local_date(target: date, zone: ZoneInfo, *, near: datetime) -> datetime:
     """The smallest UTC instant whose local date in `zone` is `target`.
 

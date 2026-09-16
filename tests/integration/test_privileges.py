@@ -40,6 +40,15 @@ async def test_delete_raises_insufficient_privilege(app_conn: asyncpg.Connection
         await app_conn.execute("DELETE FROM games")
 
 
+async def test_game_update_audit_cannot_be_changed_or_deleted(
+    app_conn: asyncpg.Connection,
+) -> None:
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        await app_conn.execute("UPDATE game_updates SET reason = NULL")
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        await app_conn.execute("DELETE FROM game_updates")
+
+
 async def test_create_table_raises_insufficient_privilege(app_conn: asyncpg.Connection) -> None:
     with pytest.raises(asyncpg.InsufficientPrivilegeError):
         await app_conn.execute("CREATE TABLE privilege_probe (id INT)")

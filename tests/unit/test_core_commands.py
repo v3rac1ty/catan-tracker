@@ -60,7 +60,13 @@ def test_group_cogs_expose_every_m4_subcommand() -> None:
         "history",
     }
     assert game.name == "game"
-    assert {command.name for command in game.commands} == {"report", "void", "history", "show"}
+    assert {command.name for command in game.commands} == {
+        "report",
+        "update",
+        "void",
+        "history",
+        "show",
+    }
 
 
 def test_config_exposes_player_role_command() -> None:
@@ -91,15 +97,18 @@ def test_command_options_publish_required_bounds() -> None:
     void = game_cog.GameCog.game_group.get_command("void")
     report = game_cog.GameCog.game_group.get_command("report")
     show = game_cog.GameCog.game_group.get_command("show")
+    update = game_cog.GameCog.game_group.get_command("update")
     assert start is not None
     assert void is not None
     assert report is not None
     assert show is not None
+    assert update is not None
 
     start_options = {parameter.name: parameter for parameter in start.parameters}
     void_options = {parameter.name: parameter for parameter in void.parameters}
     report_options = {parameter.name: parameter for parameter in report.parameters}
     show_options = {parameter.name: parameter for parameter in show.parameters}
+    update_options = {parameter.name: parameter for parameter in update.parameters}
     assert (start_options["name"].min_value, start_options["name"].max_value) == (1, 100)
     assert (start_options["end_date"].min_value, start_options["end_date"].max_value) == (
         1,
@@ -134,6 +143,17 @@ def test_command_options_publish_required_bounds() -> None:
         1,
         2**53 - 1,
     )
+    assert (update_options["reason"].min_value, update_options["reason"].max_value) == (1, 200)
+    assert (update_options["game_id"].min_value, update_options["game_id"].max_value) == (
+        1,
+        2**53 - 1,
+    )
+    assert [choice.value for choice in update_options["game_type"].choices] == [
+        "normal",
+        "seafarers",
+        "cities_knights",
+        "seafarers_cities_knights",
+    ]
 
 
 def test_bundled_timezone_choices_exclude_host_only_names() -> None:
@@ -239,6 +259,42 @@ async def test_game_report_prepares_a_private_score_sheet_before_creating_a_game
     submit.assert_not_awaited()
     edited = interaction.edit_original_response.await_args
     assert edited.kwargs["view"].timeout == 900
+    _assert_no_mentions(edited)
+
+
+@pytest.mark.asyncio
+async def test_game_update_prepares_an_ephemeral_sheet_without_submitting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    interaction.edit_original_response.return_value = SimpleNamespace()
+    cog = game_cog.GameCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
+    prepared = SimpleNamespace(
+        game_id=42,
+        winner_id=456,
+        loser_ids=(789,),
+        rules=GameRules(game_type="normal", target_points=10),
+        original=SimpleNamespace(game=SimpleNamespace(game_type="normal", played_on="today")),
+        initial_scores=(),
+        played_on="today",
+        expected_revision=1,
+    )
+    monkeypatch.setattr(game_cog, "actor_from_interaction", lambda _: actor)
+    prepare = AsyncMock(return_value=prepared)
+    submit = AsyncMock()
+    monkeypatch.setattr(game_cog.game_service, "prepare_game_update", prepare)
+    monkeypatch.setattr(game_cog.game_service, "submit_game_update", submit)
+    command = game_cog.GameCog.game_group.get_command("update")
+    assert command is not None
+
+    await command.callback(cog, interaction, 42)
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+    assert prepare.await_args.kwargs["losers"] is None
+    submit.assert_not_awaited()
+    edited = interaction.edit_original_response.await_args
+    assert edited.kwargs["view"].mode == "update"
     _assert_no_mentions(edited)
 
 

@@ -39,7 +39,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
           confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
           channel_id, message_id, created_at, game_type, extension_5_6, scenario,
-          target_points, played_at, played_timezone
+          target_points, played_at, played_timezone, revision, updated_by, updated_at,
+          update_reason
 """
 
 _INSERT_GAME_PARTICIPANTS_SQL = """
@@ -58,22 +59,47 @@ WHERE guild_id = $1 AND game_id = $2
 RETURNING game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
           confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
           channel_id, message_id, created_at, game_type, extension_5_6, scenario,
-          target_points, played_at, played_timezone
+          target_points, played_at, played_timezone, revision, updated_by, updated_at,
+          update_reason
 """
 
 _SELECT_GAME_SQL = """
-SELECT game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
-       confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
-       channel_id, message_id, created_at, game_type, extension_5_6, scenario,
-       target_points, played_at, played_timezone
-FROM games
-WHERE guild_id = $1 AND game_id = $2
+SELECT g.game_id, g.guild_id, g.season_id, g.played_on, g.status, g.reported_by,
+       g.confirmed_by, g.confirmed_at, g.voided_by, g.voided_at, g.void_reason,
+       g.rejected_by, g.rejected_at, g.channel_id, g.message_id, g.created_at,
+       g.game_type, g.extension_5_6, g.scenario, g.target_points, g.played_at,
+       g.played_timezone, g.revision, g.updated_by, g.updated_at, g.update_reason,
+       COALESCE(
+           array_agg(p.user_id ORDER BY p.is_winner DESC, p.user_id)
+               FILTER (WHERE p.user_id IS NOT NULL),
+           ARRAY[]::bigint[]
+       ) AS participant_user_ids,
+       COALESCE(
+           array_agg(p.is_winner ORDER BY p.is_winner DESC, p.user_id)
+               FILTER (WHERE p.user_id IS NOT NULL),
+           ARRAY[]::boolean[]
+       ) AS participant_winner_flags,
+       COALESCE(
+           array_agg(p.total_points ORDER BY p.is_winner DESC, p.user_id)
+               FILTER (WHERE p.user_id IS NOT NULL),
+           ARRAY[]::smallint[]
+       ) AS participant_total_points,
+       COALESCE(
+           array_agg(p.score_breakdown::text ORDER BY p.is_winner DESC, p.user_id)
+               FILTER (WHERE p.user_id IS NOT NULL),
+           ARRAY[]::text[]
+       ) AS participant_score_breakdowns
+FROM games AS g
+LEFT JOIN game_participants AS p
+    ON p.game_id = g.game_id AND p.guild_id = g.guild_id AND p.is_active
+WHERE g.guild_id = $1 AND g.game_id = $2
+GROUP BY g.game_id
 """
 
 _SELECT_GAME_PARTICIPANTS_SQL = """
 SELECT user_id, is_winner, total_points, score_breakdown
 FROM game_participants
-WHERE guild_id = $1 AND game_id = $2
+WHERE guild_id = $1 AND game_id = $2 AND is_active
 ORDER BY is_winner DESC, user_id ASC
 """
 
@@ -83,7 +109,7 @@ SET status = 'confirmed', confirmed_by = $3, confirmed_at = now()
 WHERE game_id = $1 AND guild_id = $2 AND status = 'pending' AND reported_by <> $3
       AND EXISTS (
           SELECT 1 FROM game_participants
-          WHERE game_id = $1 AND guild_id = $2 AND user_id = $3
+          WHERE game_id = $1 AND guild_id = $2 AND user_id = $3 AND is_active
       )
 RETURNING game_id
 """
@@ -92,7 +118,7 @@ _SELECT_GAME_FOR_CONFIRM_CLASSIFY_SQL = """
 SELECT status, reported_by,
        EXISTS (
            SELECT 1 FROM game_participants
-           WHERE game_id = $1 AND guild_id = $2 AND user_id = $3
+           WHERE game_id = $1 AND guild_id = $2 AND user_id = $3 AND is_active
        ) AS is_participant
 FROM games
 WHERE guild_id = $2 AND game_id = $1
@@ -106,7 +132,7 @@ WHERE game_id = $1 AND guild_id = $2 AND status = 'pending'
           reported_by = $3
           OR EXISTS (
               SELECT 1 FROM game_participants
-              WHERE game_id = $1 AND guild_id = $2 AND user_id = $3
+              WHERE game_id = $1 AND guild_id = $2 AND user_id = $3 AND is_active
           )
       )
 RETURNING game_id
@@ -116,7 +142,7 @@ _SELECT_GAME_FOR_REJECT_CLASSIFY_SQL = """
 SELECT status, reported_by,
        EXISTS (
            SELECT 1 FROM game_participants
-           WHERE game_id = $1 AND guild_id = $2 AND user_id = $3
+           WHERE game_id = $1 AND guild_id = $2 AND user_id = $3 AND is_active
        ) AS is_participant
 FROM games
 WHERE guild_id = $2 AND game_id = $1
@@ -139,7 +165,8 @@ _LIST_RECENT_GAMES_SQL = """
 SELECT game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
        confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
        channel_id, message_id, created_at, game_type, extension_5_6, scenario,
-       target_points, played_at, played_timezone
+       target_points, played_at, played_timezone, revision, updated_by, updated_at,
+       update_reason
 FROM games
 WHERE guild_id = $1
 ORDER BY played_on DESC, played_at DESC NULLS LAST, game_id DESC
@@ -151,12 +178,64 @@ SELECT g.game_id, g.guild_id, g.season_id, g.played_on, g.status, g.reported_by,
        g.confirmed_by, g.confirmed_at, g.voided_by, g.voided_at, g.void_reason,
        g.rejected_by, g.rejected_at, g.channel_id, g.message_id, g.created_at,
        g.game_type, g.extension_5_6, g.scenario, g.target_points, g.played_at,
-       g.played_timezone
+       g.played_timezone, g.revision, g.updated_by, g.updated_at, g.update_reason
 FROM games g
 JOIN game_participants p ON p.game_id = g.game_id AND p.guild_id = g.guild_id
-WHERE g.guild_id = $1 AND p.user_id = $2
+WHERE g.guild_id = $1 AND p.user_id = $2 AND p.is_active
 ORDER BY g.played_on DESC, g.played_at DESC NULLS LAST, g.game_id DESC
 LIMIT $3
+"""
+
+_LOCK_GAME_SQL = """
+SELECT game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
+       confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
+       channel_id, message_id, created_at, game_type, extension_5_6, scenario,
+       target_points, played_at, played_timezone, revision, updated_by, updated_at,
+       update_reason
+FROM games
+WHERE guild_id = $1 AND game_id = $2
+FOR UPDATE
+"""
+
+_UPDATE_CONFIRMED_GAME_SQL = """
+UPDATE games
+SET played_on = $3, game_type = $4, extension_5_6 = $5, scenario = $6,
+    target_points = $7, played_at = $8, played_timezone = $9,
+    revision = revision + 1, updated_by = $10, updated_at = now(), update_reason = $11
+WHERE guild_id = $1 AND game_id = $2 AND status = 'confirmed' AND revision = $12
+RETURNING game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
+          confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
+          channel_id, message_id, created_at, game_type, extension_5_6, scenario,
+          target_points, played_at, played_timezone, revision, updated_by, updated_at,
+          update_reason
+"""
+
+_DEACTIVATE_GAME_PARTICIPANTS_SQL = """
+UPDATE game_participants
+SET is_active = false, is_winner = false
+WHERE guild_id = $1 AND game_id = $2 AND is_active
+"""
+
+_UPSERT_GAME_PARTICIPANTS_SQL = """
+INSERT INTO game_participants (
+    game_id, user_id, guild_id, is_winner, total_points, score_breakdown, is_active
+)
+SELECT $1, u, $2, w, points, breakdown::jsonb, true
+FROM unnest($3::bigint[], $4::boolean[], $5::smallint[], $6::text[])
+    AS t(u, w, points, breakdown)
+ON CONFLICT (game_id, user_id) DO UPDATE
+SET guild_id = EXCLUDED.guild_id,
+    is_winner = EXCLUDED.is_winner,
+    total_points = EXCLUDED.total_points,
+    score_breakdown = EXCLUDED.score_breakdown,
+    is_active = true
+"""
+
+_INSERT_GAME_UPDATE_SQL = """
+INSERT INTO game_updates (
+    game_id, revision, guild_id, updated_by, updated_at, reason, before_snapshot, after_snapshot
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb)
 """
 
 
@@ -184,6 +263,10 @@ def _row_to_game(row: asyncpg.Record) -> Game:
         target_points=row["target_points"],
         played_at=row["played_at"],
         played_timezone=row["played_timezone"],
+        revision=row["revision"],
+        updated_by=row["updated_by"],
+        updated_at=row["updated_at"],
+        update_reason=row["update_reason"],
     )
 
 
@@ -291,14 +374,16 @@ def _scores_for_participants(
     )
 
 
-def _row_to_player_score(row: asyncpg.Record, game: Game) -> PlayerScore | None:
-    total_points = row["total_points"]
-    score_breakdown = row["score_breakdown"]
+def _player_score_from_values(
+    user_id: int, total_points: object, score_breakdown: object, game: Game
+) -> PlayerScore | None:
     if total_points is None and score_breakdown is None:
         return None
     # pragma: no cover -- DB CHECK enforces pairing.
     if total_points is None or score_breakdown is None:
         raise RuntimeError("game participant has incomplete score data")
+    if type(total_points) is not int or not isinstance(score_breakdown, str):
+        raise RuntimeError("game participant has invalid score data")
     decoded = json.loads(score_breakdown)
     if not isinstance(decoded, dict):  # pragma: no cover -- DB CHECK enforces JSON object.
         raise RuntimeError("game participant score_breakdown is not a JSON object")
@@ -324,8 +409,49 @@ def _row_to_player_score(row: asyncpg.Record, game: Game) -> PlayerScore | None:
         if not isinstance(key, str) or type(points) is not int:
             raise RuntimeError("game participant score_breakdown has invalid entries")
         breakdown.append(ScoreEntry(key=key, points=points))
-    return PlayerScore(
-        user_id=row["user_id"], total_points=total_points, breakdown=tuple(breakdown)
+    return PlayerScore(user_id=user_id, total_points=total_points, breakdown=tuple(breakdown))
+
+
+def _row_to_player_score(row: asyncpg.Record, game: Game) -> PlayerScore | None:
+    return _player_score_from_values(
+        row["user_id"], row["total_points"], row["score_breakdown"], game
+    )
+
+
+def _game_with_participants_from_row(row: asyncpg.Record) -> GameWithParticipants:
+    """Map the one-statement game/roster read into immutable domain rows."""
+    game = _row_to_game(row)
+    user_ids = row["participant_user_ids"]
+    winner_flags = row["participant_winner_flags"]
+    total_points = row["participant_total_points"]
+    score_breakdowns = row["participant_score_breakdowns"]
+    try:
+        participant_values = zip(
+            user_ids, winner_flags, total_points, score_breakdowns, strict=True
+        )
+        participants = list(participant_values)
+    except (TypeError, ValueError) as exc:  # pragma: no cover -- aggregate query invariant.
+        raise RuntimeError("game participant aggregates are inconsistent") from exc
+
+    winner_id: int | None = None
+    loser_ids: list[int] = []
+    scores: list[PlayerScore] = []
+    for user_id, is_winner, player_points, score_breakdown in participants:
+        if type(user_id) is not int or type(is_winner) is not bool:
+            raise RuntimeError("game participant aggregates have invalid values")
+        if is_winner:
+            winner_id = user_id
+        else:
+            loser_ids.append(user_id)
+        score = _player_score_from_values(user_id, player_points, score_breakdown, game)
+        if score is not None:
+            scores.append(score)
+    if winner_id is None:  # pragma: no cover -- a game always has exactly one winner.
+        raise RuntimeError(
+            f"game {game.game_id} in guild {game.guild_id} has no winner participant"
+        )
+    return GameWithParticipants(
+        game=game, winner_id=winner_id, loser_ids=tuple(loser_ids), scores=tuple(scores)
     )
 
 
@@ -421,30 +547,185 @@ async def set_game_message(
 async def get_game(
     conn: asyncpg.Connection, guild_id: int, game_id: int
 ) -> GameWithParticipants | None:
+    """Read game details and its active roster from one statement snapshot."""
     require_id(guild_id, name="guild_id")
     require_id(game_id, name="game_id")
-    game_row = await conn.fetchrow(_SELECT_GAME_SQL, guild_id, game_id)
-    if game_row is None:
+    row = await conn.fetchrow(_SELECT_GAME_SQL, guild_id, game_id)
+    if row is None:
         return None
-    game = _row_to_game(game_row)
+    return _game_with_participants_from_row(row)
 
-    participant_rows = await conn.fetch(_SELECT_GAME_PARTICIPANTS_SQL, guild_id, game_id)
+
+async def lock_game(
+    conn: asyncpg.Connection, guild_id: int, game_id: int
+) -> GameWithParticipants | None:
+    """Lock one game and return its current active roster.
+
+    The caller must keep a transaction open for the duration of any decision
+    based on this result.  This mirrors ``seasons.lock_active_season`` and is
+    deliberately guild-scoped before ``FOR UPDATE``.
+    """
+    require_id(guild_id, name="guild_id")
+    require_id(game_id, name="game_id")
+    row = await conn.fetchrow(_LOCK_GAME_SQL, guild_id, game_id)
+    if row is None:
+        return None
+    game = _row_to_game(row)
+    participants = await conn.fetch(_SELECT_GAME_PARTICIPANTS_SQL, guild_id, game_id)
     winner_id: int | None = None
-    loser_ids: list[int] = []
+    losers: list[int] = []
     scores: list[PlayerScore] = []
-    for row in participant_rows:
-        if row["is_winner"]:
-            winner_id = row["user_id"]
+    for participant in participants:
+        if participant["is_winner"]:
+            winner_id = participant["user_id"]
         else:
-            loser_ids.append(row["user_id"])
-        score = _row_to_player_score(row, game)
+            losers.append(participant["user_id"])
+        score = _row_to_player_score(participant, game)
         if score is not None:
             scores.append(score)
-    if winner_id is None:  # pragma: no cover -- a game always has exactly one winner.
-        raise RuntimeError(f"game {game_id} in guild {guild_id} has no winner participant")
-    return GameWithParticipants(
-        game=game, winner_id=winner_id, loser_ids=tuple(loser_ids), scores=tuple(scores)
+    if winner_id is None:  # pragma: no cover -- schema/application invariant.
+        raise RuntimeError(f"game {game_id} in guild {guild_id} has no active winner")
+    return GameWithParticipants(game, winner_id, tuple(losers), tuple(scores))
+
+
+def _snapshot(game: GameWithParticipants) -> str:
+    """A deterministic, bounded representation of an authoritative roster."""
+    g = game.game
+    score_by_user = {score.user_id: score for score in game.scores}
+    users = [game.winner_id, *game.loser_ids]
+    participants: list[dict[str, object]] = []
+    for user_id in users:
+        score = score_by_user.get(user_id)
+        participants.append(
+            {
+                "user_id": user_id,
+                "is_winner": user_id == game.winner_id,
+                "total_points": score.total_points if score is not None else None,
+                "score_breakdown": (
+                    {entry.key: entry.points for entry in score.breakdown}
+                    if score is not None
+                    else None
+                ),
+            }
+        )
+    payload = {
+        "game": {
+            "game_id": g.game_id,
+            "guild_id": g.guild_id,
+            "season_id": g.season_id,
+            "played_on": g.played_on.isoformat(),
+            "game_type": g.game_type,
+            "extension_5_6": g.extension_5_6,
+            "scenario": g.scenario,
+            "target_points": g.target_points,
+            "played_at": g.played_at.isoformat() if g.played_at is not None else None,
+            "played_timezone": g.played_timezone,
+            "revision": g.revision,
+        },
+        "participants": participants,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+async def update_confirmed_game(
+    conn: asyncpg.Connection,
+    guild_id: int,
+    game_id: int,
+    *,
+    expected_revision: int,
+    updated_by: int,
+    reason: str | None,
+    played_on: date,
+    winner_id: int,
+    loser_ids: Sequence[int],
+    game_type: str,
+    extension_5_6: bool,
+    scenario: str | None,
+    target_points: int | None,
+    played_at: datetime | None,
+    played_timezone: str | None,
+    scores: Sequence[PlayerScore] | None,
+) -> GameWithParticipants | str:
+    """Replace the active roster/details of a confirmed game and audit it.
+
+    Returns ``not_found``, ``not_confirmed``, or ``stale`` without mutating
+    when the guarded update cannot apply.  It never changes the game season,
+    report/confirmation identity, or Discord message identity.
+    """
+    require_id(guild_id, name="guild_id")
+    require_id(game_id, name="game_id")
+    expected_revision = require_int(
+        expected_revision, name="expected_revision", min_value=0, max_value=2**31 - 1
     )
+    require_id(updated_by, name="updated_by")
+    reason = _require_optional_bounded_str(reason, name="reason", min_length=1, max_length=200)
+    require_id(winner_id, name="winner_id")
+    game_type = _require_game_type(game_type)
+    extension_5_6 = _require_extension(extension_5_6)
+    scenario = _require_optional_bounded_str(
+        scenario, name="scenario", min_length=1, max_length=100
+    )
+    if target_points is not None:
+        target_points = require_int(target_points, name="target_points", min_value=1, max_value=99)
+    played_at, played_timezone = _validate_played_time(played_at, played_timezone)
+    loser_ids = list(loser_ids)
+    for i, loser_id in enumerate(loser_ids):
+        require_id(loser_id, name=f"loser_ids[{i}]")
+    user_ids = [winner_id, *loser_ids]
+    if len(set(user_ids)) != len(user_ids):
+        raise ValueError("winner_id and loser_ids must not contain duplicates")
+    points, breakdowns = _scores_for_participants(scores, user_ids)
+
+    async with conn.transaction():
+        before = await lock_game(conn, guild_id, game_id)
+        if before is None:
+            return "not_found"
+        if before.game.status != "confirmed":
+            return "not_confirmed"
+        if before.game.revision != expected_revision:
+            return "stale"
+        updated_row = await conn.fetchrow(
+            _UPDATE_CONFIRMED_GAME_SQL,
+            guild_id,
+            game_id,
+            played_on,
+            game_type,
+            extension_5_6,
+            scenario,
+            target_points,
+            played_at,
+            played_timezone,
+            updated_by,
+            reason,
+            expected_revision,
+        )
+        if updated_row is None:  # pragma: no cover -- lock prevents a concurrent transition.
+            return "stale"
+        await conn.execute(_DEACTIVATE_GAME_PARTICIPANTS_SQL, guild_id, game_id)
+        await conn.execute(
+            _UPSERT_GAME_PARTICIPANTS_SQL,
+            game_id,
+            guild_id,
+            user_ids,
+            [True, *([False] * len(loser_ids))],
+            points,
+            breakdowns,
+        )
+        updated = await get_game(conn, guild_id, game_id)
+        if updated is None:  # pragma: no cover -- protected by the locked game row.
+            raise RuntimeError("updated game disappeared")
+        await conn.execute(
+            _INSERT_GAME_UPDATE_SQL,
+            game_id,
+            updated.game.revision,
+            guild_id,
+            updated_by,
+            updated.game.updated_at,
+            reason,
+            _snapshot(before),
+            _snapshot(updated),
+        )
+    return updated
 
 
 async def confirm_game(

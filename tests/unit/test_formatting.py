@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime
 
 from catan_bot.db.models import Game, GameWithParticipants, GuildConfig, Season
@@ -294,3 +295,30 @@ def test_game_report_and_status_preserve_score_details_and_legacy_time_message()
         field.name == "Date" and "Time not recorded" in field.value
         for field in status.fields
     )
+    assert not any(field.name == "Revision" for field in status.fields)
+
+
+def test_revised_game_status_shows_safe_audit_metadata() -> None:
+    game = replace(
+        _detailed_game(),
+        revision=2,
+        updated_by=77,
+        updated_at=datetime(2026, 1, 2, 1, 30, tzinfo=UTC),
+        update_reason="@everyone **corrected** <@&12345678901234567>",
+    )
+    embed = build_game_status_embed(GameWithParticipants(game=game, winner_id=10, loser_ids=(20,)))
+
+    fields = {field.name: field.value for field in embed.fields}
+    assert fields["Revision"] == "2"
+    assert fields["Updated by"] == "<@77>"
+    assert fields["Updated at"] == "<t:1767317400:f>"
+    assert "@everyone" not in fields["Update reason"]
+    assert "<@&12345678901234567>" not in fields["Update reason"]
+    assert r"\*\*corrected\*\*" in fields["Update reason"]
+
+
+def test_revised_game_history_is_succinct_and_mentions_revision() -> None:
+    game = replace(_game(8, "unused"), revision=3, updated_by=77)
+    embed = build_game_history_embed([game], member_id=None)
+
+    assert "Updated r3 by <@77>" in embed.fields[0].value

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, date, datetime
 
@@ -37,6 +38,19 @@ async def test_create_game_and_get_game_round_trips_participants(
     assert fetched is not None
     assert fetched.winner_id == 1
     assert set(fetched.loser_ids) == {2, 3}
+
+
+async def test_get_game_returns_active_roster_in_deterministic_order(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2, 3, 4])
+    game = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [4, 3, 2])
+
+    fetched = await games.get_game(app_conn, guild_id, game.game_id)
+
+    assert fetched is not None
+    assert fetched.winner_id == 1
+    assert fetched.loser_ids == (2, 3, 4)
 
 
 async def test_create_game_with_generator_loser_ids_succeeds_with_all_participants(
@@ -533,3 +547,237 @@ async def test_recent_history_orders_by_date_then_time_then_game_id_and_scopes_g
         legacy.game_id,
         older_day.game_id,
     ]
+
+
+def _update_scores(*user_ids: int, zero: bool = False) -> tuple[PlayerScore, ...]:
+    """Small complete persistence representations; domain validation is service-owned."""
+    return tuple(
+        PlayerScore(
+            user_id=user_id,
+            total_points=0 if zero else 10 - index,
+            breakdown=(ScoreEntry("settlements", 0 if zero else 10 - index),),
+        )
+        for index, user_id in enumerate(user_ids)
+    )
+
+
+async def _confirmed_game(
+    conn: asyncpg.Connection, guild_id: int, *, winner: int = 1, losers: list[int] | None = None
+):
+    losers = [2] if losers is None else losers
+    game = await games.create_game(conn, guild_id, None, PLAYED_ON, winner, winner, losers)
+    assert await games.confirm_game(conn, guild_id, game.game_id, losers[0]) == "confirmed"
+    return game
+
+
+async def test_update_confirmed_game_replaces_active_roster_and_appends_audit(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2, 3])
+    game = await _confirmed_game(app_conn, guild_id)
+
+    updated = await games.update_confirmed_game(
+        app_conn,
+        guild_id,
+        game.game_id,
+        expected_revision=0,
+        updated_by=99,
+        reason=None,
+        played_on=date(2026, 3, 2),
+        winner_id=3,
+        loser_ids=[1],
+        game_type="normal",
+        extension_5_6=False,
+        scenario=None,
+        target_points=10,
+        played_at=None,
+        played_timezone=None,
+        scores=None,
+    )
+
+    assert not isinstance(updated, str)
+    assert updated.game.revision == 1
+    assert updated.game.updated_by == 99
+    assert updated.game.update_reason is None
+    assert updated.winner_id == 3
+    assert updated.loser_ids == (1,)
+    assert updated.scores == ()
+    # The removed player must disappear from player history, while retained
+    # rows still read through the active-only participant filter.
+    assert await games.list_recent_games_for_player(app_conn, guild_id, 2, 10) == []
+    player_three_history = await games.list_recent_games_for_player(app_conn, guild_id, 3, 10)
+    assert [g.game_id for g in player_three_history] == [game.game_id]
+    inactive = await app_conn.fetchval(
+        "SELECT is_active FROM game_participants WHERE game_id = $1 AND user_id = $2",
+        game.game_id,
+        2,
+    )
+    assert inactive is False
+    audit = await app_conn.fetchrow(
+        "SELECT revision, reason, before_snapshot, after_snapshot FROM game_updates "
+        "WHERE game_id = $1",
+        game.game_id,
+    )
+    assert audit["revision"] == 1
+    assert audit["reason"] is None
+    before = json.loads(audit["before_snapshot"])
+    after = json.loads(audit["after_snapshot"])
+    assert before["participants"][0]["user_id"] == 1
+    assert {p["user_id"] for p in after["participants"]} == {1, 3}
+
+
+async def test_update_confirmed_game_reactivates_prior_player_and_preserves_zero_scores(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2, 3])
+    game = await _confirmed_game(app_conn, guild_id)
+    first = await games.update_confirmed_game(
+        app_conn,
+        guild_id,
+        game.game_id,
+        expected_revision=0,
+        updated_by=9,
+        reason="swap",
+        played_on=PLAYED_ON,
+        winner_id=3,
+        loser_ids=[1],
+        game_type="normal",
+        extension_5_6=False,
+        scenario=None,
+        target_points=None,
+        played_at=None,
+        played_timezone=None,
+        scores=None,
+    )
+    assert not isinstance(first, str)
+    second = await games.update_confirmed_game(
+        app_conn,
+        guild_id,
+        game.game_id,
+        expected_revision=1,
+        updated_by=9,
+        reason="restore",
+        played_on=PLAYED_ON,
+        winner_id=1,
+        loser_ids=[2],
+        game_type="normal",
+        extension_5_6=False,
+        scenario=None,
+        target_points=None,
+        played_at=None,
+        played_timezone=None,
+        scores=_update_scores(1, 2, zero=True),
+    )
+    assert not isinstance(second, str)
+    assert second.scores == _update_scores(1, 2, zero=True)
+    count = await app_conn.fetchval(
+        "SELECT COUNT(*) FROM game_participants WHERE game_id = $1 AND user_id = $2",
+        game.game_id,
+        2,
+    )
+    assert count == 1
+    assert await app_conn.fetchval(
+        "SELECT is_active FROM game_participants WHERE game_id = $1 AND user_id = $2",
+        game.game_id,
+        2,
+    ) is True
+    full = await games.update_confirmed_game(
+        app_conn,
+        guild_id,
+        game.game_id,
+        expected_revision=2,
+        updated_by=9,
+        reason=None,
+        played_on=PLAYED_ON,
+        winner_id=1,
+        loser_ids=[2],
+        game_type="normal",
+        extension_5_6=False,
+        scenario=None,
+        target_points=None,
+        played_at=None,
+        played_timezone=None,
+        scores=_update_scores(1, 2),
+    )
+    assert not isinstance(full, str)
+    assert full.scores == _update_scores(1, 2)
+    assert await app_conn.fetchval(
+        "SELECT COUNT(*) FROM game_updates WHERE game_id = $1", game.game_id
+    ) == 3
+
+
+async def test_update_confirmed_game_guards_guild_status_and_revision(
+    app_conn: asyncpg.Connection, guild_id: int, other_guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    await players.ensure_players(app_conn, other_guild_id, [1, 2])
+    game = await _confirmed_game(app_conn, guild_id)
+    kwargs = dict(
+        expected_revision=0,
+        updated_by=9,
+        reason=None,
+        played_on=PLAYED_ON,
+        winner_id=1,
+        loser_ids=[2],
+        game_type="normal",
+        extension_5_6=False,
+        scenario=None,
+        target_points=None,
+        played_at=None,
+        played_timezone=None,
+        scores=None,
+    )
+    foreign = await games.update_confirmed_game(app_conn, other_guild_id, game.game_id, **kwargs)
+    assert foreign == "not_found"
+    missing = await games.update_confirmed_game(app_conn, guild_id, 999_999, **kwargs)
+    assert missing == "not_found"
+    first = await games.update_confirmed_game(app_conn, guild_id, game.game_id, **kwargs)
+    assert not isinstance(first, str)
+    stale = await games.update_confirmed_game(app_conn, guild_id, game.game_id, **kwargs)
+    assert stale == "stale"
+    pending = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2])
+    not_confirmed = await games.update_confirmed_game(app_conn, guild_id, pending.game_id, **kwargs)
+    assert not_confirmed == "not_confirmed"
+
+
+async def test_update_confirmed_game_rolls_back_if_a_late_step_fails(
+    app_conn: asyncpg.Connection, guild_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2, 3])
+    game = await _confirmed_game(app_conn, guild_id)
+    real_get_game = games.get_game
+
+    async def fail_after_roster(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected failure")
+
+    monkeypatch.setattr(games, "get_game", fail_after_roster)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        await games.update_confirmed_game(
+            app_conn, guild_id, game.game_id, expected_revision=0, updated_by=9, reason=None,
+            played_on=PLAYED_ON, winner_id=3, loser_ids=[1], game_type="normal",
+            extension_5_6=False, scenario=None, target_points=None, played_at=None,
+            played_timezone=None, scores=None,
+        )
+    monkeypatch.setattr(games, "get_game", real_get_game)
+    fetched = await games.get_game(app_conn, guild_id, game.game_id)
+    assert fetched is not None
+    assert fetched.game.revision == 0
+    assert fetched.winner_id == 1
+    assert fetched.loser_ids == (2,)
+    assert await app_conn.fetchval(
+        "SELECT COUNT(*) FROM game_updates WHERE game_id = $1", game.game_id
+    ) == 0
+
+
+async def test_inactive_participant_cannot_confirm_or_reject_pending_game(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    game = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2])
+    await app_conn.execute(
+        "UPDATE game_participants SET is_active = false WHERE game_id = $1 AND user_id = $2",
+        game.game_id,
+        2,
+    )
+    assert await games.confirm_game(app_conn, guild_id, game.game_id, 2) == "not_participant"
+    assert await games.reject_game(app_conn, guild_id, game.game_id, 2) == "not_participant"

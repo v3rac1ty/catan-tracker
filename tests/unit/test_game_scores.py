@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, call
 
 import discord
 import pytest
@@ -57,8 +57,52 @@ def _sheet(*, players: int = 2) -> game_scores.GameScoreSheet:
     )
 
 
-@pytest.mark.parametrize(
-    ("raw", "expected"), [("", None), ("  ", None), ("0", 0), ("99", 99)])
+def _update_sheet(*, stored_scores: tuple[object, ...] = ()) -> game_scores.GameScoreSheet:
+    original = SimpleNamespace(
+        game=SimpleNamespace(
+            game_id=42,
+            game_type="normal",
+            played_on="2026-01-02",
+            channel_id=None,
+            message_id=None,
+        ),
+        winner_id=1,
+        loser_ids=(2,),
+        scores=stored_scores,
+    )
+    prepared = SimpleNamespace(
+        game_id=42,
+        winner_id=1,
+        loser_ids=(2,),
+        rules=GameRules("normal", target_points=10),
+        original=original,
+        initial_scores=stored_scores,
+        played_on="2026-01-02",
+        expected_revision=3,
+    )
+    return game_scores.GameScoreSheet(
+        pool="pool",
+        guild_id=10,
+        actor=Actor(user_id=1, has_manage_guild=True, role_ids=frozenset()),
+        prepared=prepared,
+        channel=SimpleNamespace(id=700, send=AsyncMock()),
+        mode="update",
+    )
+
+
+def _announcement_state(*, revision: int, status: str = "confirmed") -> SimpleNamespace:
+    return SimpleNamespace(
+        game=SimpleNamespace(
+            game_id=42,
+            revision=revision,
+            status=status,
+            channel_id=700,
+            message_id=800,
+        )
+    )
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("", None), ("  ", None), ("0", 0), ("99", 99)])
 def test_score_cells_preserve_blank_vs_explicit_zero(raw: str, expected: int | None) -> None:
     assert game_scores.parse_score_cell(raw) == expected
 
@@ -85,9 +129,7 @@ def test_game_type_catalog_controls_score_rows() -> None:
     normal_pages = game_scores.score_pages(GameRules("normal", target_points=10))
     normal = [source.key for source in normal_pages[0]]
     seafarers_pages = game_scores.score_pages(GameRules("seafarers", target_points=10))
-    seafarers = [
-        source.key for source in seafarers_pages[0]
-    ]
+    seafarers = [source.key for source in seafarers_pages[0]]
 
     assert "longest_road" in normal
     assert "longest_trade_route" in seafarers
@@ -96,9 +138,7 @@ def test_game_type_catalog_controls_score_rows() -> None:
 def test_first_and_later_score_modals_never_exceed_five_inputs() -> None:
     sheet = _sheet()
     for page_index in range(len(sheet.pages)):
-        modal = game_scores.ScorePageModal(
-            sheet, player_id=1, page_index=page_index, revision=0
-        )
+        modal = game_scores.ScorePageModal(sheet, player_id=1, page_index=page_index, revision=0)
         assert len(modal.children) <= 5
     first = game_scores.ScorePageModal(sheet, player_id=1, page_index=0, revision=0)
     assert len(first.children) == 5
@@ -125,9 +165,7 @@ async def test_stale_modal_save_does_not_overwrite_current_draft() -> None:
         interaction, player_id=1, page_index=0, revision=0, values=(10, 4, 4, 2, 0)
     )
     stale = _interaction()
-    await sheet.save_page(
-        stale, player_id=1, page_index=0, revision=0, values=(1, 1, 0, 0, 0)
-    )
+    await sheet.save_page(stale, player_id=1, page_index=0, revision=0, values=(1, 1, 0, 0, 0))
 
     assert sheet.values[1]["settlements"] == 4
     stale.response.send_message.assert_awaited_once()
@@ -140,7 +178,9 @@ async def test_untouched_submit_passes_none_and_publishes_once(
     sheet = _sheet()
     interaction = _interaction()
     created = SimpleNamespace(game=SimpleNamespace(game_id=42))
-    public = SimpleNamespace(channel=SimpleNamespace(id=700), id=800, jump_url="https://example.test/42")
+    public = SimpleNamespace(
+        channel=SimpleNamespace(id=700), id=800, jump_url="https://example.test/42"
+    )
     sheet.channel.send.return_value = public
     submit = AsyncMock(return_value=created)
     record = AsyncMock()
@@ -237,7 +277,9 @@ async def test_failed_publication_retries_without_duplicate_database_report(
 ) -> None:
     sheet = _sheet()
     created = SimpleNamespace(game=SimpleNamespace(game_id=42))
-    public = SimpleNamespace(channel=SimpleNamespace(id=700), id=800, jump_url="https://example.test/42")
+    public = SimpleNamespace(
+        channel=SimpleNamespace(id=700), id=800, jump_url="https://example.test/42"
+    )
     sheet.channel.send.side_effect = [RuntimeError("offline"), public]
     submit = AsyncMock(return_value=created)
     monkeypatch.setattr(game_scores.game_service, "submit_game_report", submit)
@@ -257,7 +299,9 @@ async def test_failed_publication_retries_without_duplicate_database_report(
 async def test_persisted_retry_ignores_later_partial_state(monkeypatch: pytest.MonkeyPatch) -> None:
     sheet = _sheet()
     created = SimpleNamespace(game=SimpleNamespace(game_id=42))
-    public = SimpleNamespace(channel=SimpleNamespace(id=700), id=800, jump_url="https://example.test/42")
+    public = SimpleNamespace(
+        channel=SimpleNamespace(id=700), id=800, jump_url="https://example.test/42"
+    )
     sheet.channel.send.side_effect = [RuntimeError("offline"), public]
     submit = AsyncMock(return_value=created)
     monkeypatch.setattr(game_scores.game_service, "submit_game_report", submit)
@@ -372,3 +416,172 @@ async def test_absolute_deadline_expires_independently_of_terminal_flags() -> No
 
     assert await sheet.interaction_check(_interaction()) is False
     assert sheet.expired is True
+
+
+def test_update_prefills_zero_but_keeps_legacy_empty_scores_blank() -> None:
+    score = game_scores.PlayerScore(
+        user_id=1,
+        total_points=0,
+        breakdown=(game_scores.ScoreEntry(key="settlements", points=0),),
+    )
+    sheet = _update_sheet(stored_scores=(score,))
+
+    assert sheet.values[1]["__total__"] == 0
+    assert sheet.values[1]["settlements"] == 0
+    assert sheet.values[1]["cities"] is None
+    assert sheet.values[2]["__total__"] is None
+
+
+@pytest.mark.asyncio
+async def test_update_clear_all_points_stales_open_modal() -> None:
+    sheet = _update_sheet()
+    sheet.values[1]["settlements"] = 4
+    interaction = _interaction()
+
+    await sheet.clear_all_points(interaction)
+
+    assert sheet.revision == 1
+    assert all(value is None for player in sheet.values.values() for value in player.values())
+    assert interaction.response.defer.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_update_submit_rebuilds_actor_and_does_not_create_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sheet = _update_sheet()
+    interaction = _interaction()
+    updated = _announcement_state(revision=1)
+    submit = AsyncMock(return_value=updated)
+    monkeypatch.setattr(game_scores.game_service, "submit_game_update", submit)
+    monkeypatch.setattr("catan_bot.permissions.actor_from_interaction", lambda _: sheet.actor)
+    monkeypatch.setattr(
+        game_scores.formatting, "build_game_status_embed", lambda _: discord.Embed()
+    )
+
+    await sheet.submit(interaction)
+    await sheet.submit(_interaction())
+
+    submit.assert_awaited_once()
+    assert submit.await_args.kwargs["scores"] is None
+    assert sheet.created_report is None
+    assert sheet.completed is True
+
+
+@pytest.mark.asyncio
+async def test_update_refreshes_original_message_without_confirm_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sheet = _update_sheet()
+    sheet.prepared.original.game.channel_id = 700
+    sheet.prepared.original.game.message_id = 800
+    message = SimpleNamespace(edit=AsyncMock())
+    channel = SimpleNamespace(
+        id=700, guild=SimpleNamespace(id=10), fetch_message=AsyncMock(return_value=message)
+    )
+    sheet.channel = channel
+    updated = _announcement_state(revision=1)
+    monkeypatch.setattr(
+        game_scores.game_service, "submit_game_update", AsyncMock(return_value=updated)
+    )
+    monkeypatch.setattr(game_scores.game_service, "get_game", AsyncMock(return_value=updated))
+    monkeypatch.setattr("catan_bot.permissions.actor_from_interaction", lambda _: sheet.actor)
+    monkeypatch.setattr(
+        game_scores.formatting, "build_game_status_embed", lambda _: discord.Embed()
+    )
+
+    await sheet.submit(_interaction())
+
+    channel.fetch_message.assert_awaited_once_with(800)
+    assert message.edit.await_args.kwargs["view"] is None
+    assert sheet.completed is True
+
+
+@pytest.mark.asyncio
+async def test_update_refresh_failure_retries_message_only_with_fresh_game(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sheet = _update_sheet()
+    sheet.prepared.original.game.channel_id = 700
+    sheet.prepared.original.game.message_id = 800
+    message = SimpleNamespace(edit=AsyncMock())
+    channel = SimpleNamespace(
+        id=700,
+        guild=SimpleNamespace(id=10),
+        fetch_message=AsyncMock(side_effect=[RuntimeError("offline"), message]),
+    )
+    sheet.channel = channel
+    updated = _announcement_state(revision=1)
+    submit = AsyncMock(return_value=updated)
+    fresh = _announcement_state(revision=1)
+    get_game = AsyncMock(return_value=fresh)
+    monkeypatch.setattr(game_scores.game_service, "submit_game_update", submit)
+    monkeypatch.setattr(game_scores.game_service, "get_game", get_game)
+    monkeypatch.setattr("catan_bot.permissions.actor_from_interaction", lambda _: sheet.actor)
+    monkeypatch.setattr(
+        game_scores.formatting, "build_game_status_embed", lambda _: discord.Embed()
+    )
+
+    await sheet.submit(_interaction())
+    await sheet.submit(_interaction())
+
+    submit.assert_awaited_once()
+    assert get_game.await_count >= 2
+    assert all(args == call("pool", 10, 42) for args in get_game.await_args_list)
+    message.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_update_refresh_reconciles_a_newer_revision_without_second_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sheet = _update_sheet()
+    sheet.prepared.original.game.channel_id = 700
+    sheet.prepared.original.game.message_id = 800
+    message = SimpleNamespace(edit=AsyncMock())
+    sheet.channel = SimpleNamespace(
+        id=700, guild=SimpleNamespace(id=10), fetch_message=AsyncMock(return_value=message)
+    )
+    saved, newer = _announcement_state(revision=1), _announcement_state(revision=2)
+    submit = AsyncMock(return_value=saved)
+    get_game = AsyncMock(side_effect=[saved, newer, newer, newer])
+    monkeypatch.setattr(game_scores.game_service, "submit_game_update", submit)
+    monkeypatch.setattr(game_scores.game_service, "get_game", get_game)
+    monkeypatch.setattr("catan_bot.permissions.actor_from_interaction", lambda _: sheet.actor)
+    monkeypatch.setattr(
+        game_scores.formatting, "build_game_status_embed", lambda _: discord.Embed()
+    )
+
+    await sheet.submit(_interaction())
+
+    submit.assert_awaited_once()
+    assert message.edit.await_count == 2
+    assert get_game.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_update_refresh_reconciles_a_concurrent_void(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sheet = _update_sheet()
+    sheet.prepared.original.game.channel_id = 700
+    sheet.prepared.original.game.message_id = 800
+    message = SimpleNamespace(edit=AsyncMock())
+    sheet.channel = SimpleNamespace(
+        id=700, guild=SimpleNamespace(id=10), fetch_message=AsyncMock(return_value=message)
+    )
+    saved = _announcement_state(revision=1)
+    voided = _announcement_state(revision=1, status="voided")
+    get_game = AsyncMock(side_effect=[saved, voided, voided, voided])
+    status_embed = Mock(return_value=discord.Embed())
+    monkeypatch.setattr(
+        game_scores.game_service, "submit_game_update", AsyncMock(return_value=saved)
+    )
+    monkeypatch.setattr(game_scores.game_service, "get_game", get_game)
+    monkeypatch.setattr("catan_bot.permissions.actor_from_interaction", lambda _: sheet.actor)
+    monkeypatch.setattr(game_scores.formatting, "build_game_status_embed", status_embed)
+
+    await sheet.submit(_interaction())
+
+    assert message.edit.await_count == 2
+    assert any(call.args[0] is voided for call in status_embed.call_args_list)

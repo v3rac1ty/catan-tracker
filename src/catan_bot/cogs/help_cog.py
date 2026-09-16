@@ -24,7 +24,19 @@ _COMMANDS: tuple[tuple[str, str], ...] = (
         "/game history",
         "Show recent games in chronological date/time order, including their ruleset.",
     ),
-    ("/game show", "Show one game's full ruleset, participants, and point breakdown."),
+    (
+        "/game update",
+        "Admin-only correction for a confirmed game. Omitted fields are preserved; any "
+        "loser supplied replaces the full loser roster, while winner-only swaps the "
+        "existing roster. Use clear_time or clear_scenario to remove optional values. "
+        "Completed-season winner/roster changes are blocked; each edit creates a "
+        "revision, and /game show is the current source of truth.",
+    ),
+    (
+        "/game show",
+        "Show one game's current ruleset, participants, point breakdown, and audit revision; "
+        "it is the current source of truth.",
+    ),
     ("/leaderboard [channel]", "Show rankings here or post them to a chosen channel."),
     ("/stats", "Show a player's win/loss record."),
     (

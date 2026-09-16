@@ -65,6 +65,7 @@ async def test_all_commands_register_in_an_offline_tree() -> None:
         }
         assert {command.name for command in top_level["game"].commands} == {
             "report",
+            "update",
             "void",
             "history",
             "show",

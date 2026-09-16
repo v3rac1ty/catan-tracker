@@ -429,6 +429,48 @@ async def test_game_scoring_metadata_defaults_and_time_pair_constraint(
         )
 
 
+async def test_game_update_columns_and_active_winner_constraint(
+    app_conn: asyncpg.Connection,
+) -> None:
+    await _insert_guild(app_conn)
+    await app_conn.execute(
+        "INSERT INTO players (guild_id, user_id) VALUES ($1, $2), ($1, $3)",
+        GUILD_ID,
+        1,
+        2,
+    )
+    game_id = await app_conn.fetchval(
+        "INSERT INTO games (guild_id, played_on, reported_by) VALUES ($1, $2, $3) "
+        "RETURNING game_id",
+        GUILD_ID,
+        date(2026, 1, 7),
+        1,
+    )
+    defaults = await app_conn.fetchrow(
+        "SELECT revision, updated_by, updated_at, update_reason FROM games WHERE game_id = $1",
+        game_id,
+    )
+    assert tuple(defaults.values()) == (0, None, None, None)
+    await app_conn.execute(
+        "INSERT INTO game_participants (game_id, user_id, guild_id, is_winner) "
+        "VALUES ($1, $2, $3, true)",
+        game_id,
+        1,
+        GUILD_ID,
+    )
+    await app_conn.execute(
+        "INSERT INTO game_participants (game_id, user_id, guild_id, is_winner, is_active) "
+        "VALUES ($1, $2, $3, true, false)",
+        game_id,
+        2,
+        GUILD_ID,
+    )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await app_conn.execute(
+            "UPDATE games SET updated_by = $1 WHERE game_id = $2", 1, game_id
+        )
+
+
 async def test_game_participant_scores_must_be_an_object_and_paired(
     app_conn: asyncpg.Connection,
 ) -> None:

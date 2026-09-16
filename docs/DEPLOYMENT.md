@@ -199,6 +199,11 @@ Expected state:
 - `migrate` exited with code 0. It is intentionally a one-shot service.
 - `bot` is running, connected, and reports a successful command sync.
 
+The one-shot migration service applies every pending migration, including
+`0004_game_updates.sql`, which adds confirmed-game correction and audit
+revision storage. Confirm it completed successfully before using
+`/game update`.
+
 A sync with `DEV_GUILD_ID` is limited to that server and should appear quickly.
 A global sync can take longer to propagate. After the sync succeeds, change
 `SYNC_COMMANDS=false` and recreate only the bot container:
@@ -208,8 +213,8 @@ sudo docker compose up -d --no-deps --force-recreate bot
 ```
 
 Run another one-time sync after installing a release that changes slash-command
-definitions. Avoid syncing on every restart because it makes unnecessary
-Discord API calls.
+definitions, including a release that adds or changes `/game update`. Avoid
+syncing on every restart because it makes unnecessary Discord API calls.
 
 In Discord, use `/config channel` to select the season-announcement channel,
 then set the server timezone and optional admin role. To enable event

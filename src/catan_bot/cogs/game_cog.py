@@ -38,7 +38,7 @@ def _participants(
 class GameCog(commands.Cog):
     game_group = app_commands.Group(
         name="game",
-        description="Report, void, or look up Catan games.",
+        description="Report, update, void, or look up Catan games.",
         guild_only=True,
     )
 
@@ -109,6 +109,95 @@ class GameCog(commands.Cog):
             embed=view.embed(),
             view=view,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+        view.private_message = private_message
+
+    @game_group.command(name="update", description="Correct a confirmed game (admin).")
+    @app_commands.describe(
+        game_id="The confirmed game to correct.",
+        winner="Replacement winner; an external winner needs a full loser list.",
+        loser1="First replacement loser. Supplying any loser replaces the entire loser list.",
+        loser2="Replacement loser.",
+        loser3="Replacement loser.",
+        loser4="Replacement loser.",
+        loser5="Replacement loser.",
+        date="Optional replacement date.",
+        time="Optional replacement local time.",
+        game_type="Optional replacement rules.",
+        extension_5_6="Optional replacement extension setting.",
+        scenario="Optional replacement scenario; use clear_scenario to remove it.",
+        target_points="Optional replacement winning score.",
+        reason="Why this confirmed game is being corrected.",
+        clear_time="Remove the recorded time.",
+        clear_scenario="Remove the recorded scenario.",
+    )
+    @app_commands.choices(game_type=_GAME_TYPE_CHOICES)
+    async def update_command(
+        self,
+        interaction: discord.Interaction,
+        game_id: app_commands.Range[int, 1, _DISCORD_INTEGER_MAX],
+        winner: discord.Member | None = None,
+        loser1: discord.Member | None = None,
+        loser2: discord.Member | None = None,
+        loser3: discord.Member | None = None,
+        loser4: discord.Member | None = None,
+        loser5: discord.Member | None = None,
+        date: app_commands.Range[str, 1, 32] | None = None,
+        time: app_commands.Range[str, 1, 32] | None = None,
+        game_type: app_commands.Choice[str] | None = None,
+        extension_5_6: bool | None = None,
+        scenario: app_commands.Range[str, 1, 100] | None = None,
+        target_points: app_commands.Range[int, 1, 99] | None = None,
+        reason: app_commands.Range[str, 1, 200] | None = None,
+        clear_time: bool = False,
+        clear_scenario: bool = False,
+    ) -> None:
+        actor = actor_from_interaction(interaction)
+        guild_id = guild_id_from_interaction(interaction)
+        loser_members = (loser1, loser2, loser3, loser4, loser5)
+        # `None` means preserve; an option (including just loser1) replaces all losers.
+        loser_refs = (
+            None
+            if all(member is None for member in loser_members)
+            else [
+                ParticipantRef(user_id=member.id, is_bot=member.bot)
+                for member in loser_members
+                if member is not None
+            ]
+        )
+        winner_ref = (
+            None if winner is None else ParticipantRef(user_id=winner.id, is_bot=winner.bot)
+        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        prepared = await game_service.prepare_game_update(
+            self.bot.pool,
+            guild_id,
+            actor,
+            game_id=game_id,
+            winner=winner_ref,
+            losers=loser_refs,
+            date_text=date,
+            time_text=time,
+            game_type=game_type.value if game_type is not None else None,
+            extension_5_6=extension_5_6,
+            scenario=scenario,
+            target_points=target_points,
+            reason=reason,
+            clear_time=clear_time,
+            clear_scenario=clear_scenario,
+            now=datetime.now(UTC),
+        )
+        view = GameScoreSheet(
+            pool=self.bot.pool,
+            guild_id=guild_id,
+            actor=actor,
+            prepared=prepared,
+            channel=interaction.channel,
+            mode="update",
+            bot=self.bot,
+        )
+        private_message = await interaction.edit_original_response(
+            embed=view.embed(), view=view, allowed_mentions=discord.AllowedMentions.none()
         )
         view.private_message = private_message
 

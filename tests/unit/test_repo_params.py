@@ -444,6 +444,69 @@ async def test_list_recent_games_for_player_validates_limit_before_conn(
         await games.list_recent_games_for_player(conn, 1, 1, -1)
 
 
+def _valid_update_kwargs() -> dict[str, object]:
+    return {
+        "expected_revision": 0,
+        "updated_by": 1,
+        "reason": None,
+        "played_on": PLAYED_ON,
+        "winner_id": 1,
+        "loser_ids": [2],
+        "game_type": "normal",
+        "extension_5_6": False,
+        "scenario": None,
+        "target_points": None,
+        "played_at": None,
+        "played_timezone": None,
+        "scores": None,
+    }
+
+
+@pytest.mark.parametrize("bad", [True, -1, 2**31])
+async def test_update_game_validates_expected_revision_before_conn(
+    conn: _ExplodingConnection, bad: object
+) -> None:
+    kwargs = _valid_update_kwargs()
+    kwargs["expected_revision"] = bad
+    with pytest.raises(ValueError, match="expected_revision"):
+        await games.update_confirmed_game(conn, 1, 1, **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad", ["", "x" * 201, True])
+async def test_update_game_validates_optional_reason_before_conn(
+    conn: _ExplodingConnection, bad: object
+) -> None:
+    kwargs = _valid_update_kwargs()
+    kwargs["reason"] = bad
+    with pytest.raises(ValueError, match="reason"):
+        await games.update_confirmed_game(conn, 1, 1, **kwargs)  # type: ignore[arg-type]
+
+
+async def test_update_game_validates_duplicate_roster_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    kwargs = _valid_update_kwargs()
+    kwargs["loser_ids"] = [1]
+    with pytest.raises(ValueError, match="duplicates"):
+        await games.update_confirmed_game(conn, 1, 1, **kwargs)  # type: ignore[arg-type]
+
+
+async def test_update_game_validates_paired_time_before_conn(conn: _ExplodingConnection) -> None:
+    kwargs = _valid_update_kwargs()
+    kwargs["played_at"] = _AWARE_DATETIME
+    with pytest.raises(ValueError, match="played_at and played_timezone"):
+        await games.update_confirmed_game(conn, 1, 1, **kwargs)  # type: ignore[arg-type]
+
+
+async def test_lock_game_and_lock_season_validate_ids_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="game_id"):
+        await games.lock_game(conn, 1, 0)
+    with pytest.raises(ValueError, match="season_id"):
+        await seasons.lock_season(conn, 1, 0)
+
+
 # --- seasons.py ---
 
 

@@ -116,11 +116,19 @@ FROM seasons
 WHERE guild_id = $1 AND season_id = $2
 """
 
+_LOCK_SEASON_SQL = """
+SELECT season_id, guild_id, name, starts_on, ends_on, ends_at, min_games, status,
+       resolved_at, announced_at, created_by, created_at
+FROM seasons
+WHERE guild_id = $1 AND season_id = $2
+FOR UPDATE
+"""
+
 _SELECT_SEASON_PLAYER_STATS_SQL = """
 SELECT p.user_id AS user_id, COUNT(*) AS games, COUNT(*) FILTER (WHERE p.is_winner) AS wins
 FROM game_participants p
 JOIN games g ON g.game_id = p.game_id
-WHERE g.guild_id = $1 AND g.season_id = $2 AND g.status = 'confirmed'
+WHERE g.guild_id = $1 AND g.season_id = $2 AND g.status = 'confirmed' AND p.is_active
 GROUP BY p.user_id
 """
 
@@ -128,7 +136,7 @@ _SELECT_ALL_TIME_PLAYER_STATS_SQL = """
 SELECT p.user_id AS user_id, COUNT(*) AS games, COUNT(*) FILTER (WHERE p.is_winner) AS wins
 FROM game_participants p
 JOIN games g ON g.game_id = p.game_id
-WHERE g.guild_id = $1 AND g.status = 'confirmed'
+WHERE g.guild_id = $1 AND g.status = 'confirmed' AND p.is_active
 GROUP BY p.user_id
 """
 
@@ -136,14 +144,15 @@ _SELECT_SEASON_PLAYER_STATS_FOR_USER_SQL = """
 SELECT COUNT(*) AS games, COUNT(*) FILTER (WHERE p.is_winner) AS wins
 FROM game_participants p
 JOIN games g ON g.game_id = p.game_id
-WHERE g.guild_id = $1 AND g.season_id = $2 AND g.status = 'confirmed' AND p.user_id = $3
+WHERE g.guild_id = $1 AND g.season_id = $2 AND g.status = 'confirmed'
+  AND p.user_id = $3 AND p.is_active
 """
 
 _SELECT_ALL_TIME_PLAYER_STATS_FOR_USER_SQL = """
 SELECT COUNT(*) AS games, COUNT(*) FILTER (WHERE p.is_winner) AS wins
 FROM game_participants p
 JOIN games g ON g.game_id = p.game_id
-WHERE g.guild_id = $1 AND g.status = 'confirmed' AND p.user_id = $2
+WHERE g.guild_id = $1 AND g.status = 'confirmed' AND p.user_id = $2 AND p.is_active
 """
 
 # System-wide (no guild_id): the scheduler must see every guild's due
@@ -342,6 +351,14 @@ async def get_season(conn: asyncpg.Connection, guild_id: int, season_id: int) ->
     require_id(guild_id, name="guild_id")
     require_id(season_id, name="season_id")
     row = await conn.fetchrow(_SELECT_SEASON_SQL, guild_id, season_id)
+    return _row_to_season(row) if row is not None else None
+
+
+async def lock_season(conn: asyncpg.Connection, guild_id: int, season_id: int) -> Season | None:
+    """Lock one guild-scoped season regardless of status for a caller transaction."""
+    require_id(guild_id, name="guild_id")
+    require_id(season_id, name="season_id")
+    row = await conn.fetchrow(_LOCK_SEASON_SQL, guild_id, season_id)
     return _row_to_season(row) if row is not None else None
 
 

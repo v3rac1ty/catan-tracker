@@ -37,6 +37,7 @@ flowchart LR
 | `/game report` | Report a game through the guided form: winner/losers, ruleset, optional extension/scenario/target/time, and point breakdown | Anyone | Available |
 | Confirm / Reject buttons | Confirm or reject a pending report | Other participants; reporter may retract | Available |
 | `/game void`, `/game history`, `/game show` | Void a game / view chronological history / show one game's full details | Admin / anyone | Available |
+| `/game update` | Admin-only correction of a confirmed game, with optional field preservation and audit revisions | Admin | Available |
 | `/leaderboard [channel]`, `/stats` | View rankings and player stats. A selected leaderboard channel receives the public board; otherwise it posts here. | Anyone | Available |
 | `/event create [date] [channel] ...`, `/event list`, `/event cancel` | Schedule and manage game nights. A selected channel receives the event; otherwise it posts here. | Anyone / creator or admin | Available |
 | RSVP buttons | Going / Maybe / Not going | Anyone | Available |
@@ -61,6 +62,21 @@ time show `Time not recorded`.
 Game history is indexed newest-first by played date, then played local time
 when available, with the game id as a stable tie-breaker for games sharing a
 date and time.
+
+### Correcting confirmed games
+
+Use `/game update` for an admin-only correction instead of voiding and
+re-reporting a confirmed game. Omitted optional fields preserve their current
+values. Supplying any loser replaces the entire loser roster, while supplying
+only a winner swaps the winner within the existing roster. Use `clear_time` or
+`clear_scenario` when an optional value should be removed. Updates apply only
+to confirmed games; changing the winner or roster is blocked when the game
+belongs to a completed season. Every successful edit increments an audit
+revision and records the editor and optional reason. There is no separate
+audit-history command: `/game show` is the current source of truth.
+
+Scores follow the same NULL distinction during updates: a blank/unrecorded
+score remains database `NULL`, while an entered `0` is an explicit zero.
 
 ## Tech stack
 
@@ -103,6 +119,10 @@ Prerequisites: Docker, Python 3.12.
    docker compose run --rm migrate
    docker compose up -d bot
    ```
+
+The migration service applies all pending migrations, including `0004` for
+confirmed-game updates and audit revisions. Do not skip the migration service
+when deploying this release.
 
 To publish slash commands after installing or updating the bot, set
 `SYNC_COMMANDS=true` for one startup. Set `DEV_GUILD_ID` as well to sync to a

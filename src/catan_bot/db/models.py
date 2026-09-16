@@ -114,6 +114,24 @@ class Game:
     target_points: int | None = None
     played_at: datetime | None = None
     played_timezone: str | None = None
+    revision: int = 0
+    updated_by: int | None = None
+    updated_at: datetime | None = None
+    update_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GameUpdate:
+    """Immutable audit entry for one confirmed-game correction."""
+
+    game_id: int
+    revision: int
+    guild_id: int
+    updated_by: int
+    updated_at: datetime
+    reason: str | None
+    before_snapshot: str
+    after_snapshot: str
 
 
 @dataclass(frozen=True, slots=True)

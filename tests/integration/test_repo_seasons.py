@@ -59,6 +59,29 @@ async def test_create_season_becomes_the_active_season(
     assert active.season_id == created.season_id
 
 
+async def test_stats_ignore_inactive_game_participants(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    season = await _create_season(app_conn, guild_id)
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    game = await games.create_game(
+        app_conn, guild_id, season.season_id, date(2026, 2, 1), 1, 1, [2]
+    )
+    assert await games.confirm_game(app_conn, guild_id, game.game_id, 2) == "confirmed"
+    await app_conn.execute(
+        "UPDATE game_participants SET is_active = false, is_winner = false "
+        "WHERE game_id = $1 AND user_id = $2",
+        game.game_id,
+        2,
+    )
+    assert await seasons.season_player_stats(app_conn, guild_id, season.season_id) == [
+        seasons.PlayerStats(user_id=1, games=1, wins=1)
+    ]
+    player_season, player_all_time = await seasons.player_stats(app_conn, guild_id, 2)
+    assert player_season is not None
+    assert (player_season.games, player_all_time.games) == (0, 0)
+
+
 async def test_create_season_second_active_raises_active_season_exists_error(
     app_conn: asyncpg.Connection, guild_id: int
 ) -> None:

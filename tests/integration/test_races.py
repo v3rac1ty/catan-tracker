@@ -89,6 +89,40 @@ async def test_same_user_double_confirming_concurrently_only_one_succeeds(
     assert results == ["confirmed", "not_pending"]
 
 
+async def test_two_concurrent_game_updates_with_same_revision_one_is_stale(
+    app_conn: asyncpg.Connection,
+    guild_id: int,
+    two_conns: tuple[asyncpg.Connection, asyncpg.Connection],
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    game = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2])
+    assert await games.confirm_game(app_conn, guild_id, game.game_id, 2) == "confirmed"
+    kwargs = dict(
+        expected_revision=0,
+        updated_by=9,
+        reason=None,
+        played_on=PLAYED_ON,
+        winner_id=1,
+        loser_ids=[2],
+        game_type="normal",
+        extension_5_6=False,
+        scenario=None,
+        target_points=None,
+        played_at=None,
+        played_timezone=None,
+        scores=None,
+    )
+    first, second = await asyncio.gather(
+        games.update_confirmed_game(two_conns[0], guild_id, game.game_id, **kwargs),
+        games.update_confirmed_game(two_conns[1], guild_id, game.game_id, **kwargs),
+    )
+    assert sum(isinstance(result, str) for result in (first, second)) == 1
+    assert "stale" in (first, second)
+    assert await app_conn.fetchval(
+        "SELECT COUNT(*) FROM game_updates WHERE game_id = $1", game.game_id
+    ) == 1
+
+
 async def test_two_concurrent_create_season_one_succeeds_one_raises(
     app_conn: asyncpg.Connection,
     guild_id: int,
