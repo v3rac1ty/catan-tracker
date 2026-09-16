@@ -372,9 +372,7 @@ async def test_event_command_rsvp_cancel_and_guild_isolation_flow(
     no_click = InteractionStub(guild_id, attendee.user_id, pool=pool)
     await event_rsvp.EventRsvpButton(event_id, "no").callback(no_click)
     changed_counts = next(
-        field.value
-        for field in _embed_from(no_click).fields
-        if field.name == "Not Going (1)"
+        field.value for field in _embed_from(no_click).fields if field.name == "Not Going (1)"
     )
     assert changed_counts == "<@20>"
 

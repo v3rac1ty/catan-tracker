@@ -244,9 +244,7 @@ def test_preserve_local_time_delegates_timezone_work_to_domain_dates() -> None:
     original.game.played_at = datetime(2026, 9, 13, 0, 30, tzinfo=UTC)
     original.game.played_timezone = "America/Chicago"
 
-    preserved, timezone = game_service._preserve_local_time(
-        original, date(2026, 9, 14)
-    )
+    preserved, timezone = game_service._preserve_local_time(original, date(2026, 9, 14))
 
     assert preserved == datetime(2026, 9, 15, 0, 30, tzinfo=UTC)
     assert timezone == "America/Chicago"

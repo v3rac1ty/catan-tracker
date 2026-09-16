@@ -489,9 +489,7 @@ async def create_game(
         scenario, name="scenario", min_length=1, max_length=100
     )
     if target_points is not None:
-        target_points = require_int(
-            target_points, name="target_points", min_value=1, max_value=99
-        )
+        target_points = require_int(target_points, name="target_points", min_value=1, max_value=99)
     played_at, played_timezone = _validate_played_time(played_at, played_timezone)
     # Materialize exactly once: `loser_ids` may be a one-shot iterable (e.g. a
     # generator), and validating it here must not be the thing that consumes

@@ -167,9 +167,7 @@ async def test_submit_rejects_wrong_reporter_before_acquiring_connection(
     )
 
     with pytest.raises(PermissionDeniedError):
-        await game_service.submit_game_report(
-            pool, 123, _actor(11), prepared, scores=None, now=NOW
-        )
+        await game_service.submit_game_report(pool, 123, _actor(11), prepared, scores=None, now=NOW)
     assert pool.acquire_calls == 0
 
 
@@ -249,16 +247,11 @@ async def test_submit_accepts_a_complete_score_table(
         ("largest_army", 0),
         ("vp_cards", 1),
     )
-    winner_score = PlayerScore(
-        1, 10, tuple(ScoreEntry(key, points) for key, points in sources)
-    )
+    winner_score = PlayerScore(1, 10, tuple(ScoreEntry(key, points) for key, points in sources))
     loser_score = PlayerScore(
         2,
         3,
-        tuple(
-            ScoreEntry(key, points if key == "settlements" else 0)
-            for key, points in sources
-        ),
+        tuple(ScoreEntry(key, points if key == "settlements" else 0) for key, points in sources),
     )
     monkeypatch.setattr(game_service.players, "ensure_players", AsyncMock())
     monkeypatch.setattr(

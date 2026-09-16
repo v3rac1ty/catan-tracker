@@ -214,9 +214,7 @@ async def submit_game_report(
         )
 
 
-async def get_game(
-    pool: asyncpg.Pool, guild_id: int, game_id: int
-) -> GameWithParticipants:
+async def get_game(pool: asyncpg.Pool, guild_id: int, game_id: int) -> GameWithParticipants:
     """Load one game through the guild-scoped repository query."""
     async with pool.acquire() as conn:
         loaded = await games.get_game(conn, guild_id, game_id)
@@ -386,9 +384,7 @@ async def prepare_game_update(
         timezone = require_valid_timezone(config)
         today = today_in_timezone(timezone, now=now)
         played_on = (
-            original.game.played_on
-            if date_text is None
-            else parse_date(date_text, today=today)
+            original.game.played_on if date_text is None else parse_date(date_text, today=today)
         )
         validate_game_date(played_on, today=today)
         original_season = None

@@ -272,7 +272,8 @@ def test_six_player_combined_score_table_stays_compact_and_uses_player_labels() 
     assert any(field.name == "Extension" for field in embed.fields)
     assert any(field.name == "Date" and "13:30" in field.value for field in embed.fields)
     assert any(
-        field.name == "Scenario" and "@everyone" not in field.value
+        field.name == "Scenario"
+        and "@everyone" not in field.value
         and r"\*\*Hidden Scenario\*\*" in field.value
         for field in embed.fields
     )
@@ -292,8 +293,7 @@ def test_game_report_and_status_preserve_score_details_and_legacy_time_message()
         GameWithParticipants(game=legacy, winner_id=10, loser_ids=(20,))
     )
     assert any(
-        field.name == "Date" and "Time not recorded" in field.value
-        for field in status.fields
+        field.name == "Date" and "Time not recorded" in field.value for field in status.fields
     )
     assert not any(field.name == "Revision" for field in status.fields)
 

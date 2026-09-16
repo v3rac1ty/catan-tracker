@@ -415,19 +415,14 @@ def format_game_score_table(created: GameWithParticipants) -> str:
     table_rows = [separator.join((f"{'':<{row_label_width}}", *header_cells))]
     for source in sources:
         cells = [
-            str(entries_by_player.get(user_id, {}).get(source.key, "—"))
-            for user_id in player_ids
+            str(entries_by_player.get(user_id, {}).get(source.key, "—")) for user_id in player_ids
         ]
         value_cells = [f"{cell:>3}" for cell in cells]
         table_rows.append(
-            separator.join(
-                (f"{_score_source_label(source)[:12]:<{row_label_width}}", *value_cells)
-            )
+            separator.join((f"{_score_source_label(source)[:12]:<{row_label_width}}", *value_cells))
         )
     total_cells = [
-        str(score_by_player[user_id].total_points)
-        if user_id in score_by_player
-        else "—"
+        str(score_by_player[user_id].total_points) if user_id in score_by_player else "—"
         for user_id in player_ids
     ]
     table_rows.append(
@@ -776,9 +771,7 @@ def _rsvp_group_value(member_ids: Sequence[int], *, empty: str = "No responses y
     return truncate(rendered, EMBED_FIELD_VALUE_MAX)
 
 
-def build_event_embed(
-    event: Event, roster: RsvpRoster | RsvpCounts | None = None
-) -> discord.Embed:
+def build_event_embed(event: Event, roster: RsvpRoster | RsvpCounts | None = None) -> discord.Embed:
     title = truncate(f"Event: {escape_user_text(event.title)}", EMBED_TITLE_MAX)
     colors = {
         "scheduled": discord.Color.blurple(),

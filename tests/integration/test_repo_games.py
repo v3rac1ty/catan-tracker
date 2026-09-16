@@ -485,8 +485,7 @@ async def test_absent_scores_stay_null_while_explicit_zero_scores_round_trip(
         row["total_points"] is None and row["score_breakdown"] is None for row in absent_rows
     )
     assert all(
-        row["total_points"] == 0 and row["score_breakdown"] is not None
-        for row in recorded_rows
+        row["total_points"] == 0 and row["score_breakdown"] is not None for row in recorded_rows
     )
     absent_fetched = await games.get_game(app_conn, guild_id, absent.game_id)
     recorded_fetched = await games.get_game(app_conn, guild_id, recorded.game_id)
@@ -676,11 +675,14 @@ async def test_update_confirmed_game_reactivates_prior_player_and_preserves_zero
         2,
     )
     assert count == 1
-    assert await app_conn.fetchval(
-        "SELECT is_active FROM game_participants WHERE game_id = $1 AND user_id = $2",
-        game.game_id,
-        2,
-    ) is True
+    assert (
+        await app_conn.fetchval(
+            "SELECT is_active FROM game_participants WHERE game_id = $1 AND user_id = $2",
+            game.game_id,
+            2,
+        )
+        is True
+    )
     full = await games.update_confirmed_game(
         app_conn,
         guild_id,
@@ -701,9 +703,12 @@ async def test_update_confirmed_game_reactivates_prior_player_and_preserves_zero
     )
     assert not isinstance(full, str)
     assert full.scores == _update_scores(1, 2)
-    assert await app_conn.fetchval(
-        "SELECT COUNT(*) FROM game_updates WHERE game_id = $1", game.game_id
-    ) == 3
+    assert (
+        await app_conn.fetchval(
+            "SELECT COUNT(*) FROM game_updates WHERE game_id = $1", game.game_id
+        )
+        == 3
+    )
 
 
 async def test_update_confirmed_game_guards_guild_status_and_revision(
@@ -753,10 +758,22 @@ async def test_update_confirmed_game_rolls_back_if_a_late_step_fails(
     monkeypatch.setattr(games, "get_game", fail_after_roster)
     with pytest.raises(RuntimeError, match="injected failure"):
         await games.update_confirmed_game(
-            app_conn, guild_id, game.game_id, expected_revision=0, updated_by=9, reason=None,
-            played_on=PLAYED_ON, winner_id=3, loser_ids=[1], game_type="normal",
-            extension_5_6=False, scenario=None, target_points=None, played_at=None,
-            played_timezone=None, scores=None,
+            app_conn,
+            guild_id,
+            game.game_id,
+            expected_revision=0,
+            updated_by=9,
+            reason=None,
+            played_on=PLAYED_ON,
+            winner_id=3,
+            loser_ids=[1],
+            game_type="normal",
+            extension_5_6=False,
+            scenario=None,
+            target_points=None,
+            played_at=None,
+            played_timezone=None,
+            scores=None,
         )
     monkeypatch.setattr(games, "get_game", real_get_game)
     fetched = await games.get_game(app_conn, guild_id, game.game_id)
@@ -764,9 +781,12 @@ async def test_update_confirmed_game_rolls_back_if_a_late_step_fails(
     assert fetched.game.revision == 0
     assert fetched.winner_id == 1
     assert fetched.loser_ids == (2,)
-    assert await app_conn.fetchval(
-        "SELECT COUNT(*) FROM game_updates WHERE game_id = $1", game.game_id
-    ) == 0
+    assert (
+        await app_conn.fetchval(
+            "SELECT COUNT(*) FROM game_updates WHERE game_id = $1", game.game_id
+        )
+        == 0
+    )
 
 
 async def test_inactive_participant_cannot_confirm_or_reject_pending_game(

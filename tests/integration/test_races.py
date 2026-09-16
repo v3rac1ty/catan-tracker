@@ -118,9 +118,12 @@ async def test_two_concurrent_game_updates_with_same_revision_one_is_stale(
     )
     assert sum(isinstance(result, str) for result in (first, second)) == 1
     assert "stale" in (first, second)
-    assert await app_conn.fetchval(
-        "SELECT COUNT(*) FROM game_updates WHERE game_id = $1", game.game_id
-    ) == 1
+    assert (
+        await app_conn.fetchval(
+            "SELECT COUNT(*) FROM game_updates WHERE game_id = $1", game.game_id
+        )
+        == 1
+    )
 
 
 async def test_two_concurrent_create_season_one_succeeds_one_raises(

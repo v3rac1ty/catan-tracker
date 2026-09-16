@@ -62,9 +62,7 @@ def _season(name: str = "Fall League") -> Season:
 def test_event_embed_escapes_text_and_uses_native_timestamps() -> None:
     payload = "@everyone **Game** <#12345678901234567>"
     event = _event(title=payload, location=payload, description=payload)
-    embed = build_event_embed(
-        event, RsvpRoster(going=(1, 2), maybe=(3,), not_going=(4, 5, 6))
-    )
+    embed = build_event_embed(event, RsvpRoster(going=(1, 2), maybe=(3,), not_going=(4, 5, 6)))
 
     expected = escape_user_text(payload)
     assert expected in (embed.title or "")

@@ -466,9 +466,7 @@ async def test_game_update_columns_and_active_winner_constraint(
         GUILD_ID,
     )
     with pytest.raises(asyncpg.CheckViolationError):
-        await app_conn.execute(
-            "UPDATE games SET updated_by = $1 WHERE game_id = $2", 1, game_id
-        )
+        await app_conn.execute("UPDATE games SET updated_by = $1 WHERE game_id = $2", 1, game_id)
 
 
 async def test_game_participant_scores_must_be_an_object_and_paired(
