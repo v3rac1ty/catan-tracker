@@ -31,6 +31,7 @@ async def test_ensure_guild_creates_row_with_defaults(app_conn: asyncpg.Connecti
     assert config.timezone == "UTC"
     assert config.announce_channel_id is None
     assert config.admin_role_id is None
+    assert config.player_role_id is None
     assert config.default_min_games == 2
     assert config.created_at == config.updated_at
 
@@ -105,6 +106,16 @@ async def test_set_admin_role_sets_and_clears(app_conn: asyncpg.Connection, guil
     assert cleared.admin_role_id is None
 
 
+async def test_set_player_role_sets_and_clears(app_conn: asyncpg.Connection, guild_id: int) -> None:
+    set_result = await guilds.set_player_role(app_conn, guild_id, 765432)
+    assert set_result is not None
+    assert set_result.player_role_id == 765432
+
+    cleared = await guilds.set_player_role(app_conn, guild_id, None)
+    assert cleared is not None
+    assert cleared.player_role_id is None
+
+
 async def test_set_default_min_games_updates_value(
     app_conn: asyncpg.Connection, guild_id: int
 ) -> None:
@@ -128,6 +139,7 @@ async def test_set_default_min_games_out_of_range_raises_value_error(
 async def test_setters_return_none_for_unknown_guild(app_conn: asyncpg.Connection) -> None:
     assert await guilds.set_announce_channel(app_conn, UNKNOWN_GUILD_ID, 1) is None
     assert await guilds.set_admin_role(app_conn, UNKNOWN_GUILD_ID, 1) is None
+    assert await guilds.set_player_role(app_conn, UNKNOWN_GUILD_ID, 1) is None
     assert await guilds.set_default_min_games(app_conn, UNKNOWN_GUILD_ID, 3) is None
 
 

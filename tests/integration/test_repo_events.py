@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 import pytest
 
-from catan_bot.db.repositories import events
+from catan_bot.db.repositories import events, guilds
 
 pytestmark = [
     pytest.mark.integration,
@@ -277,6 +277,28 @@ async def test_rsvp_user_ids_filters_by_multiple_responses(
     assert set(ids) == {1, 2}
 
 
+async def test_rsvp_roster_groups_ids_in_stable_order_and_exposes_counts(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    event = await events.create_event(
+        app_conn, guild_id, "Title", None, None, NOW + timedelta(hours=1), 1, None, []
+    )
+    await events.upsert_rsvp(app_conn, guild_id, event.event_id, 9, "maybe")
+    await events.upsert_rsvp(app_conn, guild_id, event.event_id, 4, "going")
+    await events.upsert_rsvp(app_conn, guild_id, event.event_id, 7, "not_going")
+    await events.upsert_rsvp(app_conn, guild_id, event.event_id, 2, "going")
+
+    roster = await events.rsvp_roster(app_conn, guild_id, event.event_id)
+
+    assert roster.going == (2, 4)
+    assert roster.maybe == (9,)
+    assert roster.not_going == (7,)
+    assert (roster.going_count, roster.maybe_count, roster.not_going_count) == (2, 1, 1)
+    assert roster.counts.going == 2
+    assert roster.counts.maybe == 1
+    assert roster.counts.not_going == 1
+
+
 # ---------------------------------------------------------------------------
 # Scheduler queries.
 # ---------------------------------------------------------------------------
@@ -331,6 +353,28 @@ async def test_claim_due_reminders_claims_each_reminder_once_and_skips_cancelled
     # Claiming again at the same "now" must not re-claim it (sent_at is set).
     claimed_again = await events.claim_due_reminders(app_conn, NOW)
     assert due_event.event_id not in {c.event_id for c in claimed_again}
+
+
+async def test_claim_due_reminders_propagates_configured_player_role(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await guilds.set_player_role(app_conn, guild_id, 765_432)
+    event = await events.create_event(
+        app_conn,
+        guild_id,
+        "Due event",
+        None,
+        None,
+        NOW + timedelta(hours=2),
+        1,
+        555,
+        [(60, NOW - timedelta(minutes=1))],
+    )
+
+    claimed = await events.claim_due_reminders(app_conn, NOW)
+
+    reminder = next(item for item in claimed if item.event_id == event.event_id)
+    assert reminder.player_role_id == 765_432
 
 
 async def test_complete_past_events_marks_only_stale_scheduled_events(

@@ -16,7 +16,7 @@ from datetime import datetime
 
 import asyncpg
 
-from catan_bot.db.models import ClaimedReminder, Event, RsvpCounts, TransitionResult
+from catan_bot.db.models import ClaimedReminder, Event, RsvpCounts, RsvpRoster, TransitionResult
 from catan_bot.db.repositories._params import (
     require_aware,
     require_id,
@@ -103,6 +103,14 @@ JOIN events e ON e.event_id = r.event_id
 WHERE r.event_id = $1 AND e.guild_id = $2 AND r.response = ANY($3::text[])
 """
 
+_SELECT_RSVP_ROSTER_SQL = """
+SELECT r.response, r.user_id
+FROM event_rsvps r
+JOIN events e ON e.event_id = r.event_id
+WHERE r.event_id = $1 AND e.guild_id = $2
+ORDER BY r.response, r.user_id
+"""
+
 # System-wide (no guild_id): the scheduler must claim every guild's due
 # reminders in one pass. The UPDATE ... RETURNING makes each reminder
 # claimed at-most-once, even across two concurrent scheduler ticks.
@@ -110,13 +118,15 @@ _CLAIM_DUE_REMINDERS_SQL = """
 UPDATE event_reminders r
 SET sent_at = $1
 FROM events e
+LEFT JOIN guild_config gc ON gc.guild_id = e.guild_id
 WHERE r.event_id = e.event_id
       AND e.status = 'scheduled'
       AND r.sent_at IS NULL
       AND r.remind_at <= $1
 RETURNING e.guild_id AS guild_id, e.channel_id AS channel_id, e.title AS title,
           e.starts_at AS starts_at, r.offset_minutes AS offset_minutes,
-          r.remind_at AS remind_at, r.event_id AS event_id
+          r.remind_at AS remind_at, r.event_id AS event_id,
+          gc.player_role_id AS player_role_id
 """
 
 # System-wide (no guild_id): every guild's stale scheduled events are swept
@@ -288,6 +298,23 @@ async def rsvp_user_ids(
     return [row["user_id"] for row in rows]
 
 
+async def rsvp_roster(conn: asyncpg.Connection, guild_id: int, event_id: int) -> RsvpRoster:
+    """Return every RSVP grouped by response, scoped to ``guild_id``."""
+    require_id(guild_id, name="guild_id")
+    require_id(event_id, name="event_id")
+    rows = await conn.fetch(_SELECT_RSVP_ROSTER_SQL, event_id, guild_id)
+    grouped: dict[str, list[int]] = {"going": [], "maybe": [], "not_going": []}
+    for row in rows:
+        response = row["response"]
+        if response in grouped:
+            grouped[response].append(row["user_id"])
+    return RsvpRoster(
+        going=tuple(grouped["going"]),
+        maybe=tuple(grouped["maybe"]),
+        not_going=tuple(grouped["not_going"]),
+    )
+
+
 async def claim_due_reminders(conn: asyncpg.Connection, now: datetime) -> list[ClaimedReminder]:
     """Claim (at-most-once) every reminder due across all guilds, skipping cancelled events.
 
@@ -306,6 +333,7 @@ async def claim_due_reminders(conn: asyncpg.Connection, now: datetime) -> list[C
             starts_at=row["starts_at"],
             offset_minutes=row["offset_minutes"],
             remind_at=row["remind_at"],
+            player_role_id=row["player_role_id"],
         )
         for row in rows
     ]

@@ -14,6 +14,7 @@ import pytest
 
 from catan_bot import formatting
 from catan_bot.cogs import event_cog
+from catan_bot.domain.errors import DomainValidationError
 from catan_bot.services import config_service, event_service
 from catan_bot.services.context import Actor
 from catan_bot.services.errors import PermissionDeniedError
@@ -32,6 +33,18 @@ class InteractionStub:
         self.guild_id = guild_id
         self.channel_id = 700
         self.user = SimpleNamespace(id=user_id)
+        permissions = SimpleNamespace(
+            view_channel=True,
+            send_messages=True,
+            send_messages_in_threads=True,
+            embed_links=True,
+        )
+        self.guild = SimpleNamespace(id=guild_id, me=SimpleNamespace(id=999))
+        self.channel = SimpleNamespace(
+            id=self.channel_id,
+            guild=self.guild,
+            permissions_for=lambda _member: permissions,
+        )
         self.client = SimpleNamespace(pool=pool)
         self.response = SimpleNamespace(defer=AsyncMock())
         self.edit_original_response = AsyncMock(
@@ -83,16 +96,19 @@ async def test_create_defers_before_service_and_records_returned_message(
     cog = event_cog.EventCog(SimpleNamespace(pool=pool))
     actor = _actor(456)
     event = SimpleNamespace(event_id=42)
+    created = SimpleNamespace(event=event, player_role_id=None)
     create_event = AsyncMock()
 
     async def create(*args: object, **kwargs: object) -> object:
         interaction.response.defer.assert_awaited_once_with(thinking=True)
-        return event
+        return created
 
     create_event.side_effect = create
     record = AsyncMock()
     monkeypatch.setattr(event_cog, "actor_from_interaction", lambda _: actor)
-    monkeypatch.setattr(event_cog.event_service, "create_event", create_event)
+    monkeypatch.setattr(
+        event_cog.event_service, "create_event_with_notification_role", create_event
+    )
     monkeypatch.setattr(event_cog.event_service, "record_event_message", record, raising=False)
     monkeypatch.setattr(event_cog.formatting, "build_event_embed", lambda _: discord.Embed())
     command = event_cog.EventCog.event_group.get_command("create")
@@ -106,6 +122,192 @@ async def test_create_defers_before_service_and_records_returned_message(
     edited = interaction.edit_original_response.await_args
     assert edited.kwargs["view"].timeout is None
     assert edited.kwargs["allowed_mentions"].everyone is False
+
+
+@pytest.mark.asyncio
+async def test_create_to_selected_channel_pings_only_snapshot_role_and_confirms_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = InteractionStub(123, 456)
+    pool = object()
+    cog = event_cog.EventCog(SimpleNamespace(pool=pool))
+    actor = _actor(456)
+    event = SimpleNamespace(event_id=42)
+    create = AsyncMock(return_value=SimpleNamespace(event=event, player_role_id=44))
+    target = SimpleNamespace(
+        id=701,
+        guild=interaction.guild,
+        permissions_for=interaction.channel.permissions_for,
+        send=AsyncMock(
+            return_value=SimpleNamespace(
+                channel=SimpleNamespace(id=701), id=801, jump_url="https://discord.test/jump"
+            )
+        ),
+    )
+    record = AsyncMock()
+    monkeypatch.setattr(event_cog, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(event_cog.event_service, "create_event_with_notification_role", create)
+    monkeypatch.setattr(event_cog.event_service, "record_event_message", record)
+    monkeypatch.setattr(event_cog.formatting, "build_event_embed", lambda _: discord.Embed())
+    command = event_cog.EventCog.event_group.get_command("create")
+    assert command is not None
+
+    await command.callback(cog, interaction, "Game Night", "19:00", None, None, None, target)
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+    assert create.await_args.kwargs["channel_id"] == 701
+    posted = target.send.await_args
+    assert posted.kwargs["content"] == "<@&44>"
+    allowed = posted.kwargs["allowed_mentions"]
+    assert allowed.everyone is False and allowed.users is False
+    assert [role.id for role in allowed.roles] == [44]
+    record.assert_awaited_once_with(pool, 123, 42, 701, 801)
+    confirmation = interaction.edit_original_response.await_args.kwargs["content"]
+    assert "<#701>" in confirmation and "https://discord.test/jump" in confirmation
+
+
+@pytest.mark.asyncio
+async def test_selected_channel_records_message_before_acknowledgement_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = InteractionStub(123, 456)
+    pool = object()
+    cog = event_cog.EventCog(SimpleNamespace(pool=pool))
+    event = SimpleNamespace(event_id=42)
+    target = SimpleNamespace(
+        id=701,
+        guild=interaction.guild,
+        permissions_for=interaction.channel.permissions_for,
+        send=AsyncMock(
+            return_value=SimpleNamespace(
+                channel=SimpleNamespace(id=701), id=801, jump_url="https://discord.test/jump"
+            )
+        ),
+    )
+    order: list[str] = []
+    record = AsyncMock(side_effect=lambda *_args: order.append("record"))
+
+    async def fail_ack(**_kwargs: object) -> None:
+        order.append("ack")
+        raise RuntimeError("ack failed")
+
+    interaction.edit_original_response.side_effect = fail_ack
+    monkeypatch.setattr(event_cog, "actor_from_interaction", lambda _: _actor(456))
+    monkeypatch.setattr(
+        event_cog.event_service,
+        "create_event_with_notification_role",
+        AsyncMock(return_value=SimpleNamespace(event=event, player_role_id=None)),
+    )
+    monkeypatch.setattr(event_cog.event_service, "record_event_message", record)
+    monkeypatch.setattr(event_cog.formatting, "build_event_embed", lambda _: discord.Embed())
+    command = event_cog.EventCog.event_group.get_command("create")
+    assert command is not None
+
+    with pytest.raises(RuntimeError, match="ack failed"):
+        await command.callback(cog, interaction, "Game Night", "19:00", None, None, None, target)
+
+    assert order == ["record", "ack"]
+    record.assert_awaited_once_with(pool, 123, 42, 701, 801)
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_unusable_target_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = InteractionStub(123, 456)
+    interaction.channel.permissions_for = lambda _member: SimpleNamespace(
+        view_channel=True,
+        send_messages=False,
+        send_messages_in_threads=False,
+        embed_links=True,
+    )
+    cog = event_cog.EventCog(SimpleNamespace(pool=object()))
+    create = AsyncMock()
+    monkeypatch.setattr(event_cog, "actor_from_interaction", lambda _: _actor(456))
+    monkeypatch.setattr(event_cog.event_service, "create_event_with_notification_role", create)
+    command = event_cog.EventCog.event_group.get_command("create")
+    assert command is not None
+
+    with pytest.raises(DomainValidationError, match="Send Messages"):
+        await command.callback(cog, interaction, "Game Night", "19:00", None, None, None)
+
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_missing_configured_notification_role_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = InteractionStub(123, 456)
+    interaction.guild.get_role = lambda _role_id: None
+    cog = event_cog.EventCog(SimpleNamespace(pool=object()))
+    create = AsyncMock()
+    monkeypatch.setattr(event_cog, "actor_from_interaction", lambda _: _actor(456))
+    monkeypatch.setattr(
+        event_cog.config_service,
+        "get_config",
+        AsyncMock(return_value=SimpleNamespace(player_role_id=44)),
+    )
+    monkeypatch.setattr(event_cog.event_service, "create_event_with_notification_role", create)
+    command = event_cog.EventCog.event_group.get_command("create")
+    assert command is not None
+
+    with pytest.raises(DomainValidationError, match="no longer exists"):
+        await command.callback(cog, interaction, "Game Night", "19:00", None, None, None)
+
+    interaction.response.defer.assert_awaited_once_with(thinking=True)
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_role_race_publishes_unpinged_and_records_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = InteractionStub(123, 456)
+    role = SimpleNamespace(id=44, mentionable=True, is_default=lambda: False)
+    role_lookups = 0
+
+    def get_role(_role_id: int) -> object | None:
+        nonlocal role_lookups
+        role_lookups += 1
+        return role if role_lookups == 1 else None
+
+    interaction.guild.get_role = get_role
+    pool = object()
+    cog = event_cog.EventCog(SimpleNamespace(pool=pool))
+    event = SimpleNamespace(event_id=42)
+    target = SimpleNamespace(
+        id=701,
+        guild=interaction.guild,
+        permissions_for=interaction.channel.permissions_for,
+        send=AsyncMock(
+            return_value=SimpleNamespace(
+                channel=SimpleNamespace(id=701), id=801, jump_url="https://discord.test/jump"
+            )
+        ),
+    )
+    record = AsyncMock()
+    monkeypatch.setattr(event_cog, "actor_from_interaction", lambda _: _actor(456))
+    monkeypatch.setattr(
+        event_cog.config_service,
+        "get_config",
+        AsyncMock(return_value=SimpleNamespace(player_role_id=44)),
+    )
+    monkeypatch.setattr(
+        event_cog.event_service,
+        "create_event_with_notification_role",
+        AsyncMock(return_value=SimpleNamespace(event=event, player_role_id=44)),
+    )
+    monkeypatch.setattr(event_cog.event_service, "record_event_message", record)
+    monkeypatch.setattr(event_cog.formatting, "build_event_embed", lambda _: discord.Embed())
+    command = event_cog.EventCog.event_group.get_command("create")
+    assert command is not None
+
+    await command.callback(cog, interaction, "Game Night", "19:00", None, None, None, target)
+
+    assert target.send.await_args.kwargs["content"] is None
+    assert "ping was skipped" in interaction.edit_original_response.await_args.kwargs["content"]
+    record.assert_awaited_once_with(pool, 123, 42, 701, 801)
 
 
 @pytest.mark.asyncio
@@ -163,16 +365,18 @@ async def test_event_command_rsvp_cancel_and_guild_isolation_flow(
     going_click = InteractionStub(guild_id, attendee.user_id, pool=pool)
     await event_rsvp.EventRsvpButton(event_id, "going").callback(going_click)
     going_counts = next(
-        field.value for field in _embed_from(going_click).fields if field.name == "RSVPs"
+        field.value for field in _embed_from(going_click).fields if field.name == "Going (1)"
     )
-    assert going_counts == "Going: 1 | Maybe: 0 | Not going: 0"
+    assert going_counts == "<@20>"
 
     no_click = InteractionStub(guild_id, attendee.user_id, pool=pool)
     await event_rsvp.EventRsvpButton(event_id, "no").callback(no_click)
     changed_counts = next(
-        field.value for field in _embed_from(no_click).fields if field.name == "RSVPs"
+        field.value
+        for field in _embed_from(no_click).fields
+        if field.name == "Not Going (1)"
     )
-    assert changed_counts == "Going: 0 | Maybe: 0 | Not going: 1"
+    assert changed_counts == "<@20>"
 
     other_interaction = InteractionStub(other_guild_id, 99, pool=pool)
     listing = event_cog.EventCog.event_group.get_command("list")

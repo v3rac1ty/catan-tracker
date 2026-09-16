@@ -33,6 +33,15 @@ _AUTOCOMPLETE_LIMIT = 25
 _TIMEZONE_HINT = "That isn't a recognized timezone name. Pick one from the list."
 
 
+def validate_player_role(role: discord.Role, guild_id: int) -> int:
+    """Reject broad or cross-guild roles before persisting a notification target."""
+    if role.guild.id != guild_id:
+        raise DomainValidationError("Choose a role from this server.")
+    if role.is_default() or role.id == guild_id:
+        raise DomainValidationError("The @everyone role cannot be used for event notifications.")
+    return role.id
+
+
 def is_canonical_timezone_name(name: str) -> bool:
     """Whether `name` is a real, human-facing IANA zone name.
 
@@ -145,6 +154,23 @@ class ConfigCog(commands.Cog):
         config = await config_service.set_admin_role(
             self.bot.pool, guild_id, actor, role.id if role is not None else None
         )
+        embed = formatting.build_config_show_embed(config)
+        await interaction.edit_original_response(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    @config_group.command(
+        name="player-role", description="Set (or clear) the event notification role."
+    )
+    @app_commands.describe(role="Role to ping for event announcements. Omit to disable pings.")
+    async def player_role_command(
+        self, interaction: discord.Interaction, role: discord.Role | None = None
+    ) -> None:
+        actor = actor_from_interaction(interaction)
+        guild_id = guild_id_from_interaction(interaction)
+        role_id = validate_player_role(role, guild_id) if role is not None else None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        config = await config_service.set_player_role(self.bot.pool, guild_id, actor, role_id)
         embed = formatting.build_config_show_embed(config)
         await interaction.edit_original_response(
             embed=embed, allowed_mentions=discord.AllowedMentions.none()

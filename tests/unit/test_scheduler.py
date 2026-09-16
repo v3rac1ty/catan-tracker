@@ -13,7 +13,7 @@ import discord
 import pytest
 
 from catan_bot.db.models import Event, GuildConfig, Season, SeasonResultRow
-from catan_bot.scheduler import CatanScheduler, _mention_batches
+from catan_bot.scheduler import CatanScheduler, _deliverable_role_id, _mention_batches
 from catan_bot.services.results import Announcement, ReminderToSend
 
 NOW = datetime(2026, 1, 2, 12, tzinfo=UTC)
@@ -68,7 +68,9 @@ def _announcement(season_id: int, guild_id: int) -> Announcement:
     )
 
 
-def _config(guild_id: int, channel_id: int | None) -> GuildConfig:
+def _config(
+    guild_id: int, channel_id: int | None, *, player_role_id: int | None = None
+) -> GuildConfig:
     return GuildConfig(
         guild_id=guild_id,
         timezone="UTC",
@@ -77,6 +79,7 @@ def _config(guild_id: int, channel_id: int | None) -> GuildConfig:
         default_min_games=2,
         created_at=NOW,
         updated_at=NOW,
+        player_role_id=player_role_id,
     )
 
 
@@ -102,6 +105,24 @@ def _scheduler(channels: dict[tuple[int, int], object] | None = None) -> CatanSc
         pool=pool,
     )
     return CatanScheduler(bot)  # type: ignore[arg-type]
+
+
+def test_deleted_or_unmentionable_role_is_silenced_without_fallback_mentions(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    guild = SimpleNamespace(
+        id=1,
+        me=object(),
+        get_role=lambda _role_id: None,
+    )
+    channel = SimpleNamespace(
+        permissions_for=lambda _member: discord.Permissions(mention_everyone=False)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="catan_bot.scheduler"):
+        assert _deliverable_role_id(guild, channel, 987) is None
+
+    assert "unavailable" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -339,7 +360,7 @@ async def test_reminder_cancelled_while_channel_is_fetched_is_not_sent(
 
 
 @pytest.mark.asyncio
-async def test_reminder_batches_content_and_user_allowlist(
+async def test_reminder_mentions_configured_role_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     channel = _channel(1)
@@ -348,7 +369,7 @@ async def test_reminder_batches_content_and_user_allowlist(
     reminder = ReminderToSend(
         event=_event(4),
         offset_minutes=60,
-        user_ids=tuple(range(1, 151)),
+        player_role_id=987,
     )
     monkeypatch.setattr(
         "catan_bot.scheduler.event_service.get_event", AsyncMock(return_value=latest)
@@ -359,18 +380,37 @@ async def test_reminder_batches_content_and_user_allowlist(
 
     await scheduler._send_reminder(reminder)
 
-    assert render.call_count == 2
+    assert render.call_count == 1
     render.assert_called_with(latest, 60)
-    assert channel.send.await_count == 2
-    mentioned_ids: list[int] = []
-    for call in channel.send.await_args_list:
-        content = call.kwargs["content"]
-        allowed = call.kwargs["allowed_mentions"].to_dict()
-        assert len(content) <= 2000
-        assert allowed["parse"] == []
-        assert len(allowed["users"]) <= 100
-        mentioned_ids.extend(allowed["users"])
-    assert mentioned_ids == list(range(1, 151))
+    assert channel.send.await_count == 1
+    call = channel.send.await_args
+    assert call.kwargs["content"] == "<@&987>"
+    assert call.kwargs["allowed_mentions"].to_dict() == {
+        "roles": [987],
+        "parse": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_reminder_without_role_has_no_content_or_allowed_mentions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = _channel(1)
+    scheduler = _scheduler({(1, 101): channel})
+    reminder = ReminderToSend(event=_event(4), offset_minutes=60, player_role_id=None)
+    monkeypatch.setattr(
+        "catan_bot.scheduler.event_service.get_event", AsyncMock(return_value=_event(4))
+    )
+    monkeypatch.setattr(
+        "catan_bot.scheduler.formatting.build_event_reminder_embed",
+        Mock(return_value=discord.Embed(title="Reminder")),
+    )
+
+    await scheduler._send_reminder(reminder)
+
+    call = channel.send.await_args
+    assert "content" not in call.kwargs
+    assert call.kwargs["allowed_mentions"].to_dict() == {"parse": []}
 
 
 def test_mention_batches_filter_invalid_duplicate_ids_and_bound_worst_case() -> None:

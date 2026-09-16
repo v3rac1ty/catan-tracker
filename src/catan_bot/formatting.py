@@ -30,7 +30,15 @@ from fractions import Fraction
 
 import discord
 
-from catan_bot.db.models import Event, Game, GameWithParticipants, GuildConfig, RsvpCounts, Season
+from catan_bot.db.models import (
+    Event,
+    Game,
+    GameWithParticipants,
+    GuildConfig,
+    RsvpCounts,
+    RsvpRoster,
+    Season,
+)
 from catan_bot.domain.ranking import RankedPlayer
 from catan_bot.services.results import (
     Announcement,
@@ -556,7 +564,29 @@ _EVENT_STATUS_LABELS = {
 }
 
 
-def build_event_embed(event: Event, counts: RsvpCounts | None = None) -> discord.Embed:
+_RSVP_MEMBER_DISPLAY_LIMIT = 20
+
+
+def _rsvp_group_value(member_ids: Sequence[int], *, empty: str = "No responses yet.") -> str:
+    """Render a bounded, mention-safe RSVP field value.
+
+    The caller must disable user mentions when delivering the embed.  The
+    field name holds the exact total; the trailing text says how many IDs did
+    not fit rather than silently dropping attendees.
+    """
+    if not member_ids:
+        return empty
+    visible = list(member_ids[:_RSVP_MEMBER_DISPLAY_LIMIT])
+    rendered = ", ".join(mention(member_id) for member_id in visible)
+    remainder = len(member_ids) - len(visible)
+    if remainder:
+        rendered += f"\n…and {remainder} more"
+    return truncate(rendered, EMBED_FIELD_VALUE_MAX)
+
+
+def build_event_embed(
+    event: Event, roster: RsvpRoster | RsvpCounts | None = None
+) -> discord.Embed:
     title = truncate(f"Event: {escape_user_text(event.title)}", EMBED_TITLE_MAX)
     colors = {
         "scheduled": discord.Color.blurple(),
@@ -578,14 +608,32 @@ def build_event_embed(event: Event, counts: RsvpCounts | None = None) -> discord
     if event.location:
         _add_field(embed, "Location", escape_user_text(event.location), inline=False)
     embed.add_field(name="Created by", value=mention(event.created_by), inline=True)
-    if counts is not None:
-        embed.add_field(
-            name="RSVPs",
-            value=(
-                f"Going: {counts.going} | Maybe: {counts.maybe} | Not going: {counts.not_going}"
-            ),
-            inline=False,
-        )
+    if isinstance(roster, RsvpCounts):
+        # Compatibility for callers that only have aggregate counts.  New
+        # command paths always pass a roster so names can be displayed.
+        counts = roster
+        roster = RsvpRoster(going=(), maybe=(), not_going=())
+    else:
+        roster = roster or RsvpRoster(going=(), maybe=(), not_going=())
+        counts = roster.counts
+    _add_field(
+        embed,
+        f"Going ({counts.going})",
+        _rsvp_group_value(roster.going),
+        inline=False,
+    )
+    _add_field(
+        embed,
+        f"Maybe ({counts.maybe})",
+        _rsvp_group_value(roster.maybe),
+        inline=False,
+    )
+    _add_field(
+        embed,
+        f"Not Going ({counts.not_going})",
+        _rsvp_group_value(roster.not_going),
+        inline=False,
+    )
     embed.set_footer(text=f"Event #{event.event_id}")
     return embed
 
@@ -644,6 +692,8 @@ def build_config_show_embed(config: GuildConfig) -> discord.Embed:
     )
     role_value = role_mention(config.admin_role_id) if config.admin_role_id else "Not set"
     embed.add_field(name="Admin role", value=role_value, inline=True)
+    player_role_value = role_mention(config.player_role_id) if config.player_role_id else "Not set"
+    embed.add_field(name="Event player role", value=player_role_value, inline=True)
     embed.add_field(name="Default minimum games", value=str(config.default_min_games), inline=True)
     return embed
 

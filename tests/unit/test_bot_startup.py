@@ -51,6 +51,7 @@ async def test_all_commands_register_in_an_offline_tree() -> None:
             "channel",
             "timezone",
             "admin-role",
+            "player-role",
             "show",
         }
         assert {command.name for command in top_level["season"].commands} == {

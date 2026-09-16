@@ -58,3 +58,20 @@ async def set_admin_role(
     if updated is None:  # pragma: no cover -- ensure_guild above guarantees the row exists.
         raise RuntimeError(f"guild_config row for guild {guild_id} vanished during set_admin_role")
     return updated
+
+
+async def set_player_role(
+    pool: asyncpg.Pool, guild_id: int, actor: Actor, role_id: int | None
+) -> GuildConfig:
+    """Configure (or clear) the role mentioned for event notifications.
+
+    Like the other ``/config`` mutators, this is deliberately restricted to
+    Manage Server rather than the configured admin role.
+    """
+    require_manage_guild(actor)
+    async with pool.acquire() as conn, conn.transaction():
+        await guilds.ensure_guild(conn, guild_id)
+        updated = await guilds.set_player_role(conn, guild_id, role_id)
+    if updated is None:  # pragma: no cover -- ensure_guild above guarantees the row exists.
+        raise RuntimeError(f"guild_config row for guild {guild_id} vanished during set_player_role")
+    return updated

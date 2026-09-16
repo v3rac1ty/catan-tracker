@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 
-from catan_bot.db.models import Event, RsvpCounts, Season, SeasonResultRow
+from catan_bot.db.models import Event, RsvpRoster, Season, SeasonResultRow
 from catan_bot.formatting import (
     EMBED_FIELD_NAME_MAX,
     EMBED_FIELD_VALUE_MAX,
@@ -62,7 +62,9 @@ def _season(name: str = "Fall League") -> Season:
 def test_event_embed_escapes_text_and_uses_native_timestamps() -> None:
     payload = "@everyone **Game** <#12345678901234567>"
     event = _event(title=payload, location=payload, description=payload)
-    embed = build_event_embed(event, RsvpCounts(going=2, maybe=1, not_going=3))
+    embed = build_event_embed(
+        event, RsvpRoster(going=(1, 2), maybe=(3,), not_going=(4, 5, 6))
+    )
 
     expected = escape_user_text(payload)
     assert expected in (embed.title or "")
@@ -71,9 +73,25 @@ def test_event_embed_escapes_text_and_uses_native_timestamps() -> None:
     when = next(field.value for field in embed.fields if field.name == "When")
     assert f"<t:{int(NOW.timestamp())}:F>" in when
     assert f"<t:{int(NOW.timestamp())}:R>" in when
-    rsvps = next(field.value for field in embed.fields if field.name == "RSVPs")
-    assert rsvps == "Going: 2 | Maybe: 1 | Not going: 3"
+    going = next(field.value for field in embed.fields if field.name == "Going (2)")
+    maybe = next(field.value for field in embed.fields if field.name == "Maybe (1)")
+    no = next(field.value for field in embed.fields if field.name == "Not Going (3)")
+    assert going == "<@1>, <@2>"
+    assert maybe == "<@3>"
+    assert no == "<@4>, <@5>, <@6>"
     assert len(embed) <= EMBED_TOTAL_MAX
+
+
+def test_event_embed_bounds_roster_mentions_and_reports_omitted_members() -> None:
+    member_ids = tuple(range(1, 31))
+    embed = build_event_embed(_event(), RsvpRoster(member_ids, (), ()))
+
+    going = next(field for field in embed.fields if field.name == "Going (30)")
+    assert "<@1>" in going.value
+    assert "<@20>" in going.value
+    assert "<@21>" not in going.value
+    assert "and 10 more" in going.value
+    assert len(going.value) <= EMBED_FIELD_VALUE_MAX
 
 
 def test_event_list_limits_rows_and_embed_sizes() -> None:

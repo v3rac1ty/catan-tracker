@@ -164,6 +164,17 @@ async def test_guild_config_default_min_games_defaults_to_two(
     assert value == 2
 
 
+async def test_guild_config_player_role_defaults_to_null(
+    app_conn: asyncpg.Connection,
+) -> None:
+    await _insert_guild(app_conn)
+
+    value = await app_conn.fetchval(
+        "SELECT player_role_id FROM guild_config WHERE guild_id = $1", GUILD_ID
+    )
+    assert value is None
+
+
 async def test_seasons_min_games_defaults_to_two(app_conn: asyncpg.Connection) -> None:
     await _insert_guild(app_conn)
 

@@ -63,7 +63,7 @@ class EventRsvpButton(discord.ui.DynamicItem[discord.ui.Button], template=_CUSTO
                 raise ValueError("RSVP button has an invalid event id")
             pool = interaction.client.pool  # type: ignore[attr-defined]
             await interaction.response.defer()
-            counts = await event_service.rsvp(
+            await event_service.rsvp(
                 pool,
                 guild_id,
                 self.event_id,
@@ -74,8 +74,9 @@ class EventRsvpButton(discord.ui.DynamicItem[discord.ui.Button], template=_CUSTO
             if event is None:
                 raise RuntimeError("event vanished after a successful RSVP")
             view = build_event_rsvp_view(self.event_id) if event.status == "scheduled" else None
+            roster = await event_service.rsvp_roster(pool, guild_id, self.event_id)
             await interaction.edit_original_response(
-                embed=formatting.build_event_embed(event, counts),
+                embed=formatting.build_event_embed(event, roster),
                 view=view,
                 allowed_mentions=discord.AllowedMentions.none(),
             )

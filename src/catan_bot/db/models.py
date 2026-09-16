@@ -47,6 +47,9 @@ class GuildConfig:
     default_min_games: int
     created_at: datetime
     updated_at: datetime
+    # Optional role to mention for scheduled-event notifications.  Kept
+    # nullable so existing guilds remain silent until explicitly configured.
+    player_role_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +136,36 @@ class RsvpCounts:
 
 
 @dataclass(frozen=True, slots=True)
+class RsvpRoster:
+    """The complete, guild-scoped RSVP roster for an event.
+
+    IDs are grouped by response and are kept in repository order.  The count
+    properties make this safe to pass to callers that only need exact totals,
+    while retaining the IDs needed to render a useful event breakdown.
+    """
+
+    going: tuple[int, ...]
+    maybe: tuple[int, ...]
+    not_going: tuple[int, ...]
+
+    @property
+    def going_count(self) -> int:
+        return len(self.going)
+
+    @property
+    def maybe_count(self) -> int:
+        return len(self.maybe)
+
+    @property
+    def not_going_count(self) -> int:
+        return len(self.not_going)
+
+    @property
+    def counts(self) -> RsvpCounts:
+        return RsvpCounts(self.going_count, self.maybe_count, self.not_going_count)
+
+
+@dataclass(frozen=True, slots=True)
 class ClaimedReminder:
     """One reminder claimed by `events.claim_due_reminders`.
 
@@ -147,3 +180,4 @@ class ClaimedReminder:
     starts_at: datetime
     offset_minutes: int
     remind_at: datetime
+    player_role_id: int | None = None

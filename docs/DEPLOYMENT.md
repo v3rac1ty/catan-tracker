@@ -212,9 +212,22 @@ definitions. Avoid syncing on every restart because it makes unnecessary
 Discord API calls.
 
 In Discord, use `/config channel` to select the season-announcement channel,
-then set the server timezone and optional admin role. Event reminders go to the
-channel where `/event create` was run. Use `/config show` to review the saved
-configuration.
+then set the server timezone and optional admin role. To enable event
+notifications, use `/config player-role` with a role that exists in this
+server. The role should be mentionable. If it is intentionally not
+mentionable, grant the bot `Mention @everyone, @here, and All Roles` in every
+channel where events may be posted; Discord permits the bot to mention that
+role only with that channel permission. The bot also needs View Channel, Send
+Messages (or Send Messages in Threads for a thread), and Embed Links in the
+destination. If the role is deleted, becomes unmentionable, or the permission
+is removed, the scheduler logs the condition and delivers an unpinged
+reminder. Clear the setting with `/config player-role` without a role to keep
+notifications silent.
+
+Event reminders go to the channel where `/event create` was run. Both
+`/event create` and `/leaderboard` accept an optional destination channel and
+show an ephemeral confirmation when one is supplied. Use `/config show` to
+review the saved configuration.
 
 ## 6. Health checks and logs
 

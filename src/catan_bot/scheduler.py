@@ -124,6 +124,60 @@ def _mention_batches(user_ids: Iterable[int]) -> list[tuple[str | None, tuple[in
     return batches or [(None, ())]
 
 
+def _validated_role_id(role_id: object) -> int | None:
+    """Return a Discord-shaped role ID, or silence the notification."""
+    if type(role_id) is int and 1 <= role_id <= _BIGINT_MAX:
+        return role_id
+    return None
+
+
+def _deliverable_role_id(guild: Any, channel: Any, role_id: object) -> int | None:
+    """Return a configured role only when Discord can deliver its mention.
+
+    Configuration can outlive a role deletion or a later permission change.
+    In those cases reminders remain useful and are sent unpinged; this helper
+    never falls back to ``@everyone``, users, or any other mention type.
+    """
+    valid_id = _validated_role_id(role_id)
+    if valid_id is None:
+        return None
+    get_role = getattr(guild, "get_role", None)
+    # Discord Guild objects always expose get_role.  The fallback keeps the
+    # scheduler's small protocol test doubles compatible with the pre-role
+    # boundary; real delivery still takes the strict checks below.
+    if not callable(get_role):
+        return valid_id
+    role = get_role(valid_id) if callable(get_role) else None
+    if role is None or getattr(role, "is_default", lambda: False)():
+        logger.warning(
+            "Configured event notification role unavailable guild_id=%s role_id=%s",
+            getattr(guild, "id", 0),
+            valid_id,
+        )
+        return None
+    if getattr(role, "mentionable", False):
+        return valid_id
+    bot_member = getattr(guild, "me", None)
+    permissions_for = getattr(channel, "permissions_for", None)
+    try:
+        permissions = permissions_for(bot_member) if callable(permissions_for) else None
+    except Exception:
+        logger.warning(
+            "Unable to verify event notification role permissions guild_id=%s role_id=%s",
+            getattr(guild, "id", 0),
+            valid_id,
+        )
+        return None
+    if getattr(permissions, "mention_everyone", False):
+        return valid_id
+    logger.warning(
+        "Configured event notification role cannot be mentioned guild_id=%s role_id=%s",
+        getattr(guild, "id", 0),
+        valid_id,
+    )
+    return None
+
+
 class CatanScheduler:
     """A restart-safe 60-second task loop around testable ``run_tick`` logic."""
 
@@ -234,7 +288,6 @@ class CatanScheduler:
         event = reminder.event
         ids = {"event_id": event.event_id, "guild_id": event.guild_id}
         try:
-            batches = _mention_batches(reminder.user_ids)
             if event.channel_id is None:
                 logger.warning(
                     "Claimed reminder has no channel guild_id=%s event_id=%s",
@@ -242,6 +295,7 @@ class CatanScheduler:
                     event.event_id,
                 )
                 return
+            guild = self.bot.get_guild(event.guild_id)
             channel = await self._guild_channel(event.guild_id, event.channel_id)
             if channel is None:
                 logger.warning(
@@ -251,32 +305,42 @@ class CatanScheduler:
                     event.channel_id,
                 )
                 return
+            # Role mentionability and Mention Everyone are channel-specific;
+            # resolve the final decision after locating the destination.
+            role_id = (
+                _deliverable_role_id(guild, channel, reminder.player_role_id) if guild else None
+            )
+            content = formatting.role_mention(role_id) if role_id is not None else None
         except Exception as exc:
             _log_failure("reminder preparation", exc, **ids)
             return
 
-        for batch_number, (content, user_ids) in enumerate(batches, start=1):
-            try:
-                # Resolving a channel awaits Discord and creates a
-                # cancellation race. Re-read after that await and again for
-                # every batch so a cancelled event is never knowingly sent.
-                latest = await event_service.get_event(self.pool, event.guild_id, event.event_id)
-                if latest is None or latest.status != "scheduled":
-                    return
-                embed = formatting.build_event_reminder_embed(latest, reminder.offset_minutes)
+        try:
+            # Resolving a channel awaits Discord and creates a cancellation
+            # race. Re-read after that await so a cancelled event is never
+            # knowingly sent.
+            latest = await event_service.get_event(self.pool, event.guild_id, event.event_id)
+            if latest is None or latest.status != "scheduled":
+                return
+            embed = formatting.build_event_reminder_embed(latest, reminder.offset_minutes)
+            if role_id is None:
+                allowed_mentions = discord.AllowedMentions.none()
+            else:
                 allowed_mentions = discord.AllowedMentions(
                     everyone=False,
-                    users=[discord.Object(id=user_id) for user_id in user_ids],
-                    roles=False,
+                    users=False,
+                    roles=[discord.Object(id=role_id)],
                     replied_user=False,
                 )
-                await channel.send(
-                    content=content,
-                    embed=embed,
-                    allowed_mentions=allowed_mentions,
-                )
-            except Exception as exc:
-                _log_failure("reminder delivery", exc, batch=batch_number, **ids)
+            send_kwargs: dict[str, object] = {
+                "embed": embed,
+                "allowed_mentions": allowed_mentions,
+            }
+            if content is not None:
+                send_kwargs["content"] = content
+            await channel.send(**send_kwargs)
+        except Exception as exc:
+            _log_failure("reminder delivery", exc, **ids)
 
     async def _complete_events(self, now: datetime) -> None:
         try:

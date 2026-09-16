@@ -329,6 +329,11 @@ async def test_set_admin_role_validates_role_id_before_conn(conn: _ExplodingConn
         await guilds.set_admin_role(conn, 1, 1.5)
 
 
+async def test_set_player_role_validates_role_id_before_conn(conn: _ExplodingConnection) -> None:
+    with pytest.raises(ValueError, match="role_id"):
+        await guilds.set_player_role(conn, 1, 1.5)
+
+
 async def test_set_default_min_games_validates_guild_id_before_conn(
     conn: _ExplodingConnection,
 ) -> None:

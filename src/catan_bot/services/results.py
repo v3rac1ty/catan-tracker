@@ -61,8 +61,28 @@ class PlayerStatsView:
 
 @dataclass(frozen=True, slots=True)
 class ReminderToSend:
-    """One reminder ready to send: the event, its offset, and who to ping."""
+    """One reminder ready to send and its configured guild role.
+
+    ``user_ids`` remains as a deprecated constructor-compatible field for
+    callers compiled against the pre-role API.  Delivery deliberately ignores
+    it: reminders may only mention the configured player role.
+    """
 
     event: Event
     offset_minutes: int
-    user_ids: tuple[int, ...]
+    player_role_id: int | None = None
+    user_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EventCreation:
+    """An event together with the role snapshot for its announcement.
+
+    The role is read in the same transaction as event creation.  That makes
+    the outbound announcement deterministic if an administrator changes the
+    notification role while a create command is in flight.  Reminder delivery
+    intentionally reads the current role instead.
+    """
+
+    event: Event
+    player_role_id: int | None

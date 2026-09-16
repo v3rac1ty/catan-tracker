@@ -25,7 +25,8 @@ ON CONFLICT (guild_id) DO NOTHING
 """
 
 _SELECT_GUILD_SQL = """
-SELECT guild_id, timezone, announce_channel_id, admin_role_id, default_min_games,
+SELECT guild_id, timezone, announce_channel_id, admin_role_id, player_role_id,
+       default_min_games,
        created_at, updated_at
 FROM guild_config
 WHERE guild_id = $1
@@ -35,32 +36,40 @@ _UPDATE_TIMEZONE_SQL = """
 UPDATE guild_config
 SET timezone = $2, updated_at = now()
 WHERE guild_id = $1
-RETURNING guild_id, timezone, announce_channel_id, admin_role_id, default_min_games,
-          created_at, updated_at
+RETURNING guild_id, timezone, announce_channel_id, admin_role_id, player_role_id,
+          default_min_games, created_at, updated_at
 """
 
 _UPDATE_ANNOUNCE_CHANNEL_SQL = """
 UPDATE guild_config
 SET announce_channel_id = $2, updated_at = now()
 WHERE guild_id = $1
-RETURNING guild_id, timezone, announce_channel_id, admin_role_id, default_min_games,
-          created_at, updated_at
+RETURNING guild_id, timezone, announce_channel_id, admin_role_id, player_role_id,
+          default_min_games, created_at, updated_at
 """
 
 _UPDATE_ADMIN_ROLE_SQL = """
 UPDATE guild_config
 SET admin_role_id = $2, updated_at = now()
 WHERE guild_id = $1
-RETURNING guild_id, timezone, announce_channel_id, admin_role_id, default_min_games,
-          created_at, updated_at
+RETURNING guild_id, timezone, announce_channel_id, admin_role_id, player_role_id,
+          default_min_games, created_at, updated_at
 """
 
 _UPDATE_DEFAULT_MIN_GAMES_SQL = """
 UPDATE guild_config
 SET default_min_games = $2, updated_at = now()
 WHERE guild_id = $1
-RETURNING guild_id, timezone, announce_channel_id, admin_role_id, default_min_games,
-          created_at, updated_at
+RETURNING guild_id, timezone, announce_channel_id, admin_role_id, player_role_id,
+          default_min_games, created_at, updated_at
+"""
+
+_UPDATE_PLAYER_ROLE_SQL = """
+UPDATE guild_config
+SET player_role_id = $2, updated_at = now()
+WHERE guild_id = $1
+RETURNING guild_id, timezone, announce_channel_id, admin_role_id, player_role_id,
+          default_min_games, created_at, updated_at
 """
 
 
@@ -70,6 +79,7 @@ def _row_to_guild_config(row: asyncpg.Record) -> GuildConfig:
         timezone=row["timezone"],
         announce_channel_id=row["announce_channel_id"],
         admin_role_id=row["admin_role_id"],
+        player_role_id=row["player_role_id"],
         default_min_games=row["default_min_games"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -122,6 +132,16 @@ async def set_admin_role(
     require_id(guild_id, name="guild_id")
     require_optional_id(role_id, name="role_id")
     row = await conn.fetchrow(_UPDATE_ADMIN_ROLE_SQL, guild_id, role_id)
+    return _row_to_guild_config(row) if row is not None else None
+
+
+async def set_player_role(
+    conn: asyncpg.Connection, guild_id: int, role_id: int | None
+) -> GuildConfig | None:
+    """Set (or, with ``role_id=None``, clear) the event notification role."""
+    require_id(guild_id, name="guild_id")
+    require_optional_id(role_id, name="role_id")
+    row = await conn.fetchrow(_UPDATE_PLAYER_ROLE_SQL, guild_id, role_id)
     return _row_to_guild_config(row) if row is not None else None
 
 

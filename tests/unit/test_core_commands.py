@@ -7,14 +7,30 @@ import discord
 import pytest
 
 from catan_bot.cogs import config_cog, game_cog, season_cog, stats_cog
+from catan_bot.domain.errors import DomainValidationError
 from catan_bot.permissions import actor_from_interaction, guild_id_from_interaction
 from catan_bot.services.context import Actor
 
 
 def _interaction(*, guild_id: int = 123, user_id: int = 456) -> SimpleNamespace:
+    permissions = SimpleNamespace(
+        view_channel=True,
+        send_messages=True,
+        send_messages_in_threads=True,
+        embed_links=True,
+    )
+    member = SimpleNamespace(id=user_id)
+    guild = SimpleNamespace(id=guild_id, me=SimpleNamespace(id=999))
+    channel = SimpleNamespace(
+        id=700,
+        guild=guild,
+        permissions_for=lambda _member: permissions,
+    )
     return SimpleNamespace(
         guild_id=guild_id,
-        user=SimpleNamespace(id=user_id),
+        user=member,
+        guild=guild,
+        channel=channel,
         response=SimpleNamespace(defer=AsyncMock()),
         edit_original_response=AsyncMock(),
     )
@@ -44,6 +60,29 @@ def test_group_cogs_expose_every_m4_subcommand() -> None:
     }
     assert game.name == "game"
     assert {command.name for command in game.commands} == {"report", "void", "history"}
+
+
+def test_config_exposes_player_role_command() -> None:
+    config = config_cog.ConfigCog.config_group
+    assert config.get_command("player-role") is not None
+
+
+def test_player_role_validation_rejects_everyone_and_cross_guild() -> None:
+    everyone = SimpleNamespace(
+        id=123,
+        guild=SimpleNamespace(id=123),
+        is_default=lambda: True,
+    )
+    foreign = SimpleNamespace(
+        id=987,
+        guild=SimpleNamespace(id=456),
+        is_default=lambda: False,
+    )
+
+    with pytest.raises(DomainValidationError, match="@everyone"):
+        config_cog.validate_player_role(everyone, 123)  # type: ignore[arg-type]
+    with pytest.raises(DomainValidationError, match="this server"):
+        config_cog.validate_player_role(foreign, 123)  # type: ignore[arg-type]
 
 
 def test_command_options_publish_required_bounds() -> None:
@@ -185,9 +224,35 @@ async def test_leaderboard_maps_choice_and_defers_before_service(
     monkeypatch.setattr(stats_cog.formatting, "build_leaderboard_embed", lambda _: discord.Embed())
 
     await stats_cog.StatsCog.leaderboard_command.callback(
-        cog, interaction, discord.app_commands.Choice(name="all-time", value="all_time")
+        cog, interaction, discord.app_commands.Choice(name="all-time", value="all_time"), None
     )
 
     interaction.response.defer.assert_awaited_once_with(thinking=True)
     leaderboard.assert_awaited_once_with("pool", 123, "all_time")
+    _assert_no_mentions(interaction.edit_original_response.await_args)
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_posts_to_selected_channel_and_returns_ephemeral_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    target = SimpleNamespace(
+        id=701,
+        guild=interaction.guild,
+        permissions_for=interaction.channel.permissions_for,
+        send=AsyncMock(return_value=SimpleNamespace(jump_url="https://discord.test/board")),
+    )
+    cog = stats_cog.StatsCog(SimpleNamespace(pool="pool"))
+    leaderboard = AsyncMock(return_value=object())
+    monkeypatch.setattr(stats_cog.stats_service, "leaderboard", leaderboard)
+    monkeypatch.setattr(stats_cog.formatting, "build_leaderboard_embed", lambda _: discord.Embed())
+
+    await stats_cog.StatsCog.leaderboard_command.callback(cog, interaction, None, target)
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+    leaderboard.assert_awaited_once_with("pool", 123, "season")
+    target.send.assert_awaited_once()
+    confirmation = interaction.edit_original_response.await_args.kwargs["content"]
+    assert "<#701>" in confirmation and "https://discord.test/board" in confirmation
     _assert_no_mentions(interaction.edit_original_response.await_args)

@@ -8,7 +8,14 @@ from typing import get_args
 
 import asyncpg
 
-from catan_bot.db.models import ClaimedReminder, Event, RsvpCounts, RsvpResponse, TransitionResult
+from catan_bot.db.models import (
+    ClaimedReminder,
+    Event,
+    RsvpCounts,
+    RsvpResponse,
+    RsvpRoster,
+    TransitionResult,
+)
 from catan_bot.db.repositories import events, guilds
 from catan_bot.domain.dates import combine_local, parse_date, parse_time, today_in_timezone
 from catan_bot.domain.reminders import EVENT_COMPLETE_AFTER, classify_reminder, plan_reminders
@@ -26,14 +33,13 @@ from catan_bot.services.errors import (
     PermissionDeniedError,
     ServiceError,
 )
-from catan_bot.services.results import ReminderToSend
+from catan_bot.services.results import EventCreation, ReminderToSend
 
 logger = logging.getLogger(__name__)
 
 _UPCOMING_MIN_LIMIT, _UPCOMING_MAX_LIMIT = 1, 10
 
 _VALID_RSVP_RESPONSES = frozenset(get_args(RsvpResponse))
-_GOING_AND_MAYBE: tuple[str, ...] = ("going", "maybe")
 
 _EVENT_NOT_FOUND = "That event doesn't exist."
 _EVENT_NOT_SCHEDULED = "That event has already been cancelled or has already happened."
@@ -58,6 +64,36 @@ async def create_event(
     channel_id: int | None,
     now: datetime,
 ) -> Event:
+    """Create an event, retaining the legacy event-only service result."""
+    created = await create_event_with_notification_role(
+        pool,
+        guild_id,
+        actor,
+        title=title,
+        date_text=date_text,
+        time_text=time_text,
+        location=location,
+        description=description,
+        channel_id=channel_id,
+        now=now,
+    )
+    return created.event
+
+
+async def create_event_with_notification_role(
+    pool: asyncpg.Pool,
+    guild_id: int,
+    actor: Actor,
+    *,
+    title: str,
+    date_text: str | None,
+    time_text: str,
+    location: str | None,
+    description: str | None,
+    channel_id: int | None,
+    now: datetime,
+) -> EventCreation:
+    """Create an event and atomically snapshot its announcement role."""
     clean_title = clean_text(title, field="Event title", max_len=EVENT_TITLE_MAX, min_len=1)
     clean_location = clean_text(
         location, field="Event location", max_len=EVENT_LOCATION_MAX, min_len=0
@@ -79,7 +115,7 @@ async def create_event(
         validate_event_start(starts_at, now=now)
 
         reminders = plan_reminders(starts_at, now=now)
-        return await events.create_event(
+        event = await events.create_event(
             conn,
             guild_id,
             clean_title,
@@ -90,6 +126,7 @@ async def create_event(
             channel_id,
             [(plan.offset_minutes, plan.remind_at) for plan in reminders],
         )
+        return EventCreation(event=event, player_role_id=config.player_role_id)
 
 
 async def record_event_message(
@@ -153,6 +190,12 @@ async def rsvp(
         return await events.rsvp_counts(conn, guild_id, event_id)
 
 
+async def rsvp_roster(pool: asyncpg.Pool, guild_id: int, event_id: int) -> RsvpRoster:
+    """Load the complete grouped RSVP roster for a scheduled event."""
+    async with pool.acquire() as conn:
+        return await events.rsvp_roster(conn, guild_id, event_id)
+
+
 async def upcoming_events(
     pool: asyncpg.Pool, guild_id: int, now: datetime, limit: int
 ) -> list[Event]:
@@ -189,7 +232,7 @@ def _log_reminder_read_failure(event_id: int, guild_id: int, exc: Exception) -> 
 
 
 async def _read_reminder(pool: asyncpg.Pool, reminder: ClaimedReminder) -> ReminderToSend | None:
-    """Load the event and going/maybe RSVPs for one already-claimed reminder.
+    """Load the event for one already-claimed reminder.
 
     Runs on its own `pool.acquire()` connection, isolated from every other
     reminder's read: a failure here (a bad connection, a guild-specific
@@ -204,14 +247,13 @@ async def _read_reminder(pool: asyncpg.Pool, reminder: ClaimedReminder) -> Remin
             event = await events.get_event(conn, reminder.guild_id, reminder.event_id)
             if event is None or event.status != "scheduled":
                 return None
-            user_ids = await events.rsvp_user_ids(
-                conn, reminder.guild_id, reminder.event_id, _GOING_AND_MAYBE
-            )
     except Exception as exc:
         _log_reminder_read_failure(reminder.event_id, reminder.guild_id, exc)
         return None
     return ReminderToSend(
-        event=event, offset_minutes=reminder.offset_minutes, user_ids=tuple(user_ids)
+        event=event,
+        offset_minutes=reminder.offset_minutes,
+        player_role_id=reminder.player_role_id,
     )
 
 

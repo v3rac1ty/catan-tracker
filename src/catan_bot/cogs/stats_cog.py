@@ -8,6 +8,7 @@ from discord.ext import commands
 
 from catan_bot import formatting
 from catan_bot.bot import CatanBot
+from catan_bot.cogs.channel_publish import validate_publish_channel
 from catan_bot.permissions import guild_id_from_interaction
 from catan_bot.services import stats_service
 
@@ -18,6 +19,7 @@ class StatsCog(commands.Cog):
 
     @app_commands.command(name="leaderboard", description="Show season or all-time rankings.")
     @app_commands.guild_only()
+    @app_commands.describe(channel="Where to post it. Defaults to this channel.")
     @app_commands.choices(
         scope=[
             app_commands.Choice(name="season", value="season"),
@@ -25,16 +27,38 @@ class StatsCog(commands.Cog):
         ]
     )
     async def leaderboard_command(
-        self, interaction: discord.Interaction, scope: app_commands.Choice[str] | None = None
+        self,
+        interaction: discord.Interaction,
+        scope: app_commands.Choice[str] | None = None,
+        channel: discord.TextChannel | None = None,
     ) -> None:
         guild_id = guild_id_from_interaction(interaction)
         scope_value = scope.value if scope is not None else "season"
-        await interaction.response.defer(thinking=True)
+        destination = channel if channel is not None else interaction.channel
+        if destination is None:
+            raise ValueError("interaction requires a channel")
+        validate_publish_channel(interaction, destination)
+        if channel is None:
+            await interaction.response.defer(thinking=True)
+        else:
+            await interaction.response.defer(ephemeral=True, thinking=True)
         board = await stats_service.leaderboard(self.bot.pool, guild_id, scope_value)
         embed = formatting.build_leaderboard_embed(board)
-        await interaction.edit_original_response(
-            embed=embed, allowed_mentions=discord.AllowedMentions.none()
-        )
+        if channel is None:
+            await interaction.edit_original_response(
+                embed=embed, allowed_mentions=discord.AllowedMentions.none()
+            )
+        else:
+            sent = await destination.send(
+                embed=embed, allowed_mentions=discord.AllowedMentions.none()
+            )
+            await interaction.edit_original_response(
+                content=(
+                    f"Leaderboard posted in {formatting.channel_mention(destination.id)}: "
+                    f"{sent.jump_url}"
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     @app_commands.command(name="stats", description="Show a player's win/loss record.")
     @app_commands.guild_only()

@@ -63,9 +63,11 @@ async def test_not_going_maps_to_service_value_and_keeps_buttons(
     event = SimpleNamespace(status="scheduled")
     rsvp = AsyncMock(return_value=counts)
     get_event = AsyncMock(return_value=event)
+    roster = object()
     monkeypatch.setattr(event_rsvp, "actor_from_interaction", lambda _: actor)
     monkeypatch.setattr(event_rsvp.event_service, "rsvp", rsvp)
     monkeypatch.setattr(event_rsvp.event_service, "get_event", get_event, raising=False)
+    monkeypatch.setattr(event_rsvp.event_service, "rsvp_roster", AsyncMock(return_value=roster))
     monkeypatch.setattr(event_rsvp.formatting, "build_event_embed", lambda *_: discord.Embed())
 
     await event_rsvp.EventRsvpButton(42, "no").callback(interaction)
@@ -73,6 +75,7 @@ async def test_not_going_maps_to_service_value_and_keeps_buttons(
     interaction.response.defer.assert_awaited_once_with()
     rsvp.assert_awaited_once_with("pool", 123, 42, actor, "not_going")
     get_event.assert_awaited_once_with("pool", 123, 42)
+    event_rsvp.event_service.rsvp_roster.assert_awaited_once_with("pool", 123, 42)
     edited = interaction.edit_original_response.await_args
     assert [item.item.custom_id for item in edited.kwargs["view"].children] == [
         "rsvp:going:42",
@@ -94,6 +97,7 @@ async def test_cancelled_event_removes_buttons(monkeypatch: pytest.MonkeyPatch) 
         AsyncMock(return_value=SimpleNamespace(status="cancelled")),
         raising=False,
     )
+    monkeypatch.setattr(event_rsvp.event_service, "rsvp_roster", AsyncMock(return_value=object()))
     monkeypatch.setattr(event_rsvp.formatting, "build_event_embed", lambda *_: discord.Embed())
 
     await event_rsvp.EventRsvpButton(42, "going").callback(interaction)
@@ -136,6 +140,7 @@ async def test_edit_failure_uses_shared_error_handler(monkeypatch: pytest.Monkey
         AsyncMock(return_value=SimpleNamespace(status="scheduled")),
         raising=False,
     )
+    monkeypatch.setattr(event_rsvp.event_service, "rsvp_roster", AsyncMock(return_value=object()))
     monkeypatch.setattr(event_rsvp.formatting, "build_event_embed", lambda *_: discord.Embed())
 
     await event_rsvp.EventRsvpButton(42, "going").callback(interaction)

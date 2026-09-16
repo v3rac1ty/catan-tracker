@@ -9,14 +9,17 @@ from discord.ext import commands
 # (command, description) pairs shown in the help embed, matching what's
 # actually registered through M5.
 _COMMANDS: tuple[tuple[str, str], ...] = (
-    ("/config channel|timezone|admin-role|show", "View or change this server's settings."),
+    (
+        "/config channel|timezone|admin-role|player-role|show",
+        "View or change this server's settings.",
+    ),
     ("/season start|min-games|end-date|end|cancel|info|history", "Manage this server's season."),
     ("/game report", "Report a game's winner and losers for confirmation."),
     ("/game void", "Void a reported game (admin)."),
     ("/game history", "Show recent games."),
-    ("/leaderboard", "Show season or all-time rankings."),
+    ("/leaderboard [channel]", "Show rankings here or post them to a chosen channel."),
     ("/stats", "Show a player's win/loss record."),
-    ("/event create|list|cancel", "Schedule and manage game nights with RSVPs."),
+    ("/event create [channel]|list|cancel", "Schedule and manage game nights with RSVPs."),
 )
 
 

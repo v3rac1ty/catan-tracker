@@ -90,3 +90,17 @@ async def test_set_admin_role_rejects_non_manage_guild(pool: asyncpg.Pool, guild
     actor = Actor(user_id=2, has_manage_guild=False, role_ids=frozenset())
     with pytest.raises(PermissionDeniedError):
         await config_service.set_admin_role(pool, guild_id, actor, 999)
+
+
+async def test_set_player_role_success_and_clear(pool: asyncpg.Pool, guild_id: int) -> None:
+    updated = await config_service.set_player_role(pool, guild_id, _admin(), 999)
+    assert updated.player_role_id == 999
+
+    cleared = await config_service.set_player_role(pool, guild_id, _admin(), None)
+    assert cleared.player_role_id is None
+
+
+async def test_set_player_role_rejects_non_manage_guild(pool: asyncpg.Pool, guild_id: int) -> None:
+    actor = Actor(user_id=2, has_manage_guild=False, role_ids=frozenset())
+    with pytest.raises(PermissionDeniedError):
+        await config_service.set_player_role(pool, guild_id, actor, 999)

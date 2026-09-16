@@ -2,25 +2,11 @@
 
 A Discord bot for a friend group that tracks Catan wins and losses and ranks players by win rate. Seasons run for a set period with a minimum-games threshold (default 2) for eligibility; when a season ends, the lowest-ranked eligible player buys food for the top-ranked player. The bot also schedules game nights with RSVPs and reminders.
 
-## Status
-
-Feature-complete through the events and scheduler milestone, with deployment
-and CI configuration ready for review. The project has not been verified on a
-live OCI host.
-
-- [x] Foundation — git/Docker setup, database schema and migrations, bot skeleton, `/help`
-- [x] Domain logic — dates, ranking, bet resolution, reminders, validation
-- [x] Repositories, services, and SQL injection tests
-- [x] Core commands — config, season, game reporting, leaderboard, stats
-- [x] Events + scheduler
-- [x] CI configuration
-- [x] Deployment documentation
-
 ## Features
 
 - Multi-server season tracking with configurable end dates and eligibility
 - Confirmed game reports, voiding, history, leaderboards, and player stats
-- Game-night events with RSVP buttons and targeted reminders
+- Game-night events with grouped RSVP buttons, optional role-only pings, and targeted reminders
 - Automatic season resolution with frozen result announcements
 - Least-privilege PostgreSQL roles, bounded output, and mention-safe responses
 
@@ -44,13 +30,13 @@ flowchart LR
 | Command | Description | Who | Status |
 |---|---|---|---|
 | `/help` | List available commands | Anyone | Available |
-| `/config channel` / `timezone` / `admin-role` / `show` | View or change the server configuration | Manage Server | Available |
+| `/config channel` / `timezone` / `admin-role` / `player-role` / `show` | View or change the server configuration. `player-role` is the optional role pinged for new events and reminders. | Manage Server | Available |
 | `/season start` / `min-games` / `end-date` / `end` / `cancel` / `info` / `history` | Manage seasons and the win/loss eligibility threshold (default 2) | Admin (`info`/`history`: anyone) | Available |
 | `/game report winner loser1 [...] [date]` | Report a game; `date` defaults to today | Anyone | Available |
 | Confirm / Reject buttons | Confirm or reject a pending report | Other participants; reporter may retract | Available |
 | `/game void`, `/game history` | Void a game / view game history | Admin / anyone | Available |
-| `/leaderboard`, `/stats` | View rankings and player stats | Anyone | Available |
-| `/event create [date] ...`, `/event list`, `/event cancel` | Schedule and manage game nights | Anyone / creator or admin | Available |
+| `/leaderboard [channel]`, `/stats` | View rankings and player stats. A selected leaderboard channel receives the public board; otherwise it posts here. | Anyone | Available |
+| `/event create [date] [channel] ...`, `/event list`, `/event cancel` | Schedule and manage game nights. A selected channel receives the event; otherwise it posts here. | Anyone / creator or admin | Available |
 | RSVP buttons | Going / Maybe / Not going | Anyone | Available |
 
 ## Tech stack
@@ -70,7 +56,7 @@ flowchart LR
 - The database uses least-privilege roles: the application's runtime role cannot `DELETE`, `DROP`, `TRUNCATE`, or `ALTER` anything — only `SELECT`/`INSERT`/`UPDATE` on existing tables. Schema changes require a separate migration role.
 - A server-side `statement_timeout` applied to every pooled connection, plus a client-side command timeout, bound query run time.
 - The database port is bound to `localhost` only; it is never exposed publicly.
-- Discord mentions are disabled by default (`AllowedMentions.none()`); only specific, intentional pings are ever allowed through.
+- Discord mentions are disabled by default (`AllowedMentions.none()`); event announcements and reminders can allow only the configured player role. An unset player role sends no ping.
 
 See the [security guide](docs/SECURITY.md) for the threat model, operational
 controls, incident response, and disclosure process.

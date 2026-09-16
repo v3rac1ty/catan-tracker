@@ -65,6 +65,7 @@ async def test_scheduler_sends_due_reminder_once_across_restart_style_ticks(
     pool: asyncpg.Pool, guild_id: int
 ) -> None:
     event = await _create_two_hour_event(pool, guild_id)
+    await config_service.set_player_role(pool, guild_id, _actor(1, admin=True), 765_432)
     await event_service.rsvp(pool, guild_id, event.event_id, _actor(2), "going")
     await event_service.rsvp(pool, guild_id, event.event_id, _actor(3), "maybe")
     await event_service.rsvp(pool, guild_id, event.event_id, _actor(4), "not_going")
@@ -75,9 +76,9 @@ async def test_scheduler_sends_due_reminder_once_across_restart_style_ticks(
 
     channel.send.assert_awaited_once()
     call = channel.send.await_args
-    assert call.kwargs["content"] in {"<@2> <@3>", "<@3> <@2>"}
+    assert call.kwargs["content"] == "<@&765432>"
     assert call.kwargs["allowed_mentions"].to_dict() == {
-        "users": [2, 3],
+        "roles": [765_432],
         "parse": [],
     }
     assert "Game Night" in (call.kwargs["embed"].title or "")

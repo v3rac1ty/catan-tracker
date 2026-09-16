@@ -301,14 +301,15 @@ async def test_upcoming_events_clamps_limit(pool: asyncpg.Pool, guild_id: int) -
 
 
 # ---------------------------------------------------------------------------
-# 7. due_reminders: send/going+maybe, stale, cancel race.
+# 7. due_reminders: send/role propagation, stale, cancel race.
 # ---------------------------------------------------------------------------
 
 
-async def test_due_reminders_send_path_includes_going_and_maybe_excludes_not_going(
+async def test_due_reminders_send_path_carries_configured_player_role(
     pool: asyncpg.Pool, guild_id: int
 ) -> None:
     created = await _create(pool, guild_id, creator=1, **_at(timedelta(hours=2)))
+    await config_service.set_player_role(pool, guild_id, _actor(1, admin=True), 765_432)
     await event_service.rsvp(pool, guild_id, created.event_id, _actor(2), "going")
     await event_service.rsvp(pool, guild_id, created.event_id, _actor(3), "maybe")
     await event_service.rsvp(pool, guild_id, created.event_id, _actor(4), "not_going")
@@ -321,7 +322,7 @@ async def test_due_reminders_send_path_includes_going_and_maybe_excludes_not_goi
     reminder = reminders[0]
     assert reminder.event.event_id == created.event_id
     assert reminder.offset_minutes == 60
-    assert set(reminder.user_ids) == {2, 3}
+    assert reminder.player_role_id == 765_432
 
 
 async def test_due_reminders_stale_reminder_is_dropped_but_marked_sent(
@@ -375,51 +376,39 @@ async def test_due_reminders_isolates_one_guilds_read_failure_from_another(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """L4: `due_reminders` claims every due reminder in one committed
-    transaction, then reads each on its own connection. A read failure for
-    one guild (`rsvp_user_ids` raising) must not affect another guild's due
-    reminder in the same tick, and the failing guild's reminder -- already
-    marked sent by the claim -- is dropped (never retried), with no DETAIL
-    text in the log."""
+    """Reminder reads no longer depend on the event's RSVP users.
+
+    A broken RSVP query must not make a due reminder disappear because the
+    scheduler only needs the event and its configured role.
+    """
     created_a = await _create(pool, guild_id, creator=1, **_at(timedelta(hours=2)))
     created_b = await _create(pool, other_guild_id, creator=1, **_at(timedelta(hours=2)))
 
-    real_rsvp_user_ids = event_service.events.rsvp_user_ids
-    marker = "MARKER_deadbeef_ROW_CONTENTS_DO_NOT_LEAK"
+    async def _rsvp_query_must_not_run(*_args):
+        raise AssertionError("due reminder loading must not query RSVP users")
 
-    async def _maybe_fail(conn, guild_id_arg, event_id_arg, responses):
-        if guild_id_arg == guild_id:
-            exc = asyncpg.CheckViolationError("simulated")
-            exc.detail = f"boom {marker}"
-            raise exc
-        return await real_rsvp_user_ids(conn, guild_id_arg, event_id_arg, responses)
-
-    monkeypatch.setattr(event_service.events, "rsvp_user_ids", _maybe_fail)
+    monkeypatch.setattr(event_service.events, "rsvp_user_ids", _rsvp_query_must_not_run)
 
     due_time = NOW + timedelta(hours=1)
     with caplog.at_level(logging.ERROR):
         reminders = await event_service.due_reminders(pool, due_time)
 
-    assert {r.event.event_id for r in reminders} == {created_b.event_id}
+    assert {r.event.event_id for r in reminders} == {created_a.event_id, created_b.event_id}
 
     async with pool.acquire() as conn:
         sent_at = await conn.fetchval(
             "SELECT sent_at FROM event_reminders WHERE event_id = $1 AND offset_minutes = 60",
             created_a.event_id,
         )
-    assert sent_at is not None  # claimed (marked sent) despite the failed read
+        sent_at_b = await conn.fetchval(
+            "SELECT sent_at FROM event_reminders WHERE event_id = $1 AND offset_minutes = 60",
+            created_b.event_id,
+        )
+    assert sent_at is not None
+    assert sent_at_b is not None
 
     second_call = await event_service.due_reminders(pool, due_time)
-    assert second_call == []  # never retried -- both already claimed/sent
-
-    for record in caplog.records:
-        assert marker not in record.getMessage()
-        assert marker not in repr(record.args)
-        assert marker not in (record.exc_text or "")
-    assert marker not in caplog.text
-    combined = "\n".join(r.getMessage() for r in caplog.records)
-    assert str(created_a.event_id) in combined
-    assert "CheckViolationError" in combined
+    assert second_call == []  # both claims are at-most-once
 
 
 async def test_due_reminders_logs_non_postgres_read_failure_without_exc_info_leak(
