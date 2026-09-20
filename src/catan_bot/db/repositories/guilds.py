@@ -123,12 +123,25 @@ RETURNING guild_id, timezone, announce_channel_id, admin_role_id, player_role_id
 # caller-supplied NULL the same as "not supplied", which would make
 # `leaderboard_channel_id` (itself nullable) impossible to explicitly clear
 # through this function.
+#
+# $3/$5/$7/$9 (the "new value" side of each CASE) are each explicitly cast
+# rather than left for Postgres to infer from the ELSE branch's column
+# reference. Ordinary CASE type resolution isn't the same ambiguity as
+# score_requests.py's `$n + INTERVAL` bug (there's no competing operator
+# overload here), so this would likely still resolve correctly without a
+# cast -- but every one of these parameters can be NULL at bind time
+# (`channel_id=None` is a legitimate explicit "clear it", and mode/scope/
+# daily_time are all sent as `None` on the branch where the caller didn't
+# supply them), and a NULL with no cast has nothing but the CASE's other
+# branch to anchor its type to. Casting explicitly removes any dependence
+# on that inference succeeding, matching every other value-carrying `$n` in
+# this file.
 _SET_LEADERBOARD_SETTINGS_SQL = """
 UPDATE guild_config
-SET leaderboard_mode = CASE WHEN $2 THEN $3 ELSE leaderboard_mode END,
-    leaderboard_channel_id = CASE WHEN $4 THEN $5 ELSE leaderboard_channel_id END,
-    leaderboard_scope = CASE WHEN $6 THEN $7 ELSE leaderboard_scope END,
-    leaderboard_daily_time = CASE WHEN $8 THEN $9 ELSE leaderboard_daily_time END,
+SET leaderboard_mode = CASE WHEN $2 THEN $3::text ELSE leaderboard_mode END,
+    leaderboard_channel_id = CASE WHEN $4 THEN $5::bigint ELSE leaderboard_channel_id END,
+    leaderboard_scope = CASE WHEN $6 THEN $7::text ELSE leaderboard_scope END,
+    leaderboard_daily_time = CASE WHEN $8 THEN $9::time ELSE leaderboard_daily_time END,
     updated_at = now()
 WHERE guild_id = $1
 RETURNING guild_id, timezone, announce_channel_id, admin_role_id, player_role_id,

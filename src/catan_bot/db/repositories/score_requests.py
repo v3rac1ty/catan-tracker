@@ -25,9 +25,20 @@ from catan_bot.db.repositories._params import require_aware, require_id, require
 # and leaving the request outstanding for a human to chase manually.
 _MAX_PROMPTS = 3
 
+# `$3::timestamptz` is cast at BOTH occurrences, not just inside the
+# arithmetic: `$3 + INTERVAL '24 hours'` alone is genuinely ambiguous to
+# Postgres, since that `+` matches both the `interval + interval` operator
+# (result: interval) and the `timestamptz + interval` operator (result:
+# timestamptz) -- and with a bare, uncast `$3` on the other side, nothing
+# tells the planner which one to pick. It fails at *prepare* time with
+# `asyncpg.exceptions.AmbiguousParameterError`, before any row is touched,
+# so every caller of this statement broke identically. The first cast
+# resolves the ambiguity (forces the timestamptz overload); the second
+# looks redundant next to a plain `$3` used elsewhere as a timestamptz, but
+# removing it reopens the same ambiguity -- keep both.
 _INSERT_SCORE_REQUESTS_SQL = """
 INSERT INTO game_score_requests (game_id, guild_id, user_id, requested_at, next_prompt_at)
-SELECT $1, $2, u, $3, $3 + INTERVAL '24 hours'
+SELECT $1, $2, u, $3::timestamptz, $3::timestamptz + INTERVAL '24 hours'
 FROM unnest($4::bigint[]) AS t(u)
 """
 
@@ -91,13 +102,26 @@ LIMIT 1
 # every claimed row is still re-armed (never lost, just possibly delayed by
 # one tick). Claiming and rescheduling happen in the same statement, so the
 # caller never has to separately re-arm a row after deciding to send.
+# `$1::timestamptz` is cast at every occurrence, including the plain
+# `next_prompt_at <= $1` comparison, which would resolve fine on its own.
+# The reason is `next_prompt_at = $1 + INTERVAL '24 hours'` further down in
+# the same statement: that `+` matches both `interval + interval` and
+# `timestamptz + interval`, and Postgres resolves *all* occurrences of a
+# given `$n` to one single type per statement -- it doesn't pick a type
+# per-occurrence. Leaving the comparison's `$1` uncast doesn't make it
+# "safe by itself"; it just means the ambiguity below still has no
+# resolution to fall back on, and prepare fails with
+# `asyncpg.exceptions.AmbiguousParameterError` exactly like
+# `_INSERT_SCORE_REQUESTS_SQL` did (this statement happened to still work
+# depending on resolution order, but it is the identical latent bug -- see
+# the CI postmortem this comment was added for). Do not drop either cast.
 _CLAIM_DUE_PROMPTS_SQL = """
 WITH due AS (
     SELECT game_id, user_id
     FROM game_score_requests
     WHERE submitted_at IS NULL
           AND next_prompt_at IS NOT NULL
-          AND next_prompt_at <= $1
+          AND next_prompt_at <= $1::timestamptz
           AND prompts_sent < $3
     ORDER BY next_prompt_at
     LIMIT $2
@@ -105,7 +129,7 @@ WITH due AS (
 )
 UPDATE game_score_requests r
 SET prompts_sent = r.prompts_sent + 1,
-    next_prompt_at = $1 + INTERVAL '24 hours'
+    next_prompt_at = $1::timestamptz + INTERVAL '24 hours'
 FROM due
 WHERE r.game_id = due.game_id AND r.user_id = due.user_id
 RETURNING r.game_id, r.guild_id, r.user_id, r.dm_channel_id, r.dm_message_id,
