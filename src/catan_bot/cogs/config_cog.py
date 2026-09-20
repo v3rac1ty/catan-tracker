@@ -7,12 +7,13 @@ itself before reading the config back (`context.require_manage_guild`,
 called directly here since `config_service.get_config` has no actor check
 of its own -- this is the M4 requirement the M3b audit added).
 
-`/config leaderboard` is the exception: every option but `mode` is optional,
-and an omitted one must leave that field's stored value alone rather than
+`/config leaderboard` is the exception: every option is optional, and an
+omitted one must leave that field's stored value alone rather than
 resetting it to a default -- see `leaderboard_command`'s own comments for
 how that "only pass what was actually supplied" behavior is built, and
 `config_service.set_leaderboard_settings`'s docstring for how it is
-threaded down to the repository layer.
+threaded down to the repository layer. At least one option must still be
+supplied, or there's nothing for the command to do.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from discord.ext import commands
 from catan_bot import formatting
 from catan_bot.bot import CatanBot
 from catan_bot.cogs.channel_publish import validate_publish_channel
+from catan_bot.db.models import GuildConfig
 from catan_bot.domain.dates import parse_time
 from catan_bot.domain.errors import DomainValidationError
 from catan_bot.permissions import actor_from_interaction, guild_id_from_interaction
@@ -53,6 +55,7 @@ _LEADERBOARD_SCOPE_CHOICES = [
 _NO_LEADERBOARD_CHANNEL = (
     "Choose a channel, or configure an announcement channel first with /config channel."
 )
+_NO_LEADERBOARD_OPTIONS = "Set at least one of mode, channel, scope, time, or clear_channel."
 
 
 def validate_player_role(role: discord.Role, guild_id: int) -> int:
@@ -202,7 +205,8 @@ class ConfigCog(commands.Cog):
         name="leaderboard", description="Configure the recurring leaderboard post."
     )
     @app_commands.describe(
-        mode="off: never post. per-game: after every confirmed game. daily: once a day.",
+        mode="off: never post. per-game: after every confirmed game. daily: once a day. "
+        "Omitted leaves the current mode.",
         channel="Where to post it. Omitted leaves the current channel (or, if none has "
         "ever been set, falls back to the announcement channel).",
         scope="season or all-time standings. Omitted leaves the current scope.",
@@ -214,7 +218,7 @@ class ConfigCog(commands.Cog):
     async def leaderboard_command(
         self,
         interaction: discord.Interaction,
-        mode: app_commands.Choice[str],
+        mode: app_commands.Choice[str] | None = None,
         channel: discord.TextChannel | None = None,
         scope: app_commands.Choice[str] | None = None,
         time: app_commands.Range[str, 1, 16] | None = None,
@@ -229,21 +233,31 @@ class ConfigCog(commands.Cog):
         # allowed to change this in the first place.
         require_manage_guild(actor)
 
+        # Every option, `mode` included, is genuinely optional, matching
+        # `/game update`'s "omitted means unchanged" convention -- but a
+        # call that omits all five is never useful (it would just re-read
+        # and re-write the row for nothing), so that's rejected up front
+        # rather than falling through to a pointless write.
+        if (
+            mode is None
+            and channel is None
+            and scope is None
+            and time is None
+            and not clear_channel
+        ):
+            raise DomainValidationError(_NO_LEADERBOARD_OPTIONS)
+
         if channel is not None and clear_channel:
             raise DomainValidationError("Choose either a channel or clear_channel, not both.")
-        if clear_channel and mode.value != "off":
-            # Mirrors the "no destination" check below: a mode that posts
-            # somewhere can't be saved with no channel at all.
-            raise DomainValidationError(_NO_LEADERBOARD_CHANNEL)
 
-        # Every option except `mode` is genuinely optional, matching
-        # `/game update`'s "omitted means unchanged" convention: a kwarg
-        # this cog never adds to `settings_kwargs` is never passed to
-        # `config_service.set_leaderboard_settings` at all, so that field's
-        # already-stored value survives untouched (see that function's
-        # docstring for how the omission is threaded down to the repository
-        # layer's own partial-update sentinel).
+        # A kwarg this cog never adds to `settings_kwargs` is never passed
+        # to `config_service.set_leaderboard_settings` at all, so that
+        # field's already-stored value survives untouched (see that
+        # function's docstring for how the omission is threaded down to the
+        # repository layer's own partial-update sentinel).
         settings_kwargs: dict[str, object] = {}
+        if mode is not None:
+            settings_kwargs["mode"] = mode.value
         if scope is not None:
             settings_kwargs["scope"] = scope.value
         if time is not None:
@@ -254,27 +268,49 @@ class ConfigCog(commands.Cog):
         elif clear_channel:
             settings_kwargs["channel_id"] = None
 
-        if "channel_id" not in settings_kwargs and mode.value != "off":
-            # The channel is being left as-is. That's fine as long as one is
-            # already on file; if a leaderboard channel has never been
-            # configured, fall back to the announcement channel (the same
-            # first-time convenience this command has always offered) so
-            # this mode has somewhere to post. Only reached for a mode that
-            # actually needs a destination, and only costs the extra read
-            # in that case.
-            current = await config_service.get_config(self.bot.pool, guild_id)
-            if current.leaderboard_channel_id is None:
-                fallback = None
-                if current.announce_channel_id is not None and interaction.guild is not None:
-                    fallback = interaction.guild.get_channel(current.announce_channel_id)
-                if fallback is None:
-                    raise DomainValidationError(_NO_LEADERBOARD_CHANNEL)
-                validate_publish_channel(interaction, fallback)
-                settings_kwargs["channel_id"] = fallback.id
+        # The two guards below both care about "the mode this write will
+        # actually leave in place" -- the newly supplied one if given,
+        # otherwise whatever is already stored -- not just the `mode`
+        # argument, which may now be absent entirely. Resolving that means
+        # a read, but only when one of the guards can actually fire:
+        # `clear_channel` was passed, or the channel is being left as-is
+        # (in which case the same read also supplies the current channel
+        # for the fallback below), matching this command's existing
+        # "off never touches the database" and "an explicit channel never
+        # reads the current config" behavior.
+        if clear_channel or "channel_id" not in settings_kwargs:
+            current: GuildConfig | None = None
+            if mode is not None:
+                effective_mode = mode.value
+            else:
+                current = await config_service.get_config(self.bot.pool, guild_id)
+                effective_mode = current.leaderboard_mode
+
+            if clear_channel and effective_mode != "off":
+                # Mirrors the "no destination" check below: a mode that
+                # posts somewhere can't be saved with no channel at all.
+                raise DomainValidationError(_NO_LEADERBOARD_CHANNEL)
+
+            if "channel_id" not in settings_kwargs and effective_mode != "off":
+                # The channel is being left as-is. That's fine as long as
+                # one is already on file; if a leaderboard channel has
+                # never been configured, fall back to the announcement
+                # channel (the same first-time convenience this command has
+                # always offered) so this mode has somewhere to post.
+                if current is None:
+                    current = await config_service.get_config(self.bot.pool, guild_id)
+                if current.leaderboard_channel_id is None:
+                    fallback = None
+                    if current.announce_channel_id is not None and interaction.guild is not None:
+                        fallback = interaction.guild.get_channel(current.announce_channel_id)
+                    if fallback is None:
+                        raise DomainValidationError(_NO_LEADERBOARD_CHANNEL)
+                    validate_publish_channel(interaction, fallback)
+                    settings_kwargs["channel_id"] = fallback.id
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         config = await config_service.set_leaderboard_settings(
-            self.bot.pool, guild_id, actor, mode=mode.value, **settings_kwargs
+            self.bot.pool, guild_id, actor, **settings_kwargs
         )
         embed = formatting.build_config_show_embed(config)
         await interaction.edit_original_response(

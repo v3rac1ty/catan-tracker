@@ -768,10 +768,15 @@ def _leaderboard_command():
 
 
 def _config_with_channels(
-    *, announce_channel_id: int | None, leaderboard_channel_id: int | None = None
+    *,
+    announce_channel_id: int | None,
+    leaderboard_channel_id: int | None = None,
+    leaderboard_mode: str = "off",
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        announce_channel_id=announce_channel_id, leaderboard_channel_id=leaderboard_channel_id
+        announce_channel_id=announce_channel_id,
+        leaderboard_channel_id=leaderboard_channel_id,
+        leaderboard_mode=leaderboard_mode,
     )
 
 
@@ -1078,3 +1083,151 @@ async def test_config_leaderboard_omitted_scope_is_not_passed_and_explicit_value
         cog, interaction, _mode_choice("daily"), explicit_channel, _mode_choice("all_time")
     )
     assert set_settings.await_args.kwargs["scope"] == "all_time"
+
+
+# ---------------------------------------------------------------------------
+# `mode` becoming optional too (Phase 5): now every option, `mode` included,
+# follows the same "omitted means unchanged" rule, so a call must supply at
+# least one of them, and the guards that used to just read `mode.value`
+# must resolve the *effective* mode -- the newly supplied one if given,
+# otherwise whatever is already stored.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_config_leaderboard_no_options_at_all_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    cog = config_cog.ConfigCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
+    monkeypatch.setattr(config_cog, "actor_from_interaction", lambda _: actor)
+    get_config = AsyncMock()
+    monkeypatch.setattr(config_cog.config_service, "get_config", get_config)
+    set_settings = AsyncMock()
+    monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
+
+    with pytest.raises(DomainValidationError, match="at least one"):
+        await _leaderboard_command().callback(cog, interaction, None)
+
+    get_config.assert_not_awaited()
+    set_settings.assert_not_awaited()
+    interaction.response.defer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_config_leaderboard_channel_only_leaves_mode_scope_and_time_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing only `channel` (no `mode`) must reach the service call with
+    nothing but `channel_id` -- the mirror of the existing "mode only"
+    coverage above, now that `mode` follows the same rule as every other
+    option."""
+    interaction = _interaction()
+    permissions = SimpleNamespace(
+        view_channel=True, send_messages=True, send_messages_in_threads=True, embed_links=True
+    )
+    explicit_channel = SimpleNamespace(
+        id=701, guild=interaction.guild, permissions_for=lambda _member: permissions
+    )
+    cog = config_cog.ConfigCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
+    monkeypatch.setattr(config_cog, "actor_from_interaction", lambda _: actor)
+    get_config = AsyncMock()
+    monkeypatch.setattr(config_cog.config_service, "get_config", get_config)
+    set_settings = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
+    monkeypatch.setattr(config_cog.formatting, "build_config_show_embed", lambda _: discord.Embed())
+
+    await _leaderboard_command().callback(cog, interaction, None, explicit_channel)
+
+    # Nothing to fall back for or leave untouched -- the current-config read
+    # never happens, same as when an explicit channel accompanies an
+    # explicit mode.
+    get_config.assert_not_awaited()
+    assert set_settings.await_args.kwargs == {"channel_id": 701}
+
+
+@pytest.mark.asyncio
+async def test_config_leaderboard_clear_channel_with_a_stored_posting_mode_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`mode` omitted, `clear_channel` supplied: the "no destination" guard
+    must react to the *stored* mode -- it must not assume "off" (or skip
+    the check entirely) just because no mode was passed this call."""
+    interaction = _interaction()
+    cog = config_cog.ConfigCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
+    monkeypatch.setattr(config_cog, "actor_from_interaction", lambda _: actor)
+    get_config = AsyncMock(
+        return_value=_config_with_channels(announce_channel_id=None, leaderboard_mode="daily")
+    )
+    monkeypatch.setattr(config_cog.config_service, "get_config", get_config)
+    set_settings = AsyncMock()
+    monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
+
+    with pytest.raises(DomainValidationError, match="announcement channel"):
+        await _leaderboard_command().callback(cog, interaction, None, None, None, None, True)
+
+    get_config.assert_awaited_once()
+    set_settings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_config_leaderboard_clear_channel_with_a_stored_off_mode_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mirror case: a stored mode of `off` makes a bare `clear_channel`
+    (no `mode` passed) perfectly fine, and the write reaches the service
+    call without a `mode` kwarg -- the stored mode is left untouched."""
+    interaction = _interaction()
+    cog = config_cog.ConfigCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
+    monkeypatch.setattr(config_cog, "actor_from_interaction", lambda _: actor)
+    get_config = AsyncMock(
+        return_value=_config_with_channels(announce_channel_id=None, leaderboard_mode="off")
+    )
+    monkeypatch.setattr(config_cog.config_service, "get_config", get_config)
+    set_settings = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
+    monkeypatch.setattr(config_cog.formatting, "build_config_show_embed", lambda _: discord.Embed())
+
+    await _leaderboard_command().callback(cog, interaction, None, None, None, None, True)
+
+    get_config.assert_awaited_once()
+    assert set_settings.await_args.kwargs == {"channel_id": None}
+
+
+@pytest.mark.asyncio
+async def test_config_leaderboard_omitted_mode_uses_stored_mode_for_channel_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The channel-fallback guard must resolve its effective mode from the
+    stored value too, not just the clear_channel guard: changing only
+    `scope` on a guild already in `daily` mode, with no leaderboard channel
+    configured yet, must still fall back to the announcement channel."""
+    interaction = _interaction()
+    announce_channel = interaction.channel  # already permission-valid in _interaction()
+    interaction.guild.get_channel = lambda channel_id: (
+        announce_channel if channel_id == 900 else None
+    )
+    cog = config_cog.ConfigCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
+    monkeypatch.setattr(config_cog, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        config_cog.config_service,
+        "get_config",
+        AsyncMock(
+            return_value=_config_with_channels(
+                announce_channel_id=900, leaderboard_channel_id=None, leaderboard_mode="daily"
+            )
+        ),
+    )
+    set_settings = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
+    monkeypatch.setattr(config_cog.formatting, "build_config_show_embed", lambda _: discord.Embed())
+
+    await _leaderboard_command().callback(cog, interaction, None, None, _mode_choice("all_time"))
+
+    assert set_settings.await_args.kwargs["channel_id"] == announce_channel.id
+    assert "mode" not in set_settings.await_args.kwargs

@@ -1,5 +1,5 @@
 """Focused unit coverage for `config_service.set_leaderboard_settings`'s
-partial-update behavior (Phase 4 fix).
+partial-update behavior (Phase 4 fix; Phase 5 extended it to `mode` too).
 
 `/config leaderboard` previously always submitted a complete set of
 leaderboard fields, so an omitted Discord command option silently reset
@@ -8,7 +8,9 @@ fix one layer below the cog: an omitted keyword here must never become an
 explicit value forwarded to `guilds.set_leaderboard_settings` -- these use
 a mocked repository call (no real Postgres) so they run everywhere, unlike
 `tests/integration/test_repo_guilds.py`'s equivalent end-to-end coverage of
-the repository's own `_UNSET` sentinel.
+the repository's own `_UNSET` sentinel. `mode` follows the exact same
+`_UNSET`-sentinel rule as the other three fields now, rather than being a
+required keyword.
 """
 
 from __future__ import annotations
@@ -83,6 +85,30 @@ async def test_set_leaderboard_settings_with_only_mode_forwards_only_mode(
 
     assert result is updated
     set_settings.assert_awaited_once_with(pool.connection, 7, mode="daily")
+
+
+async def test_set_leaderboard_settings_with_only_channel_forwards_only_channel_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`mode` is optional at this layer too (Phase 5): a caller that only
+    wants to change the channel must reach the repository call without
+    `mode`, proving the stored mode survives untouched exactly like the
+    other partial-update fields already do."""
+    pool = _Pool()
+    monkeypatch.setattr(config_service.guilds, "ensure_guild", AsyncMock())
+    updated = SimpleNamespace(guild_id=7)
+    set_settings = AsyncMock(return_value=updated)
+    monkeypatch.setattr(config_service.guilds, "set_leaderboard_settings", set_settings)
+
+    result = await config_service.set_leaderboard_settings(
+        pool,  # type: ignore[arg-type]
+        7,
+        _actor(),
+        channel_id=555,
+    )
+
+    assert result is updated
+    set_settings.assert_awaited_once_with(pool.connection, 7, channel_id=555)
 
 
 async def test_set_leaderboard_settings_forwards_only_the_fields_actually_supplied(

@@ -106,24 +106,23 @@ async def set_leaderboard_settings(
     guild_id: int,
     actor: Actor,
     *,
-    mode: str,
+    mode: str | _Unset = _UNSET,
     channel_id: int | None | _Unset = _UNSET,
     scope: str | _Unset = _UNSET,
     daily_time: time | _Unset = _UNSET,
 ) -> GuildConfig:
-    """Update the leaderboard mode, and only whichever other fields were supplied
-    (`/config leaderboard`).
+    """Update only whichever leaderboard fields were supplied (`/config leaderboard`).
 
-    `mode` is the one option this command always requires; `channel_id`,
-    `scope`, and `daily_time` are each an optional Discord command option,
-    and an omitted one must leave that field's stored value exactly as it
-    was -- not silently reset it to a default -- the same "omitted means
-    unchanged" rule `/game update`'s optional fields already follow. The
-    cog signals "the user didn't pass this option" by leaving the matching
-    keyword argument out of its call here entirely (falling back to this
-    function's own `_UNSET` default); this function then forwards that same
-    per-field "was it supplied" decision straight through to the repository
-    call, via its own `_UNSET` sentinel (`guilds.set_leaderboard_settings`).
+    `mode`, `channel_id`, `scope`, and `daily_time` are all optional Discord
+    command options, and an omitted one must leave that field's stored
+    value exactly as it was -- not silently reset it to a default -- the
+    same "omitted means unchanged" rule `/game update`'s optional fields
+    already follow. The cog signals "the user didn't pass this option" by
+    leaving the matching keyword argument out of its call here entirely
+    (falling back to this function's own `_UNSET` default); this function
+    then forwards that same per-field "was it supplied" decision straight
+    through to the repository call, via its own `_UNSET` sentinel
+    (`guilds.set_leaderboard_settings`).
 
     Clearing the channel back to unset is still reachable despite `None`
     being a valid *value* for `channel_id` here (not just "omitted"): the
@@ -131,7 +130,9 @@ async def set_leaderboard_settings(
     explicitly, rather than leaving it out.
     """
     require_manage_guild(actor)
-    kwargs: dict[str, object] = {"mode": mode}
+    kwargs: dict[str, object] = {}
+    if mode is not _UNSET:
+        kwargs["mode"] = mode
     if channel_id is not _UNSET:
         kwargs["channel_id"] = channel_id
     if scope is not _UNSET:
