@@ -213,7 +213,10 @@ def test_project_tree_is_scanned_and_clean() -> None:
     files = iter_scanned_files()
     assert len(files) >= _MIN_SCANNED_FILES, len(files)  # non-vacuous
 
-    rel_paths = {str(p.relative_to(REPO_ROOT)) for p in files}
+    # `.as_posix()`, not `str(...)`: on Windows, `Path.relative_to()` keeps
+    # backslash separators, which would never match the POSIX-style required
+    # paths below even though the scan itself is correct.
+    rel_paths = {p.relative_to(REPO_ROOT).as_posix() for p in files}
     for required in (
         "src/catan_bot/db/migrations/0001_init.sql",
         "db/roles.sql",

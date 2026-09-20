@@ -17,7 +17,16 @@ from typing import Any
 import pytest
 
 from catan_bot.db.models import SeasonResultRow
-from catan_bot.db.repositories import _params, events, games, guilds, players, seasons
+from catan_bot.db.repositories import (
+    _params,
+    events,
+    games,
+    guilds,
+    players,
+    score_requests,
+    seasons,
+)
+from catan_bot.domain.scoring import PlayerScore, ScoreEntry
 
 # ---------------------------------------------------------------------------
 # Representative bad inputs, shared across every id/limit/aware-datetime
@@ -785,3 +794,159 @@ async def test_complete_past_events_validates_cutoff_before_conn(
 ) -> None:
     with pytest.raises(ValueError, match="cutoff"):
         await events.complete_past_events(conn, _NAIVE_DATETIME)
+
+
+# --- games.py (Phase 1 score-collection additions) ---
+
+
+async def test_set_player_score_validates_user_id_before_conn(conn: _ExplodingConnection) -> None:
+    with pytest.raises(ValueError, match="user_id"):
+        await games.set_player_score(conn, 1, 1, 0, None)
+
+
+async def test_set_player_score_validates_score_user_id_matches_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    mismatched = PlayerScore(user_id=2, total_points=0, breakdown=(ScoreEntry("settlements", 0),))
+    with pytest.raises(ValueError, match="score.user_id"):
+        await games.set_player_score(conn, 1, 1, 1, mismatched)
+
+
+async def test_list_games_on_date_validates_guild_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="guild_id"):
+        await games.list_games_on_date(conn, 0, PLAYED_ON)
+
+
+async def test_count_games_on_date_validates_guild_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="guild_id"):
+        await games.count_games_on_date(conn, 0, PLAYED_ON)
+
+
+# --- score_requests.py ---
+
+
+async def test_create_score_requests_validates_guild_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="guild_id"):
+        await score_requests.create_score_requests(conn, 0, 1, [1, 2], _AWARE_DATETIME)
+
+
+async def test_create_score_requests_validates_requested_at_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="requested_at"):
+        await score_requests.create_score_requests(conn, 1, 1, [1, 2], _NAIVE_DATETIME)
+
+
+async def test_create_score_requests_validates_each_user_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match=r"user_ids\[1\]"):
+        await score_requests.create_score_requests(conn, 1, 1, [1, "bad"], _AWARE_DATETIME)
+
+
+async def test_mark_delivered_validates_dm_channel_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="dm_channel_id"):
+        await score_requests.mark_delivered(conn, 1, 1, 1, 0, 1)
+
+
+async def test_mark_blocked_validates_user_id_before_conn(conn: _ExplodingConnection) -> None:
+    with pytest.raises(ValueError, match="user_id"):
+        await score_requests.mark_blocked(conn, 1, 1, 0)
+
+
+async def test_mark_submitted_validates_submitted_at_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="submitted_at"):
+        await score_requests.mark_submitted(conn, 1, 1, 1, _NAIVE_DATETIME)
+
+
+async def test_list_score_requests_validates_game_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="game_id"):
+        await score_requests.list_score_requests(conn, 1, 0)
+
+
+async def test_claim_due_prompts_validates_now_before_conn(conn: _ExplodingConnection) -> None:
+    with pytest.raises(ValueError, match="now"):
+        await score_requests.claim_due_prompts(conn, _NAIVE_DATETIME, 10)
+
+
+async def test_claim_due_prompts_validates_limit_before_conn(conn: _ExplodingConnection) -> None:
+    with pytest.raises(ValueError, match="limit"):
+        await score_requests.claim_due_prompts(conn, _AWARE_DATETIME, -1)
+
+
+# --- guilds.py (Phase 1 leaderboard additions) ---
+
+
+async def test_set_leaderboard_settings_validates_guild_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="guild_id"):
+        await guilds.set_leaderboard_settings(conn, 0, mode="daily")
+
+
+async def test_set_leaderboard_settings_validates_mode_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="mode"):
+        await guilds.set_leaderboard_settings(conn, 1, mode="bogus")
+
+
+async def test_set_leaderboard_settings_validates_channel_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="channel_id"):
+        await guilds.set_leaderboard_settings(conn, 1, channel_id=1.5)  # type: ignore[arg-type]
+
+
+async def test_set_leaderboard_settings_validates_scope_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="scope"):
+        await guilds.set_leaderboard_settings(conn, 1, scope="bogus")
+
+
+async def test_set_leaderboard_settings_validates_daily_time_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="daily_time"):
+        await guilds.set_leaderboard_settings(conn, 1, daily_time="22:00")  # type: ignore[arg-type]
+
+
+async def test_set_leaderboard_settings_with_nothing_supplied_still_validates_guild_id(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="guild_id"):
+        await guilds.set_leaderboard_settings(conn, -1)
+
+
+async def test_claim_daily_leaderboard_validates_guild_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="guild_id"):
+        await guilds.claim_daily_leaderboard(conn, 0, PLAYED_ON)
+
+
+async def test_set_leaderboard_ranking_validates_guild_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match="guild_id"):
+        await guilds.set_leaderboard_ranking(conn, 0, [1, 2])
+
+
+async def test_set_leaderboard_ranking_validates_each_user_id_before_conn(
+    conn: _ExplodingConnection,
+) -> None:
+    with pytest.raises(ValueError, match=r"user_ids\[1\]"):
+        await guilds.set_leaderboard_ranking(conn, 1, [1, "bad"])

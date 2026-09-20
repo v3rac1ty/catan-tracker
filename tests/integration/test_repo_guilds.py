@@ -6,6 +6,7 @@ Runs as the least-privilege `catan_app` role against `catan_test`.
 from __future__ import annotations
 
 import os
+from datetime import date, time
 
 import asyncpg
 import pytest
@@ -34,6 +35,12 @@ async def test_ensure_guild_creates_row_with_defaults(app_conn: asyncpg.Connecti
     assert config.player_role_id is None
     assert config.default_min_games == 2
     assert config.created_at == config.updated_at
+    assert config.leaderboard_mode == "off"
+    assert config.leaderboard_channel_id is None
+    assert config.leaderboard_scope == "season"
+    assert config.leaderboard_daily_time == time(22, 0)
+    assert config.leaderboard_last_posted_on is None
+    assert config.leaderboard_last_ranking is None
 
 
 async def test_ensure_guild_is_idempotent_and_does_not_bump_updated_at(
@@ -150,3 +157,118 @@ async def test_server_encoding_is_utf8(app_conn: asyncpg.Connection) -> None:
     `ENCODING 'UTF8' TEMPLATE template0`)."""
     encoding = await app_conn.fetchval("SHOW server_encoding")
     assert encoding == "UTF8"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: recurring leaderboard settings (0005).
+# ---------------------------------------------------------------------------
+
+
+async def test_set_leaderboard_settings_updates_only_supplied_fields(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    after_mode = await guilds.set_leaderboard_settings(app_conn, guild_id, mode="daily")
+    assert after_mode is not None
+    assert after_mode.leaderboard_mode == "daily"
+    assert after_mode.leaderboard_channel_id is None
+    assert after_mode.leaderboard_scope == "season"
+    assert after_mode.leaderboard_daily_time == time(22, 0)
+
+    after_channel = await guilds.set_leaderboard_settings(app_conn, guild_id, channel_id=42)
+    assert after_channel is not None
+    # Untouched by the second call.
+    assert after_channel.leaderboard_mode == "daily"
+    assert after_channel.leaderboard_channel_id == 42
+
+    after_scope_and_time = await guilds.set_leaderboard_settings(
+        app_conn, guild_id, scope="all_time", daily_time=time(9, 30)
+    )
+    assert after_scope_and_time is not None
+    assert after_scope_and_time.leaderboard_mode == "daily"
+    assert after_scope_and_time.leaderboard_channel_id == 42
+    assert after_scope_and_time.leaderboard_scope == "all_time"
+    assert after_scope_and_time.leaderboard_daily_time == time(9, 30)
+
+
+async def test_set_leaderboard_settings_can_explicitly_clear_channel_id(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await guilds.set_leaderboard_settings(app_conn, guild_id, channel_id=42)
+
+    cleared = await guilds.set_leaderboard_settings(app_conn, guild_id, channel_id=None)
+
+    assert cleared is not None
+    assert cleared.leaderboard_channel_id is None
+
+
+async def test_set_leaderboard_settings_with_nothing_supplied_is_a_no_op(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    before = await guilds.set_leaderboard_settings(app_conn, guild_id, mode="per_game")
+    assert before is not None
+
+    unchanged = await guilds.set_leaderboard_settings(app_conn, guild_id)
+
+    assert unchanged is not None
+    assert unchanged.leaderboard_mode == "per_game"
+
+
+async def test_set_leaderboard_settings_unknown_guild_returns_none(
+    app_conn: asyncpg.Connection,
+) -> None:
+    assert await guilds.set_leaderboard_settings(app_conn, UNKNOWN_GUILD_ID, mode="daily") is None
+
+
+async def test_list_daily_leaderboard_guilds_requires_channel_configured(
+    app_conn: asyncpg.Connection, guild_id: int, other_guild_id: int
+) -> None:
+    # `daily` mode but no channel: excluded, nowhere to post.
+    await guilds.set_leaderboard_settings(app_conn, guild_id, mode="daily")
+    # `daily` mode with a channel: included.
+    await guilds.set_leaderboard_settings(app_conn, other_guild_id, mode="daily", channel_id=99)
+
+    daily_guilds = await guilds.list_daily_leaderboard_guilds(app_conn)
+
+    assert {g.guild_id for g in daily_guilds} == {other_guild_id}
+
+
+async def test_claim_daily_leaderboard_is_at_most_once_per_day(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    today = date(2026, 3, 1)
+
+    first = await guilds.claim_daily_leaderboard(app_conn, guild_id, today)
+    assert first is not None
+    assert first.leaderboard_last_posted_on == today
+
+    second = await guilds.claim_daily_leaderboard(app_conn, guild_id, today)
+    assert second is None
+
+    tomorrow = date(2026, 3, 2)
+    third = await guilds.claim_daily_leaderboard(app_conn, guild_id, tomorrow)
+    assert third is not None
+    assert third.leaderboard_last_posted_on == tomorrow
+
+
+async def test_claim_daily_leaderboard_unknown_guild_returns_none(
+    app_conn: asyncpg.Connection,
+) -> None:
+    assert (
+        await guilds.claim_daily_leaderboard(app_conn, UNKNOWN_GUILD_ID, date(2026, 3, 1)) is None
+    )
+
+
+async def test_set_leaderboard_ranking_round_trips_order_and_supports_empty_board(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    updated = await guilds.set_leaderboard_ranking(app_conn, guild_id, [3, 1, 2])
+    assert updated is not None
+    assert updated.leaderboard_last_ranking == (3, 1, 2)
+
+    emptied = await guilds.set_leaderboard_ranking(app_conn, guild_id, [])
+    assert emptied is not None
+    assert emptied.leaderboard_last_ranking == ()
+
+    fetched = await guilds.get_guild(app_conn, guild_id)
+    assert fetched is not None
+    assert fetched.leaderboard_last_ranking == ()

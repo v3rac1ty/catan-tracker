@@ -5,9 +5,12 @@ import pytest
 from catan_bot.domain.errors import DomainValidationError
 from catan_bot.domain.scoring import (
     GameRules,
+    GameType,
     PlayerScore,
     ScoreEntry,
+    build_player_score,
     build_rules,
+    entry_fields,
     score_pages,
     score_sources,
     validate_game_scores,
@@ -151,3 +154,237 @@ def test_pages_are_stable_and_score_entries_are_immutable() -> None:
     assert [source.key for source in pages[0]] == ["settlements", "cities", "longest_road"]
     with pytest.raises((AttributeError, TypeError)):
         pages[0][0].key = "other"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# entry_fields
+# ---------------------------------------------------------------------------
+
+_ALL_GAME_TYPES: tuple[GameType, ...] = (
+    "normal",
+    "seafarers",
+    "cities_knights",
+    "seafarers_cities_knights",
+)
+
+
+@pytest.mark.parametrize("game_type", _ALL_GAME_TYPES)
+@pytest.mark.parametrize("with_scenario", [False, True])
+def test_entry_fields_splits_numeric_and_award_sources(
+    game_type: GameType, with_scenario: bool
+) -> None:
+    rules = build_rules(
+        game_type,
+        scenario="Fog Islands" if with_scenario else None,
+        target_points=12,
+    )
+    numeric, awards = entry_fields(rules)
+
+    all_sources = score_sources(rules)
+    assert {source.key for source in numeric} | {source.key for source in awards} == {
+        source.key for source in all_sources
+    }
+    assert all(source.fixed_points is None for source in numeric)
+    assert all(source.fixed_points is not None for source in awards)
+
+
+@pytest.mark.parametrize("game_type", _ALL_GAME_TYPES)
+@pytest.mark.parametrize("with_scenario", [False, True])
+def test_entry_fields_numeric_and_award_counts_fit_ui_limits(
+    game_type: GameType, with_scenario: bool
+) -> None:
+    """A Discord modal holds at most 5 text inputs, and awards are shown some
+    other way (buttons/select) with headroom to spare -- verified by
+    inspection across every game type, with and without a scenario, that
+    numeric never exceeds 5 and awards never exceed 4."""
+    rules = build_rules(
+        game_type,
+        scenario="Fog Islands" if with_scenario else None,
+        target_points=12,
+    )
+    numeric, awards = entry_fields(rules)
+    assert len(numeric) <= 5
+    assert len(awards) <= 4
+
+
+def test_entry_fields_rejects_non_game_rules() -> None:
+    with pytest.raises(DomainValidationError, match="Game rules are required"):
+        entry_fields("normal")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# build_player_score
+# ---------------------------------------------------------------------------
+
+
+def test_build_player_score_computes_total_and_zero_fills_unclaimed_awards() -> None:
+    rules = build_rules("normal")
+    score = build_player_score(
+        rules,
+        1,
+        numeric={"settlements": 4, "cities": 4, "vp_cards": 1},
+        awards=["longest_road"],
+    )
+    assert score.user_id == 1
+    assert score.total_points == 11
+    breakdown = {entry.key: entry.points for entry in score.breakdown}
+    assert breakdown == {
+        "settlements": 4,
+        "cities": 4,
+        "longest_road": 2,
+        "largest_army": 0,
+        "vp_cards": 1,
+    }
+    # Catalog order, not numeric-then-awards insertion order.
+    assert [entry.key for entry in score.breakdown] == [
+        source.key for source in score_sources(rules)
+    ]
+
+
+def test_build_player_score_accepts_no_claimed_awards() -> None:
+    rules = build_rules("normal")
+    score = build_player_score(
+        rules, 1, numeric={"settlements": 8, "cities": 0, "vp_cards": 0}, awards=()
+    )
+    assert score.total_points == 8
+    assert all(
+        entry.points == 0
+        for entry in score.breakdown
+        if entry.key in ("longest_road", "largest_army")
+    )
+
+
+def test_build_player_score_rejects_unknown_numeric_key() -> None:
+    rules = build_rules("normal")
+    with pytest.raises(DomainValidationError, match="Unknown numeric"):
+        build_player_score(
+            rules,
+            1,
+            numeric={"settlements": 4, "cities": 4, "vp_cards": 0, "bogus": 1},
+            awards=(),
+        )
+
+
+def test_build_player_score_rejects_missing_numeric_key() -> None:
+    rules = build_rules("normal")
+    with pytest.raises(DomainValidationError, match="Missing numeric"):
+        build_player_score(rules, 1, numeric={"settlements": 4, "cities": 4}, awards=())
+
+
+def test_build_player_score_rejects_unknown_award() -> None:
+    rules = build_rules("normal")
+    with pytest.raises(DomainValidationError, match="Unknown award"):
+        build_player_score(
+            rules,
+            1,
+            numeric={"settlements": 4, "cities": 4, "vp_cards": 0},
+            awards=["merchant"],
+        )
+
+
+def test_build_player_score_rejects_duplicate_claimed_award() -> None:
+    rules = build_rules("normal")
+    with pytest.raises(DomainValidationError, match="same award"):
+        build_player_score(
+            rules,
+            1,
+            numeric={"settlements": 4, "cities": 4, "vp_cards": 0},
+            awards=["longest_road", "longest_road"],
+        )
+
+
+def test_build_player_score_still_enforces_parity_and_other_rules() -> None:
+    rules = build_rules("normal")
+    with pytest.raises(DomainValidationError, match="even"):
+        build_player_score(
+            rules, 1, numeric={"settlements": 1, "cities": 1, "vp_cards": 0}, awards=()
+        )
+
+
+def test_build_player_score_rejects_non_mapping_numeric() -> None:
+    rules = build_rules("normal")
+    with pytest.raises(DomainValidationError, match="mapping"):
+        build_player_score(rules, 1, numeric=["settlements"], awards=())  # type: ignore[arg-type]
+
+
+def test_build_player_score_rejects_non_game_rules() -> None:
+    with pytest.raises(DomainValidationError, match="Game rules are required"):
+        build_player_score("normal", 1, numeric={}, awards=())  # type: ignore[arg-type]
+
+
+def test_build_player_score_cities_knights_awards_use_fixed_points() -> None:
+    rules = build_rules("cities_knights")
+    score = build_player_score(
+        rules,
+        2,
+        numeric={"settlements": 8, "cities": 2, "metropolis_bonus": 2, "defender_of_catan": 3},
+        awards=["merchant", "constitution"],
+    )
+    breakdown = {entry.key: entry.points for entry in score.breakdown}
+    assert breakdown["merchant"] == 1
+    assert breakdown["constitution"] == 1
+    assert breakdown["printer"] == 0
+    assert breakdown["longest_road"] == 0
+    assert score.total_points == 8 + 2 + 2 + 3 + 1 + 1
+
+
+# ---------------------------------------------------------------------------
+# validate_game_scores(allow_partial=True)
+# ---------------------------------------------------------------------------
+
+
+def test_allow_partial_accepts_zero_rows_and_a_subset() -> None:
+    rules = build_rules("normal")
+    assert validate_game_scores(rules, None, [1, 2], winner_id=1, allow_partial=True) == ()
+    assert validate_game_scores(rules, [], [1, 2], winner_id=1, allow_partial=True) == ()
+
+    only_loser = row(2, rules, settlements=8)
+    result = validate_game_scores(rules, [only_loser], [1, 2], winner_id=1, allow_partial=True)
+    assert result == (only_loser,)
+
+
+def test_allow_partial_still_rejects_duplicate_or_nonparticipant_rows() -> None:
+    rules = build_rules("normal")
+    dup = row(1, rules, settlements=8)
+    with pytest.raises(DomainValidationError, match="more than one score"):
+        validate_game_scores(rules, [dup, dup], [1, 2], winner_id=1, allow_partial=True)
+
+    stranger = row(3, rules, settlements=8)
+    with pytest.raises(DomainValidationError, match="exactly one score"):
+        validate_game_scores(rules, [stranger], [1, 2], winner_id=1, allow_partial=True)
+
+
+def test_allow_partial_skips_winner_target_check_until_winners_row_present() -> None:
+    rules = build_rules("normal")
+    # Loser's row is present and short of target; fine, since the winner's
+    # row (the one the target rule cares about) hasn't arrived yet.
+    short_loser = row(2, rules, settlements=1)
+    assert validate_game_scores(rules, [short_loser], [1, 2], winner_id=1, allow_partial=True) == (
+        short_loser,
+    )
+
+    # Once the winner's own row is present and short, the rule bites.
+    short_winner = row(1, rules, settlements=1)
+    with pytest.raises(DomainValidationError, match="winner must reach"):
+        validate_game_scores(rules, [short_winner], [1, 2], winner_id=1, allow_partial=True)
+
+
+def test_allow_partial_still_enforces_exclusive_award_totals_across_present_rows() -> None:
+    rules = build_rules("normal")
+    first = row(1, rules, settlements=8, longest_road=2)
+    duplicate_award = row(2, rules, settlements=8, longest_road=2)
+    with pytest.raises(DomainValidationError, match="Only one"):
+        validate_game_scores(
+            rules, [first, duplicate_award], [1, 2], winner_id=1, allow_partial=True
+        )
+
+
+def test_allow_partial_false_default_matches_original_behavior_and_messages() -> None:
+    rules = build_rules("normal")
+    with pytest.raises(DomainValidationError, match="exactly one"):
+        validate_game_scores(rules, [row(1, rules, settlements=10)], [1, 2], winner_id=1)
+    # Identical call with the new kwarg explicitly False must behave the same.
+    with pytest.raises(DomainValidationError, match="exactly one"):
+        validate_game_scores(
+            rules, [row(1, rules, settlements=10)], [1, 2], winner_id=1, allow_partial=False
+        )

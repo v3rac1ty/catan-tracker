@@ -186,6 +186,31 @@ ORDER BY g.played_on DESC, g.played_at DESC NULLS LAST, g.game_id DESC
 LIMIT $3
 """
 
+_SET_PLAYER_SCORE_SQL = """
+UPDATE game_participants
+SET total_points = $4, score_breakdown = $5::jsonb
+WHERE guild_id = $1 AND game_id = $2 AND user_id = $3 AND is_active
+RETURNING game_id
+"""
+
+_LIST_GAMES_ON_DATE_SQL = """
+SELECT game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
+       confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
+       channel_id, message_id, created_at, game_type, extension_5_6, scenario,
+       target_points, played_at, played_timezone, revision, updated_by, updated_at,
+       update_reason
+FROM games
+WHERE guild_id = $1 AND played_on = $2 AND status = 'confirmed'
+ORDER BY played_at DESC NULLS LAST, game_id DESC
+LIMIT $3
+"""
+
+_COUNT_GAMES_ON_DATE_SQL = """
+SELECT count(*) AS n
+FROM games
+WHERE guild_id = $1 AND played_on = $2 AND status = 'confirmed'
+"""
+
 _LOCK_GAME_SQL = """
 SELECT game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
        confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
@@ -334,8 +359,26 @@ def _score_breakdown_json(value: object, *, name: str) -> str:
 
 
 def _scores_for_participants(
-    scores: Sequence[PlayerScore] | None, user_ids: Sequence[int]
+    scores: Sequence[PlayerScore] | None,
+    user_ids: Sequence[int],
+    *,
+    allow_partial: bool = False,
 ) -> tuple[list[int | None], list[str | None]]:
+    """Map possibly-partial score rows onto every participant, in order.
+
+    ``allow_partial=False`` (the default) is unchanged: ``scores`` must be
+    ``None``/empty (every column NULL) or cover every participant exactly
+    once, one row per id. ``allow_partial=True`` (Phase 2's DM-based score
+    collection, where each player submits independently over a 24-hour
+    window) instead only requires that every row present belongs to an
+    actual participant and that no player has more than one row -- a
+    participant with no row *yet* simply gets ``None``/``None``, exactly the
+    same "not recorded" state an omitted score sheet is already in. This
+    matters for `_UPSERT_GAME_PARTICIPANTS_SQL`'s positional `unnest(...)`
+    arrays: every element must land in the slot for the right `user_ids`
+    entry, so a caller-supplied id that isn't actually a participant has to
+    be rejected here rather than silently dropped.
+    """
     if scores is None:
         return [None] * len(user_ids), [None] * len(user_ids)
     if not isinstance(scores, (list, tuple)):
@@ -362,13 +405,23 @@ def _scores_for_participants(
         _score_breakdown_json(score.breakdown, name=f"scores[{index}].breakdown")
         by_user_id[user_id] = score
 
-    if set(by_user_id) != set(user_ids) or len(by_user_id) != len(user_ids):
+    if allow_partial:
+        if not set(by_user_id) <= set(user_ids):
+            raise ValueError("scores must only contain game participants")
+    elif set(by_user_id) != set(user_ids) or len(by_user_id) != len(user_ids):
         raise ValueError("scores must contain exactly one score for every game participant")
 
     return (
-        [by_user_id[user_id].total_points for user_id in user_ids],
         [
-            _score_breakdown_json(by_user_id[user_id].breakdown, name="score.breakdown")
+            by_user_id[user_id].total_points if user_id in by_user_id else None
+            for user_id in user_ids
+        ],
+        [
+            (
+                _score_breakdown_json(by_user_id[user_id].breakdown, name="score.breakdown")
+                if user_id in by_user_id
+                else None
+            )
             for user_id in user_ids
         ],
     )
@@ -643,12 +696,19 @@ async def update_confirmed_game(
     played_at: datetime | None,
     played_timezone: str | None,
     scores: Sequence[PlayerScore] | None,
+    allow_partial: bool = False,
 ) -> GameWithParticipants | str:
     """Replace the active roster/details of a confirmed game and audit it.
 
     Returns ``not_found``, ``not_confirmed``, or ``stale`` without mutating
     when the guarded update cannot apply.  It never changes the game season,
     report/confirmation identity, or Discord message identity.
+
+    ``allow_partial`` is forwarded to `_scores_for_participants` unchanged;
+    it exists so a later phase can save a correction to a game whose score
+    collection isn't finished yet without forcing every participant's row to
+    be re-supplied in the same call. Default ``False`` preserves today's
+    "every participant needs exactly one score, or none" behavior.
     """
     require_id(guild_id, name="guild_id")
     require_id(game_id, name="game_id")
@@ -672,7 +732,7 @@ async def update_confirmed_game(
     user_ids = [winner_id, *loser_ids]
     if len(set(user_ids)) != len(user_ids):
         raise ValueError("winner_id and loser_ids must not contain duplicates")
-    points, breakdowns = _scores_for_participants(scores, user_ids)
+    points, breakdowns = _scores_for_participants(scores, user_ids, allow_partial=allow_partial)
 
     async with conn.transaction():
         before = await lock_game(conn, guild_id, game_id)
@@ -823,3 +883,72 @@ async def list_recent_games_for_player(
     require_limit(limit)
     rows = await conn.fetch(_LIST_RECENT_GAMES_FOR_PLAYER_SQL, guild_id, user_id, limit)
     return [_row_to_game(row) for row in rows]
+
+
+async def set_player_score(
+    conn: asyncpg.Connection,
+    guild_id: int,
+    game_id: int,
+    user_id: int,
+    score: PlayerScore | None,
+) -> bool:
+    """Write (or, with ``score=None``, clear) one active participant's score row.
+
+    This is the per-player analogue of `_scores_for_participants`'s bulk
+    write: Phase 2's DM score collection saves each participant's row as it
+    arrives, independently, rather than all of them together, so a single
+    guild-scoped ``UPDATE`` targeting exactly one active participant is
+    enough -- there's no roster to reconcile the way
+    `update_confirmed_game` has to. ``score=None`` clears both columns back
+    to NULL, which is how a player's row goes back to "not recorded" (e.g.
+    the scheduler sweep letting them resubmit). Returns whether a row was
+    actually updated; ``False`` covers an unknown guild/game/user or a
+    participant who is no longer active.
+    """
+    require_id(guild_id, name="guild_id")
+    require_id(game_id, name="game_id")
+    require_id(user_id, name="user_id")
+    if score is None:
+        total_points: int | None = None
+        breakdown: str | None = None
+    else:
+        if type(score) is not PlayerScore:
+            raise ValueError("score must be a PlayerScore or None")
+        if score.user_id != user_id:
+            raise ValueError("score.user_id must match user_id")
+        total_points = require_int(
+            score.total_points, name="score.total_points", min_value=0, max_value=99
+        )
+        breakdown = _score_breakdown_json(score.breakdown, name="score.breakdown")
+    row = await conn.fetchrow(
+        _SET_PLAYER_SCORE_SQL, guild_id, game_id, user_id, total_points, breakdown
+    )
+    return row is not None
+
+
+async def list_games_on_date(
+    conn: asyncpg.Connection, guild_id: int, played_on: date, limit: int = 100
+) -> list[Game]:
+    """Every confirmed game played on ``played_on``, most recently played first.
+
+    Restricted to ``status = 'confirmed'``: this backs the daily leaderboard
+    digest, which only cares whether there was a completed game to report on
+    -- a pending or voided report shouldn't trigger (or appear in) that
+    post.
+    """
+    require_id(guild_id, name="guild_id")
+    require_limit(limit)
+    rows = await conn.fetch(_LIST_GAMES_ON_DATE_SQL, guild_id, played_on, limit)
+    return [_row_to_game(row) for row in rows]
+
+
+async def count_games_on_date(conn: asyncpg.Connection, guild_id: int, played_on: date) -> int:
+    """How many confirmed games were played on ``played_on``.
+
+    Companion to `list_games_on_date`, for a caller that only needs to
+    decide "was there at least one game today" without paying for a full
+    row fetch (e.g. skipping the daily leaderboard post on a quiet night).
+    """
+    require_id(guild_id, name="guild_id")
+    count = await conn.fetchval(_COUNT_GAMES_ON_DATE_SQL, guild_id, played_on)
+    return count

@@ -801,3 +801,153 @@ async def test_inactive_participant_cannot_confirm_or_reject_pending_game(
     )
     assert await games.confirm_game(app_conn, guild_id, game.game_id, 2) == "not_participant"
     assert await games.reject_game(app_conn, guild_id, game.game_id, 2) == "not_participant"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 additions: per-player score writes, allow_partial, and the daily
+# leaderboard digest's date-scoped reads.
+# ---------------------------------------------------------------------------
+
+
+async def test_set_player_score_writes_and_clears_one_active_row(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    game = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2])
+    score = PlayerScore(user_id=2, total_points=6, breakdown=(ScoreEntry("settlements", 6),))
+
+    updated = await games.set_player_score(app_conn, guild_id, game.game_id, 2, score)
+    assert updated is True
+
+    fetched = await games.get_game(app_conn, guild_id, game.game_id)
+    assert fetched is not None
+    assert fetched.scores == (score,)
+
+    cleared = await games.set_player_score(app_conn, guild_id, game.game_id, 2, None)
+    assert cleared is True
+    fetched_again = await games.get_game(app_conn, guild_id, game.game_id)
+    assert fetched_again is not None
+    assert fetched_again.scores == ()
+
+
+async def test_set_player_score_leaves_other_participants_and_games_untouched(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2, 3])
+    game = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2, 3])
+    winner_score = PlayerScore(
+        user_id=1, total_points=10, breakdown=(ScoreEntry("settlements", 10),)
+    )
+
+    await games.set_player_score(app_conn, guild_id, game.game_id, 1, winner_score)
+
+    fetched = await games.get_game(app_conn, guild_id, game.game_id)
+    assert fetched is not None
+    scores_by_user = {score.user_id: score for score in fetched.scores}
+    assert scores_by_user == {1: winner_score}
+
+
+async def test_set_player_score_returns_false_for_inactive_or_unknown_participant(
+    app_conn: asyncpg.Connection, guild_id: int, other_guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    game = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2])
+    score = PlayerScore(user_id=2, total_points=1, breakdown=(ScoreEntry("settlements", 1),))
+
+    # Wrong guild.
+    assert await games.set_player_score(app_conn, other_guild_id, game.game_id, 2, score) is False
+    # Unknown user.
+    unknown = PlayerScore(user_id=999, total_points=1, breakdown=(ScoreEntry("settlements", 1),))
+    assert await games.set_player_score(app_conn, guild_id, game.game_id, 999, unknown) is False
+
+    await app_conn.execute(
+        "UPDATE game_participants SET is_active = false WHERE game_id = $1 AND user_id = $2",
+        game.game_id,
+        2,
+    )
+    assert await games.set_player_score(app_conn, guild_id, game.game_id, 2, score) is False
+
+
+async def test_update_confirmed_game_allow_partial_accepts_a_subset_of_scores(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2, 3])
+    game = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2, 3])
+    assert await games.confirm_game(app_conn, guild_id, game.game_id, 2) == "confirmed"
+
+    only_one_score = (
+        PlayerScore(user_id=1, total_points=10, breakdown=(ScoreEntry("settlements", 10),)),
+    )
+    updated = await games.update_confirmed_game(
+        app_conn,
+        guild_id,
+        game.game_id,
+        expected_revision=0,
+        updated_by=9,
+        reason=None,
+        played_on=PLAYED_ON,
+        winner_id=1,
+        loser_ids=[2, 3],
+        game_type="normal",
+        extension_5_6=False,
+        scenario=None,
+        target_points=None,
+        played_at=None,
+        played_timezone=None,
+        scores=only_one_score,
+        allow_partial=True,
+    )
+
+    assert not isinstance(updated, str)
+    assert updated.scores == only_one_score
+    remaining = await app_conn.fetch(
+        "SELECT user_id, total_points, score_breakdown FROM game_participants "
+        "WHERE game_id = $1 AND user_id != 1",
+        game.game_id,
+    )
+    assert all(row["total_points"] is None and row["score_breakdown"] is None for row in remaining)
+
+
+async def test_update_confirmed_game_without_allow_partial_still_requires_full_coverage(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    game = await _confirmed_game(app_conn, guild_id)
+    partial = (PlayerScore(user_id=1, total_points=10, breakdown=(ScoreEntry("settlements", 10),)),)
+    with pytest.raises(ValueError, match="exactly one score"):
+        await games.update_confirmed_game(
+            app_conn,
+            guild_id,
+            game.game_id,
+            expected_revision=0,
+            updated_by=9,
+            reason=None,
+            played_on=PLAYED_ON,
+            winner_id=1,
+            loser_ids=[2],
+            game_type="normal",
+            extension_5_6=False,
+            scenario=None,
+            target_points=None,
+            played_at=None,
+            played_timezone=None,
+            scores=partial,
+        )
+
+
+async def test_list_and_count_games_on_date_only_include_confirmed(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    confirmed = await _confirmed_game(app_conn, guild_id)
+    pending = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2])
+    other_day = await games.create_game(app_conn, guild_id, None, date(2026, 3, 2), 1, 1, [2])
+    assert await games.confirm_game(app_conn, guild_id, other_day.game_id, 2) == "confirmed"
+
+    listed = await games.list_games_on_date(app_conn, guild_id, PLAYED_ON)
+    assert [g.game_id for g in listed] == [confirmed.game_id]
+    assert pending.game_id not in [g.game_id for g in listed]
+
+    assert await games.count_games_on_date(app_conn, guild_id, PLAYED_ON) == 1
+    assert await games.count_games_on_date(app_conn, guild_id, date(2026, 3, 2)) == 1
+    assert await games.count_games_on_date(app_conn, guild_id, date(2026, 3, 3)) == 0

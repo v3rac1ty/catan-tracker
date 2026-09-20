@@ -504,6 +504,130 @@ async def test_game_participant_scores_must_be_an_object_and_paired(
         )
 
 
+async def test_score_request_dm_fields_must_be_paired(app_conn: asyncpg.Connection) -> None:
+    await _insert_guild(app_conn)
+    await app_conn.execute("INSERT INTO players (guild_id, user_id) VALUES ($1, $2)", GUILD_ID, 1)
+    game_id = await app_conn.fetchval(
+        "INSERT INTO games (guild_id, played_on, reported_by) VALUES ($1, $2, $3) "
+        "RETURNING game_id",
+        GUILD_ID,
+        date(2026, 1, 5),
+        1,
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError) as exc_info:
+        await app_conn.execute(
+            "INSERT INTO game_score_requests "
+            "(game_id, guild_id, user_id, requested_at, dm_channel_id) "
+            "VALUES ($1, $2, $3, now(), $4)",
+            game_id,
+            GUILD_ID,
+            1,
+            555,
+        )
+    assert exc_info.value.constraint_name == "game_score_requests_dm_fields_paired"
+
+
+async def test_score_request_delivery_status_must_be_a_known_value(
+    app_conn: asyncpg.Connection,
+) -> None:
+    await _insert_guild(app_conn)
+    await app_conn.execute("INSERT INTO players (guild_id, user_id) VALUES ($1, $2)", GUILD_ID, 1)
+    game_id = await app_conn.fetchval(
+        "INSERT INTO games (guild_id, played_on, reported_by) VALUES ($1, $2, $3) "
+        "RETURNING game_id",
+        GUILD_ID,
+        date(2026, 1, 5),
+        1,
+    )
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await app_conn.execute(
+            "INSERT INTO game_score_requests "
+            "(game_id, guild_id, user_id, requested_at, delivery_status) "
+            "VALUES ($1, $2, $3, now(), $4)",
+            game_id,
+            GUILD_ID,
+            1,
+            "not_a_real_status",
+        )
+
+
+async def test_score_request_guild_mismatch_raises_fk_violation(
+    app_conn: asyncpg.Connection,
+) -> None:
+    await _insert_guild(app_conn)
+    await _insert_guild(app_conn, guild_id=OTHER_GUILD_ID)
+    await app_conn.execute("INSERT INTO players (guild_id, user_id) VALUES ($1, $2)", GUILD_ID, 1)
+    game_id = await app_conn.fetchval(
+        "INSERT INTO games (guild_id, played_on, reported_by) VALUES ($1, $2, $3) "
+        "RETURNING game_id",
+        GUILD_ID,
+        date(2026, 1, 5),
+        1,
+    )
+
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await app_conn.execute(
+            "INSERT INTO game_score_requests (game_id, guild_id, user_id, requested_at) "
+            "VALUES ($1, $2, $3, now())",
+            game_id,
+            OTHER_GUILD_ID,
+            1,
+        )
+
+
+async def test_guild_config_leaderboard_defaults_and_mode_scope_checks(
+    app_conn: asyncpg.Connection,
+) -> None:
+    await _insert_guild(app_conn)
+    row = await app_conn.fetchrow(
+        "SELECT leaderboard_mode, leaderboard_channel_id, leaderboard_scope, "
+        "leaderboard_daily_time, leaderboard_last_posted_on, leaderboard_last_ranking "
+        "FROM guild_config WHERE guild_id = $1",
+        GUILD_ID,
+    )
+    assert row["leaderboard_mode"] == "off"
+    assert row["leaderboard_channel_id"] is None
+    assert row["leaderboard_scope"] == "season"
+    assert row["leaderboard_daily_time"] is not None
+    assert row["leaderboard_last_posted_on"] is None
+    assert row["leaderboard_last_ranking"] is None
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await app_conn.execute(
+            "UPDATE guild_config SET leaderboard_mode = $1 WHERE guild_id = $2",
+            "not_a_real_mode",
+            GUILD_ID,
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await app_conn.execute(
+            "UPDATE guild_config SET leaderboard_scope = $1 WHERE guild_id = $2",
+            "not_a_real_scope",
+            GUILD_ID,
+        )
+
+
+async def test_guild_config_leaderboard_ranking_must_be_a_json_array(
+    app_conn: asyncpg.Connection,
+) -> None:
+    await _insert_guild(app_conn)
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await app_conn.execute(
+            "UPDATE guild_config SET leaderboard_last_ranking = $1::jsonb WHERE guild_id = $2",
+            '{"not": "an array"}',
+            GUILD_ID,
+        )
+
+    # A real array is fine.
+    await app_conn.execute(
+        "UPDATE guild_config SET leaderboard_last_ranking = $1::jsonb WHERE guild_id = $2",
+        "[1, 2, 3]",
+        GUILD_ID,
+    )
+
+
 async def test_migrations_are_idempotent() -> None:
     migrator_dsn = os.environ["TEST_MIGRATOR_DATABASE_URL"]
     # The session-scoped `run_migrations` fixture already applied every

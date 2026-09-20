@@ -10,7 +10,7 @@ doesn't self-document its columns).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Literal
 
 from catan_bot.domain.scoring import PlayerScore
@@ -20,6 +20,9 @@ SeasonStatus = Literal["active", "completed", "cancelled"]
 EventStatus = Literal["scheduled", "cancelled", "completed"]
 RsvpResponse = Literal["going", "maybe", "not_going"]
 SeasonOutcome = Literal["payer", "payee"]
+ScoreRequestDeliveryStatus = Literal["pending", "delivered", "blocked"]
+LeaderboardMode = Literal["off", "per_game", "daily"]
+LeaderboardScope = Literal["season", "all_time"]
 
 # The result of a guarded status-transition UPDATE (confirm_game,
 # reject_game, void_game, cancel_event). Each function only ever returns a
@@ -52,6 +55,18 @@ class GuildConfig:
     # Optional role to mention for scheduled-event notifications.  Kept
     # nullable so existing guilds remain silent until explicitly configured.
     player_role_id: int | None = None
+    # Recurring leaderboard post configuration (0005).  Defaulted so every
+    # existing positional/keyword construction of this dataclass (repository
+    # code and unit test fixtures alike) keeps working unmodified.
+    leaderboard_mode: LeaderboardMode = "off"
+    leaderboard_channel_id: int | None = None
+    leaderboard_scope: LeaderboardScope = "season"
+    leaderboard_daily_time: time = time(22, 0)
+    leaderboard_last_posted_on: date | None = None
+    # An ordered snapshot of the previously posted board's user ids, used to
+    # compute movement arrows on the next post.  `None` means no board has
+    # ever been posted yet -- distinct from an empty board, `()`.
+    leaderboard_last_ranking: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +147,28 @@ class GameUpdate:
     reason: str | None
     before_snapshot: str
     after_snapshot: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScoreRequest:
+    """One participant's per-game score-collection tracking row (0005).
+
+    Created once per participant when a game is reported, updated as their
+    DM is delivered/blocked and, eventually, submitted, and swept by the
+    scheduler via `score_requests.claim_due_prompts` while `submitted_at`
+    stays NULL.
+    """
+
+    game_id: int
+    guild_id: int
+    user_id: int
+    dm_channel_id: int | None
+    dm_message_id: int | None
+    delivery_status: ScoreRequestDeliveryStatus
+    requested_at: datetime
+    next_prompt_at: datetime | None
+    prompts_sent: int
+    submitted_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
