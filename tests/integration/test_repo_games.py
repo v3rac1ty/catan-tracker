@@ -403,6 +403,50 @@ async def test_list_recent_games_for_player_only_includes_their_games(
     assert [g.game_id for g in listed] == [involving_1.game_id]
 
 
+async def test_list_recent_games_excludes_voided_by_default_and_filters_before_limit(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    """The voided filter lives inside the WHERE clause, applied before
+    LIMIT -- not as a second query text branched on in Python (the SQL
+    guard requires one sound constant per sink call), and not as a
+    Python-side filter applied to an already-limited result, which would
+    let voided games squeezed into the most recent N crowd out real ones.
+    """
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    real_games = [
+        await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2]) for _ in range(5)
+    ]
+    for _ in range(7):
+        voided = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2])
+        await games.void_game(app_conn, guild_id, voided.game_id, 1, "cleanup")
+
+    # A naive "take the 10 most recent, then filter in Python" would only
+    # surface the 3 real games that still fit in that window (7 voided +
+    # the 3 most recent real games == 10).
+    naive_top_10 = await games.list_recent_games(app_conn, guild_id, 10, include_voided=True)
+    naive_real = [g for g in naive_top_10 if g.status != "voided"]
+    assert len(naive_real) == 3
+
+    correct = await games.list_recent_games(app_conn, guild_id, 10)
+    assert {g.game_id for g in correct} == {g.game_id for g in real_games}
+    assert len(correct) > len(naive_real)
+
+
+async def test_list_recent_games_include_voided_returns_everything(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    kept = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2])
+    voided = await games.create_game(app_conn, guild_id, None, PLAYED_ON, 1, 1, [2])
+    await games.void_game(app_conn, guild_id, voided.game_id, 1, "cleanup")
+
+    default_listing = await games.list_recent_games(app_conn, guild_id, 10)
+    assert [g.game_id for g in default_listing] == [kept.game_id]
+
+    with_voided = await games.list_recent_games(app_conn, guild_id, 10, include_voided=True)
+    assert {g.game_id for g in with_voided} == {kept.game_id, voided.game_id}
+
+
 async def test_create_game_round_trips_rules_time_and_scores(
     app_conn: asyncpg.Connection, guild_id: int
 ) -> None:

@@ -665,6 +665,46 @@ async def test_game_show_attaches_confirm_reject_view_when_still_pending(
 
 
 @pytest.mark.asyncio
+async def test_game_history_defaults_include_voided_to_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    cog = game_cog.GameCog(SimpleNamespace(pool="pool"))
+    history = AsyncMock(return_value=[])
+    monkeypatch.setattr(game_cog.game_service, "game_history", history)
+    monkeypatch.setattr(
+        game_cog.formatting, "build_game_history_embed", lambda *_a, **_k: discord.Embed()
+    )
+    command = game_cog.GameCog.game_group.get_command("history")
+    assert command is not None
+
+    await command.callback(cog, interaction, None, None)
+
+    history.assert_awaited_once_with(
+        "pool", 123, user_id=None, limit=game_cog._DEFAULT_HISTORY_LIMIT, include_voided=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_game_history_threads_include_voided_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    cog = game_cog.GameCog(SimpleNamespace(pool="pool"))
+    history = AsyncMock(return_value=[])
+    monkeypatch.setattr(game_cog.game_service, "game_history", history)
+    monkeypatch.setattr(
+        game_cog.formatting, "build_game_history_embed", lambda *_a, **_k: discord.Embed()
+    )
+    command = game_cog.GameCog.game_group.get_command("history")
+    assert command is not None
+
+    await command.callback(cog, interaction, None, 5, True)
+
+    history.assert_awaited_once_with("pool", 123, user_id=None, limit=5, include_voided=True)
+
+
+@pytest.mark.asyncio
 async def test_leaderboard_maps_choice_and_defers_before_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -711,7 +751,9 @@ async def test_leaderboard_posts_to_selected_channel_and_returns_ephemeral_link(
 
 
 # ---------------------------------------------------------------------------
-# /config leaderboard (Phase 3)
+# /config leaderboard (Phase 3 wired it; Phase 4 made every option but
+# `mode` genuinely partial -- an omitted option must leave that field's
+# stored value alone, never silently replace it with a default).
 # ---------------------------------------------------------------------------
 
 
@@ -725,8 +767,12 @@ def _leaderboard_command():
     return command
 
 
-def _config_with_announce_channel(channel_id: int | None) -> SimpleNamespace:
-    return SimpleNamespace(announce_channel_id=channel_id)
+def _config_with_channels(
+    *, announce_channel_id: int | None, leaderboard_channel_id: int | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        announce_channel_id=announce_channel_id, leaderboard_channel_id=leaderboard_channel_id
+    )
 
 
 def test_config_leaderboard_command_choices_are_off_per_game_daily_and_scopes() -> None:
@@ -734,6 +780,7 @@ def test_config_leaderboard_command_choices_are_off_per_game_daily_and_scopes() 
     options = {parameter.name: parameter for parameter in command.parameters}
     assert [choice.value for choice in options["mode"].choices] == ["off", "per_game", "daily"]
     assert [choice.value for choice in options["scope"].choices] == ["season", "all_time"]
+    assert "clear_channel" in options
 
 
 @pytest.mark.asyncio
@@ -763,11 +810,8 @@ async def test_config_leaderboard_off_mode_never_requires_a_channel(
     cog = config_cog.ConfigCog(SimpleNamespace(pool="pool"))
     actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
     monkeypatch.setattr(config_cog, "actor_from_interaction", lambda _: actor)
-    monkeypatch.setattr(
-        config_cog.config_service,
-        "get_config",
-        AsyncMock(return_value=_config_with_announce_channel(None)),
-    )
+    get_config = AsyncMock()
+    monkeypatch.setattr(config_cog.config_service, "get_config", get_config)
     updated = SimpleNamespace()
     set_settings = AsyncMock(return_value=updated)
     monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
@@ -775,11 +819,43 @@ async def test_config_leaderboard_off_mode_never_requires_a_channel(
 
     await _leaderboard_command().callback(cog, interaction, _mode_choice("off"))
 
+    # "off" never needs a destination, so this must not even read the
+    # current config -- and with every other option omitted, only `mode`
+    # reaches the service call.
+    get_config.assert_not_awaited()
     set_settings.assert_awaited_once()
-    assert set_settings.await_args.kwargs["mode"] == "off"
-    assert set_settings.await_args.kwargs["channel_id"] is None
-    assert set_settings.await_args.kwargs["scope"] == "season"
-    assert set_settings.await_args.kwargs["daily_time"] == config_cog._DEFAULT_LEADERBOARD_TIME
+    assert set_settings.await_args.kwargs == {"mode": "off"}
+
+
+@pytest.mark.asyncio
+async def test_config_leaderboard_mode_only_leaves_channel_scope_and_time_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Phase 4 fix, proven at the cog boundary: passing only `mode` for
+    a guild that already has a leaderboard channel configured must reach
+    `config_service.set_leaderboard_settings` with nothing but `mode` --
+    the previously configured channel, scope, and time are never
+    re-submitted (see that function's own docstring for how the omission
+    survives down to the repository layer)."""
+    interaction = _interaction()
+    cog = config_cog.ConfigCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
+    monkeypatch.setattr(config_cog, "actor_from_interaction", lambda _: actor)
+    get_config = AsyncMock(
+        return_value=_config_with_channels(announce_channel_id=None, leaderboard_channel_id=555)
+    )
+    monkeypatch.setattr(config_cog.config_service, "get_config", get_config)
+    set_settings = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
+    monkeypatch.setattr(config_cog.formatting, "build_config_show_embed", lambda _: discord.Embed())
+
+    await _leaderboard_command().callback(cog, interaction, _mode_choice("per_game"))
+
+    # A channel is already on file, so the read above only confirms a
+    # destination exists -- it must never turn into a write of that
+    # channel (or the untouched scope/time) back through the service call.
+    set_settings.assert_awaited_once()
+    assert set_settings.await_args.kwargs == {"mode": "per_game"}
 
 
 @pytest.mark.asyncio
@@ -793,7 +869,7 @@ async def test_config_leaderboard_daily_mode_without_any_channel_raises(
     monkeypatch.setattr(
         config_cog.config_service,
         "get_config",
-        AsyncMock(return_value=_config_with_announce_channel(None)),
+        AsyncMock(return_value=_config_with_channels(announce_channel_id=None)),
     )
     set_settings = AsyncMock()
     monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
@@ -805,7 +881,7 @@ async def test_config_leaderboard_daily_mode_without_any_channel_raises(
 
 
 @pytest.mark.asyncio
-async def test_config_leaderboard_falls_back_to_announce_channel_when_unset(
+async def test_config_leaderboard_falls_back_to_announce_channel_only_the_first_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     interaction = _interaction()
@@ -819,7 +895,9 @@ async def test_config_leaderboard_falls_back_to_announce_channel_when_unset(
     monkeypatch.setattr(
         config_cog.config_service,
         "get_config",
-        AsyncMock(return_value=_config_with_announce_channel(900)),
+        AsyncMock(
+            return_value=_config_with_channels(announce_channel_id=900, leaderboard_channel_id=None)
+        ),
     )
     set_settings = AsyncMock(return_value=SimpleNamespace())
     monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
@@ -854,8 +932,8 @@ async def test_config_leaderboard_explicit_channel_is_validated_and_used(
         cog, interaction, _mode_choice("per_game"), explicit_channel
     )
 
-    # An explicit channel is used as-is; the announce-channel fallback read
-    # never happens because there's nothing to fall back for.
+    # An explicit channel is used as-is; the current-config read never
+    # happens because there's nothing to fall back for or leave untouched.
     get_config.assert_not_awaited()
     assert set_settings.await_args.kwargs["channel_id"] == 701
 
@@ -886,7 +964,70 @@ async def test_config_leaderboard_rejects_channel_bot_cannot_post_in(
 
 
 @pytest.mark.asyncio
-async def test_config_leaderboard_time_defaults_to_10pm_and_parses_explicit_value(
+async def test_config_leaderboard_clear_channel_explicitly_clears_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    cog = config_cog.ConfigCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
+    monkeypatch.setattr(config_cog, "actor_from_interaction", lambda _: actor)
+    set_settings = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
+    monkeypatch.setattr(config_cog.formatting, "build_config_show_embed", lambda _: discord.Embed())
+
+    await _leaderboard_command().callback(
+        cog, interaction, _mode_choice("off"), None, None, None, True
+    )
+
+    assert set_settings.await_args.kwargs == {"mode": "off", "channel_id": None}
+
+
+@pytest.mark.asyncio
+async def test_config_leaderboard_clear_channel_conflicts_with_an_explicit_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    permissions = SimpleNamespace(
+        view_channel=True, send_messages=True, send_messages_in_threads=True, embed_links=True
+    )
+    explicit_channel = SimpleNamespace(
+        id=701, guild=interaction.guild, permissions_for=lambda _member: permissions
+    )
+    cog = config_cog.ConfigCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
+    monkeypatch.setattr(config_cog, "actor_from_interaction", lambda _: actor)
+    set_settings = AsyncMock()
+    monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
+
+    with pytest.raises(DomainValidationError, match="clear_channel"):
+        await _leaderboard_command().callback(
+            cog, interaction, _mode_choice("off"), explicit_channel, None, None, True
+        )
+
+    set_settings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_config_leaderboard_clear_channel_with_a_posting_mode_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    cog = config_cog.ConfigCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=True, role_ids=frozenset())
+    monkeypatch.setattr(config_cog, "actor_from_interaction", lambda _: actor)
+    set_settings = AsyncMock()
+    monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
+
+    with pytest.raises(DomainValidationError, match="announcement channel"):
+        await _leaderboard_command().callback(
+            cog, interaction, _mode_choice("daily"), None, None, None, True
+        )
+
+    set_settings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_config_leaderboard_omitted_time_is_not_passed_and_explicit_value_parses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     interaction = _interaction()
@@ -904,7 +1045,7 @@ async def test_config_leaderboard_time_defaults_to_10pm_and_parses_explicit_valu
     monkeypatch.setattr(config_cog.formatting, "build_config_show_embed", lambda _: discord.Embed())
 
     await _leaderboard_command().callback(cog, interaction, _mode_choice("daily"), explicit_channel)
-    assert set_settings.await_args.kwargs["daily_time"] == time(22, 0)
+    assert "daily_time" not in set_settings.await_args.kwargs
 
     await _leaderboard_command().callback(
         cog, interaction, _mode_choice("daily"), explicit_channel, None, "7:30am"
@@ -913,7 +1054,7 @@ async def test_config_leaderboard_time_defaults_to_10pm_and_parses_explicit_valu
 
 
 @pytest.mark.asyncio
-async def test_config_leaderboard_scope_defaults_to_season(
+async def test_config_leaderboard_omitted_scope_is_not_passed_and_explicit_value_used(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     interaction = _interaction()
@@ -930,8 +1071,10 @@ async def test_config_leaderboard_scope_defaults_to_season(
     monkeypatch.setattr(config_cog.config_service, "set_leaderboard_settings", set_settings)
     monkeypatch.setattr(config_cog.formatting, "build_config_show_embed", lambda _: discord.Embed())
 
+    await _leaderboard_command().callback(cog, interaction, _mode_choice("daily"), explicit_channel)
+    assert "scope" not in set_settings.await_args.kwargs
+
     await _leaderboard_command().callback(
         cog, interaction, _mode_choice("daily"), explicit_channel, _mode_choice("all_time")
     )
-
     assert set_settings.await_args.kwargs["scope"] == "all_time"

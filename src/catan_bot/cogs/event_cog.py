@@ -64,7 +64,7 @@ class EventCog(commands.Cog):
     @event_group.command(name="create", description="Schedule a Catan game night.")
     @app_commands.describe(
         title="The event title.",
-        time="Start time (HH:MM or h:MMam/pm).",
+        time="Start time (h:MMam/pm, e.g. 7:30pm, or 24-hour HH:MM).",
         date="Start date. Defaults to today in this server's timezone.",
         location="Where the event will happen.",
         description="Extra details for attendees.",

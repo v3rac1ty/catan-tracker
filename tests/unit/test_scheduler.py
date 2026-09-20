@@ -12,9 +12,27 @@ import asyncpg
 import discord
 import pytest
 
-from catan_bot.db.models import Event, GuildConfig, Season, SeasonResultRow
-from catan_bot.scheduler import CatanScheduler, _deliverable_role_id, _mention_batches
-from catan_bot.services.results import Announcement, Leaderboard, LeaderboardPost, ReminderToSend
+from catan_bot.db.models import (
+    Event,
+    Game,
+    GameWithParticipants,
+    GuildConfig,
+    Season,
+    SeasonResultRow,
+)
+from catan_bot.scheduler import (
+    CatanScheduler,
+    _deliverable_role_id,
+    _group_score_prompts_by_game,
+    _mention_batches,
+)
+from catan_bot.services.results import (
+    Announcement,
+    DueScorePrompt,
+    Leaderboard,
+    LeaderboardPost,
+    ReminderToSend,
+)
 
 NOW = datetime(2026, 1, 2, 12, tzinfo=UTC)
 
@@ -87,8 +105,18 @@ def _channel(guild_id: int) -> SimpleNamespace:
     return SimpleNamespace(guild=SimpleNamespace(id=guild_id), send=AsyncMock())
 
 
-def _scheduler(channels: dict[tuple[int, int], object] | None = None) -> CatanScheduler:
+def _dm_user(user_id: int, *, dm_channel_id: int = 600) -> SimpleNamespace:
+    """A cached `discord.User`-shaped double that records what it was sent."""
+    message = SimpleNamespace(channel=SimpleNamespace(id=dm_channel_id), id=1000 + user_id)
+    return SimpleNamespace(id=user_id, send=AsyncMock(return_value=message))
+
+
+def _scheduler(
+    channels: dict[tuple[int, int], object] | None = None,
+    users: dict[int, object] | None = None,
+) -> CatanScheduler:
     channels = channels or {}
+    users = users or {}
 
     def get_guild(guild_id: int) -> SimpleNamespace:
         return SimpleNamespace(
@@ -101,10 +129,46 @@ def _scheduler(channels: dict[tuple[int, int], object] | None = None) -> CatanSc
     bot = SimpleNamespace(
         get_guild=Mock(side_effect=get_guild),
         fetch_channel=AsyncMock(side_effect=LookupError("channel unavailable")),
+        get_user=Mock(side_effect=lambda user_id: users.get(user_id)),
+        fetch_user=AsyncMock(side_effect=LookupError("user unavailable")),
         wait_until_ready=AsyncMock(),
         pool=pool,
     )
     return CatanScheduler(bot)  # type: ignore[arg-type]
+
+
+def _score_game(
+    game_id: int, guild_id: int, *, channel_id: int | None = 700, status: str = "pending"
+) -> GameWithParticipants:
+    game = Game(
+        game_id=game_id,
+        guild_id=guild_id,
+        season_id=None,
+        played_on=NOW.date(),
+        status=status,  # type: ignore[arg-type]
+        reported_by=900,
+        confirmed_by=None,
+        confirmed_at=None,
+        voided_by=None,
+        voided_at=None,
+        void_reason=None,
+        rejected_by=None,
+        rejected_at=None,
+        channel_id=channel_id,
+        message_id=800,
+        created_at=NOW,
+    )
+    return GameWithParticipants(game=game, winner_id=1, loser_ids=(2, 3))
+
+
+def _due_prompt(game: GameWithParticipants, user_id: int) -> DueScorePrompt:
+    return DueScorePrompt(
+        game=game,
+        user_id=user_id,
+        dm_channel_id=None,
+        dm_message_id=None,
+        delivery_status="pending",
+    )
 
 
 def test_deleted_or_unmentionable_role_is_silenced_without_fallback_mentions(
@@ -134,11 +198,13 @@ async def test_run_tick_isolates_failed_stage_and_sanitizes_logs(
     announcements = AsyncMock(return_value=[])
     reminders = AsyncMock(return_value=[])
     complete = AsyncMock(return_value=0)
+    score_prompts = AsyncMock(return_value=[])
     daily_leaderboards = AsyncMock(return_value=[])
     monkeypatch.setattr("catan_bot.scheduler.season_service.resolve_due_seasons", resolve)
     monkeypatch.setattr("catan_bot.scheduler.season_service.pending_announcements", announcements)
     monkeypatch.setattr("catan_bot.scheduler.event_service.due_reminders", reminders)
     monkeypatch.setattr("catan_bot.scheduler.event_service.complete_past_events", complete)
+    monkeypatch.setattr("catan_bot.scheduler.game_service.due_score_prompts", score_prompts)
     monkeypatch.setattr(
         "catan_bot.scheduler.leaderboard_service.due_daily_leaderboards", daily_leaderboards
     )
@@ -149,6 +215,7 @@ async def test_run_tick_isolates_failed_stage_and_sanitizes_logs(
     announcements.assert_awaited_once()
     reminders.assert_awaited_once_with(scheduler.pool, NOW)
     complete.assert_awaited_once_with(scheduler.pool, NOW)
+    score_prompts.assert_awaited_once()
     daily_leaderboards.assert_awaited_once()
     assert "RuntimeError" in caplog.text
     assert "password" not in caplog.text
@@ -170,6 +237,7 @@ async def test_overlapping_tick_is_skipped(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(scheduler, "_send_announcements", AsyncMock())
     monkeypatch.setattr(scheduler, "_send_reminders", AsyncMock())
     monkeypatch.setattr(scheduler, "_complete_events", AsyncMock())
+    monkeypatch.setattr(scheduler, "_send_score_prompts", AsyncMock())
     monkeypatch.setattr(scheduler, "_send_daily_leaderboards", AsyncMock())
 
     first = asyncio.create_task(scheduler.run_tick(NOW))
@@ -209,6 +277,7 @@ async def test_chained_postgres_stage_failure_isolated_and_safely_logged(
     announcements = AsyncMock(return_value=[])
     reminders = AsyncMock(return_value=[])
     complete = AsyncMock(return_value=0)
+    score_prompts = AsyncMock(return_value=[])
     daily_leaderboards = AsyncMock(return_value=[])
     if failing_stage == "season_lock":
         resolve.side_effect = chained
@@ -218,6 +287,7 @@ async def test_chained_postgres_stage_failure_isolated_and_safely_logged(
     monkeypatch.setattr("catan_bot.scheduler.season_service.pending_announcements", announcements)
     monkeypatch.setattr("catan_bot.scheduler.event_service.due_reminders", reminders)
     monkeypatch.setattr("catan_bot.scheduler.event_service.complete_past_events", complete)
+    monkeypatch.setattr("catan_bot.scheduler.game_service.due_score_prompts", score_prompts)
     monkeypatch.setattr(
         "catan_bot.scheduler.leaderboard_service.due_daily_leaderboards", daily_leaderboards
     )
@@ -228,6 +298,7 @@ async def test_chained_postgres_stage_failure_isolated_and_safely_logged(
     announcements.assert_awaited_once()
     reminders.assert_awaited_once()
     complete.assert_awaited_once_with(scheduler.pool, NOW)
+    score_prompts.assert_awaited_once()
     daily_leaderboards.assert_awaited_once()
     assert "23514" in caplog.text
     assert "InterfaceError" in caplog.text
@@ -586,6 +657,190 @@ async def test_send_daily_leaderboards_skips_unavailable_channel_without_raising
     await scheduler._send_daily_leaderboards(NOW)
 
     render.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Score-request chases: `_send_score_prompts` / `_send_score_prompt_group` /
+# `_send_score_prompt_dm` (Phase 6 -- claim, DM, and per-game notice).
+# ---------------------------------------------------------------------------
+
+
+def test_group_score_prompts_by_game_preserves_first_seen_order() -> None:
+    game7 = _score_game(7, 1)
+    game9 = _score_game(9, 1)
+    prompts = [
+        _due_prompt(game7, 2),
+        _due_prompt(game9, 5),
+        _due_prompt(game7, 3),
+    ]
+
+    groups = _group_score_prompts_by_game(prompts)
+
+    assert [[p.user_id for p in group] for group in groups] == [[2, 3], [5]]
+
+
+@pytest.mark.asyncio
+async def test_send_score_prompts_is_cheap_and_silent_when_nothing_is_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _scheduler()
+    due = AsyncMock(return_value=[])
+    monkeypatch.setattr("catan_bot.scheduler.game_service.due_score_prompts", due)
+
+    await scheduler._send_score_prompts(NOW)
+
+    due.assert_awaited_once_with(scheduler.pool, NOW, 50)
+
+
+@pytest.mark.asyncio
+async def test_send_score_prompts_claim_failure_is_isolated_and_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    scheduler = _scheduler()
+    due = AsyncMock(side_effect=RuntimeError("password=secret"))
+    monkeypatch.setattr("catan_bot.scheduler.game_service.due_score_prompts", due)
+
+    with caplog.at_level(logging.ERROR, logger="catan_bot.scheduler"):
+        await scheduler._send_score_prompts(NOW)
+
+    assert "RuntimeError" in caplog.text
+    assert "secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_score_prompt_dms_player_and_posts_one_channel_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    game = _score_game(7, 1, channel_id=701)
+    channel = _channel(1)
+    user = _dm_user(2)
+    scheduler = _scheduler({(1, 701): channel}, {2: user})
+    deliver = AsyncMock()
+    monkeypatch.setattr("catan_bot.scheduler.game_service.record_score_request_delivery", deliver)
+    embed = discord.Embed(title="Sheet")
+    view = discord.ui.View(timeout=None)
+    monkeypatch.setattr(
+        "catan_bot.scheduler.score_entry.build_score_entry_embed", Mock(return_value=embed)
+    )
+    monkeypatch.setattr(
+        "catan_bot.scheduler.score_entry.build_score_entry_view", Mock(return_value=view)
+    )
+
+    await scheduler._send_score_prompt_group([_due_prompt(game, 2)])
+
+    user.send.assert_awaited_once()
+    assert user.send.await_args.kwargs["embed"] is embed
+    assert user.send.await_args.kwargs["view"] is view
+    deliver.assert_awaited_once_with(
+        scheduler.pool, 1, 7, 2, channel_id=600, message_id=1002, delivered=True
+    )
+    channel.send.assert_awaited_once()
+    content = channel.send.await_args.args[0]
+    assert "<@2>" in content
+    assert "game #7" in content
+    assert channel.send.await_args.kwargs["allowed_mentions"].to_dict()["users"] == [2]
+
+
+@pytest.mark.asyncio
+async def test_score_prompt_multiple_outstanding_players_produce_one_notice_naming_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    game = _score_game(7, 1, channel_id=701)
+    channel = _channel(1)
+    users = {2: _dm_user(2), 3: _dm_user(3), 4: _dm_user(4)}
+    scheduler = _scheduler({(1, 701): channel}, users)
+    monkeypatch.setattr(
+        "catan_bot.scheduler.game_service.record_score_request_delivery", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "catan_bot.scheduler.score_entry.build_score_entry_embed",
+        Mock(return_value=discord.Embed()),
+    )
+    monkeypatch.setattr(
+        "catan_bot.scheduler.score_entry.build_score_entry_view",
+        Mock(return_value=discord.ui.View(timeout=None)),
+    )
+    prompts = [_due_prompt(game, uid) for uid in (2, 3, 4)]
+
+    await scheduler._send_score_prompt_group(prompts)
+
+    for user in users.values():
+        user.send.assert_awaited_once()
+    channel.send.assert_awaited_once()
+    content = channel.send.await_args.args[0]
+    for uid in (2, 3, 4):
+        assert f"<@{uid}>" in content
+    allowed = channel.send.await_args.kwargs["allowed_mentions"].to_dict()
+    assert allowed["users"] == [2, 3, 4]
+    assert "roles" not in allowed
+    assert "everyone" not in allowed["parse"]
+
+
+@pytest.mark.asyncio
+async def test_score_prompt_blocked_dm_is_recorded_and_does_not_stop_other_players(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    game = _score_game(7, 1, channel_id=701)
+    channel = _channel(1)
+    blocked_user = SimpleNamespace(
+        id=2,
+        send=AsyncMock(
+            side_effect=discord.HTTPException(
+                SimpleNamespace(status=403, reason="Forbidden"), "closed DMs"
+            )
+        ),
+    )
+    ok_user = _dm_user(3)
+    scheduler = _scheduler({(1, 701): channel}, {2: blocked_user, 3: ok_user})
+    deliver = AsyncMock()
+    monkeypatch.setattr("catan_bot.scheduler.game_service.record_score_request_delivery", deliver)
+    monkeypatch.setattr(
+        "catan_bot.scheduler.score_entry.build_score_entry_embed",
+        Mock(return_value=discord.Embed()),
+    )
+    monkeypatch.setattr(
+        "catan_bot.scheduler.score_entry.build_score_entry_view",
+        Mock(return_value=discord.ui.View(timeout=None)),
+    )
+
+    await scheduler._send_score_prompt_group([_due_prompt(game, 2), _due_prompt(game, 3)])
+
+    blocked_user.send.assert_awaited_once()
+    ok_user.send.assert_awaited_once()
+    assert deliver.await_count == 2
+    deliver.assert_any_await(
+        scheduler.pool, 1, 7, 2, channel_id=None, message_id=None, delivered=False
+    )
+    deliver.assert_any_await(
+        scheduler.pool, 1, 7, 3, channel_id=600, message_id=1003, delivered=True
+    )
+    # The notice still names both outstanding players, blocked or not.
+    channel.send.assert_awaited_once()
+    content = channel.send.await_args.args[0]
+    assert "<@2>" in content
+    assert "<@3>" in content
+
+
+@pytest.mark.asyncio
+async def test_score_prompt_one_games_failure_does_not_block_another(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    scheduler = _scheduler()
+    game7 = _score_game(7, 1)
+    game9 = _score_game(9, 1)
+    prompts = [_due_prompt(game7, 2), _due_prompt(game9, 5)]
+    monkeypatch.setattr(
+        "catan_bot.scheduler.game_service.due_score_prompts", AsyncMock(return_value=prompts)
+    )
+    send_group = AsyncMock(side_effect=[RuntimeError("password=secret"), None])
+    monkeypatch.setattr(scheduler, "_send_score_prompt_group", send_group)
+
+    with caplog.at_level(logging.ERROR, logger="catan_bot.scheduler"):
+        await scheduler._send_score_prompts(NOW)
+
+    assert send_group.await_count == 2
+    assert "RuntimeError" in caplog.text
+    assert "secret" not in caplog.text
 
 
 @pytest.mark.asyncio

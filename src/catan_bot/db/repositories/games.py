@@ -161,6 +161,17 @@ FROM games
 WHERE guild_id = $1 AND game_id = $2
 """
 
+# `AND (status <> 'voided' OR $3)` is a parameterized predicate inside this
+# one statement, not a second query text branched on in Python: the SQL
+# guard (tests/static/sql_guard.py) requires every sink argument to be a
+# single sound module-level constant, so "compose one of two statements
+# depending on include_voided" is not an option here the way it might be in
+# a codebase without that rule. `$3=true` makes the OR always true (every
+# status passes); `$3=false` (the default caller behavior) keeps only
+# non-voided rows. Filtering happens in this WHERE clause -- before
+# `LIMIT $2` -- rather than in Python after the fetch, so hiding voided
+# games can never starve a capped history of real games that would
+# otherwise have fit within the limit.
 _LIST_RECENT_GAMES_SQL = """
 SELECT game_id, guild_id, season_id, played_on, status, reported_by, confirmed_by,
        confirmed_at, voided_by, voided_at, void_reason, rejected_by, rejected_at,
@@ -168,7 +179,7 @@ SELECT game_id, guild_id, season_id, played_on, status, reported_by, confirmed_b
        target_points, played_at, played_timezone, revision, updated_by, updated_at,
        update_reason
 FROM games
-WHERE guild_id = $1
+WHERE guild_id = $1 AND (status <> 'voided' OR $3)
 ORDER BY played_on DESC, played_at DESC NULLS LAST, game_id DESC
 LIMIT $2
 """
@@ -181,7 +192,7 @@ SELECT g.game_id, g.guild_id, g.season_id, g.played_on, g.status, g.reported_by,
        g.played_timezone, g.revision, g.updated_by, g.updated_at, g.update_reason
 FROM games g
 JOIN game_participants p ON p.game_id = g.game_id AND p.guild_id = g.guild_id
-WHERE g.guild_id = $1 AND p.user_id = $2 AND p.is_active
+WHERE g.guild_id = $1 AND p.user_id = $2 AND p.is_active AND (g.status <> 'voided' OR $4)
 ORDER BY g.played_on DESC, g.played_at DESC NULLS LAST, g.game_id DESC
 LIMIT $3
 """
@@ -304,6 +315,12 @@ def _require_game_type(value: object) -> str:
 def _require_extension(value: object) -> bool:
     if type(value) is not bool:
         raise ValueError(f"extension_5_6 must be a bool, got {value!r} ({type(value).__name__})")
+    return value
+
+
+def _require_bool(value: object, *, name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a bool, got {value!r} ({type(value).__name__})")
     return value
 
 
@@ -868,20 +885,33 @@ async def void_game(
     return "not_pending_or_confirmed"
 
 
-async def list_recent_games(conn: asyncpg.Connection, guild_id: int, limit: int) -> list[Game]:
+async def list_recent_games(
+    conn: asyncpg.Connection, guild_id: int, limit: int, *, include_voided: bool = False
+) -> list[Game]:
+    """Most recent games, newest first. Voided games are excluded unless `include_voided`."""
     require_id(guild_id, name="guild_id")
     require_limit(limit)
-    rows = await conn.fetch(_LIST_RECENT_GAMES_SQL, guild_id, limit)
+    include_voided = _require_bool(include_voided, name="include_voided")
+    rows = await conn.fetch(_LIST_RECENT_GAMES_SQL, guild_id, limit, include_voided)
     return [_row_to_game(row) for row in rows]
 
 
 async def list_recent_games_for_player(
-    conn: asyncpg.Connection, guild_id: int, user_id: int, limit: int
+    conn: asyncpg.Connection,
+    guild_id: int,
+    user_id: int,
+    limit: int,
+    *,
+    include_voided: bool = False,
 ) -> list[Game]:
+    """`list_recent_games`, restricted to games `user_id` took part in."""
     require_id(guild_id, name="guild_id")
     require_id(user_id, name="user_id")
     require_limit(limit)
-    rows = await conn.fetch(_LIST_RECENT_GAMES_FOR_PLAYER_SQL, guild_id, user_id, limit)
+    include_voided = _require_bool(include_voided, name="include_voided")
+    rows = await conn.fetch(
+        _LIST_RECENT_GAMES_FOR_PLAYER_SQL, guild_id, user_id, limit, include_voided
+    )
     return [_row_to_game(row) for row in rows]
 
 

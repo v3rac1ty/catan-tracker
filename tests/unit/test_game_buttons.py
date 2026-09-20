@@ -7,6 +7,7 @@ import discord
 import pytest
 
 from catan_bot.services.context import Actor
+from catan_bot.services.errors import ConflictError, PermissionDeniedError
 from catan_bot.views import game_confirm
 
 
@@ -14,9 +15,27 @@ def _interaction() -> SimpleNamespace:
     return SimpleNamespace(
         guild_id=123,
         client=SimpleNamespace(pool="pool"),
-        response=SimpleNamespace(defer=AsyncMock()),
+        message=SimpleNamespace(edit=AsyncMock()),
+        response=SimpleNamespace(
+            defer=AsyncMock(), send_message=AsyncMock(), edit_message=AsyncMock()
+        ),
+        edit_original_response=AsyncMock(),
+        original_response=AsyncMock(return_value=SimpleNamespace(edit=AsyncMock())),
+    )
+
+
+def _dialog_interaction(*, user_id: int = 456) -> SimpleNamespace:
+    """A follow-up interaction on the ephemeral "confirm anyway" dialog itself."""
+    return SimpleNamespace(
+        user=SimpleNamespace(id=user_id),
+        client=SimpleNamespace(pool="pool"),
+        response=SimpleNamespace(edit_message=AsyncMock(), send_message=AsyncMock()),
         edit_original_response=AsyncMock(),
     )
+
+
+def _preflight_status(*, complete: bool, outstanding: tuple[int, ...] = ()) -> SimpleNamespace:
+    return SimpleNamespace(complete=complete, outstanding_ids=outstanding)
 
 
 def test_game_action_view_is_persistent_and_has_stable_ids() -> None:
@@ -71,6 +90,12 @@ async def test_button_defers_then_updates_original_message(
     service.side_effect = transition
     monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
     monkeypatch.setattr(game_confirm.game_service, service_name, service)
+    if action == "confirm":
+        monkeypatch.setattr(
+            game_confirm.game_service,
+            "confirm_preflight",
+            AsyncMock(return_value=_preflight_status(complete=True)),
+        )
     monkeypatch.setattr(
         game_confirm.formatting, "build_game_status_embed", lambda _: discord.Embed(title="Done")
     )
@@ -122,6 +147,11 @@ async def test_button_edit_failure_uses_shared_error_handler(
     handler = AsyncMock()
     monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
     monkeypatch.setattr(game_confirm, "handle_interaction_error", handler)
+    monkeypatch.setattr(
+        game_confirm.game_service,
+        "confirm_preflight",
+        AsyncMock(return_value=_preflight_status(complete=True)),
+    )
     monkeypatch.setattr(game_confirm.game_service, "confirm_game", AsyncMock(return_value=object()))
     monkeypatch.setattr(
         game_confirm.formatting, "build_game_status_embed", lambda _: discord.Embed(title="Done")
@@ -131,6 +161,230 @@ async def test_button_edit_failure_uses_shared_error_handler(
 
     handler.assert_awaited_once()
     assert isinstance(handler.await_args.args[1], discord.HTTPException)
+
+
+# ---------------------------------------------------------------------------
+# GameActionButton confirm: partial-collection "confirm anyway" dialog (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_confirm_button_completes_in_one_click_when_collection_is_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_confirm.game_service,
+        "confirm_preflight",
+        AsyncMock(return_value=_preflight_status(complete=True)),
+    )
+    confirm = AsyncMock(return_value=object())
+    monkeypatch.setattr(game_confirm.game_service, "confirm_game", confirm)
+    monkeypatch.setattr(
+        game_confirm.formatting, "build_game_status_embed", lambda _: discord.Embed(title="Done")
+    )
+
+    await game_confirm.GameActionButton(42, "confirm").callback(interaction)
+
+    interaction.response.send_message.assert_not_awaited()
+    interaction.response.defer.assert_awaited_once_with()
+    confirm.assert_awaited_once_with("pool", 123, 42, actor)
+    interaction.edit_original_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_confirm_button_shows_dialog_and_does_not_confirm_when_collection_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_confirm.game_service,
+        "confirm_preflight",
+        AsyncMock(return_value=_preflight_status(complete=False, outstanding=(2, 3))),
+    )
+    confirm = AsyncMock()
+    monkeypatch.setattr(game_confirm.game_service, "confirm_game", confirm)
+
+    await game_confirm.GameActionButton(42, "confirm").callback(interaction)
+
+    confirm.assert_not_awaited()
+    interaction.response.defer.assert_not_awaited()
+    interaction.edit_original_response.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+    content = interaction.response.send_message.await_args.args[0]
+    assert "<@2>" in content
+    assert "<@3>" in content
+    assert "haven't entered their points" in content
+    kwargs = interaction.response.send_message.await_args.kwargs
+    assert kwargs["ephemeral"] is True
+    assert isinstance(kwargs["view"], game_confirm._ConfirmAnywayView)
+
+
+@pytest.mark.asyncio
+async def test_confirm_button_reporter_gets_permission_error_not_a_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
+    error = PermissionDeniedError("You reported this game, so another player has to confirm it.")
+    monkeypatch.setattr(
+        game_confirm.game_service, "confirm_preflight", AsyncMock(side_effect=error)
+    )
+    handler = AsyncMock()
+    monkeypatch.setattr(game_confirm, "handle_interaction_error", handler)
+
+    await game_confirm.GameActionButton(42, "confirm").callback(interaction)
+
+    interaction.response.send_message.assert_not_awaited()
+    handler.assert_awaited_once()
+    assert handler.await_args.args[1] is error
+    assert handler.await_args.kwargs == {"command_name": "game:confirm"}
+
+
+@pytest.mark.asyncio
+async def test_confirm_button_non_participant_gets_permission_error_not_a_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
+    error = PermissionDeniedError("Only a player in that game can confirm it.")
+    monkeypatch.setattr(
+        game_confirm.game_service, "confirm_preflight", AsyncMock(side_effect=error)
+    )
+    handler = AsyncMock()
+    monkeypatch.setattr(game_confirm, "handle_interaction_error", handler)
+
+    await game_confirm.GameActionButton(42, "confirm").callback(interaction)
+
+    interaction.response.send_message.assert_not_awaited()
+    handler.assert_awaited_once()
+    assert handler.await_args.args[1] is error
+    assert handler.await_args.kwargs == {"command_name": "game:confirm"}
+
+
+@pytest.mark.asyncio
+async def test_confirm_anyway_confirms_and_edits_the_public_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    public_message = SimpleNamespace(edit=AsyncMock())
+    view = game_confirm._ConfirmAnywayView(
+        guild_id=123, game_id=42, actor=actor, public_message=public_message
+    )
+    updated = object()
+    confirm = AsyncMock(return_value=updated)
+    monkeypatch.setattr(game_confirm.game_service, "confirm_game", confirm)
+    monkeypatch.setattr(
+        game_confirm.formatting, "build_game_status_embed", lambda _: discord.Embed(title="Done")
+    )
+    post_leaderboard = AsyncMock()
+    monkeypatch.setattr(game_confirm, "_post_leaderboard_after_confirm", post_leaderboard)
+    interaction = _dialog_interaction(user_id=456)
+
+    await view.confirm_anyway(interaction)
+
+    confirm.assert_awaited_once_with("pool", 123, 42, actor)
+    public_message.edit.assert_awaited_once()
+    assert public_message.edit.await_args.kwargs["view"] is None
+    interaction.edit_original_response.assert_awaited_once()
+    assert interaction.edit_original_response.await_args.kwargs["view"] is None
+    post_leaderboard.assert_awaited_once_with(interaction.client, 123)
+    assert all(child.disabled for child in view.children)
+
+
+@pytest.mark.asyncio
+async def test_confirm_anyway_falls_back_to_resolving_the_public_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When `interaction.message` wasn't captured, fall back to the game's stored ids."""
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    view = game_confirm._ConfirmAnywayView(
+        guild_id=123, game_id=42, actor=actor, public_message=None
+    )
+    resolved_message = SimpleNamespace(edit=AsyncMock())
+    updated = SimpleNamespace(game=SimpleNamespace(game_id=42, channel_id=700, message_id=800))
+    monkeypatch.setattr(game_confirm.game_service, "confirm_game", AsyncMock(return_value=updated))
+    monkeypatch.setattr(
+        game_confirm.formatting, "build_game_status_embed", lambda _: discord.Embed(title="Done")
+    )
+    monkeypatch.setattr(game_confirm, "_post_leaderboard_after_confirm", AsyncMock())
+    interaction = _dialog_interaction(user_id=456)
+    interaction.client = SimpleNamespace(
+        pool="pool",
+        get_channel=lambda _cid: None,
+        fetch_channel=AsyncMock(
+            return_value=SimpleNamespace(fetch_message=AsyncMock(return_value=resolved_message))
+        ),
+    )
+
+    await view.confirm_anyway(interaction)
+
+    resolved_message.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_confirm_anyway_cancel_leaves_the_game_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    view = game_confirm._ConfirmAnywayView(
+        guild_id=123, game_id=42, actor=actor, public_message=SimpleNamespace(edit=AsyncMock())
+    )
+    confirm = AsyncMock()
+    monkeypatch.setattr(game_confirm.game_service, "confirm_game", confirm)
+    interaction = _dialog_interaction(user_id=456)
+
+    await view.cancel(interaction)
+
+    confirm.assert_not_awaited()
+    interaction.response.edit_message.assert_awaited_once()
+    assert "Cancelled" in interaction.response.edit_message.await_args.kwargs["content"]
+    assert all(child.disabled for child in view.children)
+
+
+@pytest.mark.asyncio
+async def test_confirm_anyway_dialog_is_owner_locked(monkeypatch: pytest.MonkeyPatch) -> None:
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    view = game_confirm._ConfirmAnywayView(
+        guild_id=123, game_id=42, actor=actor, public_message=SimpleNamespace(edit=AsyncMock())
+    )
+    interaction = _dialog_interaction(user_id=999)
+
+    allowed = await view.interaction_check(interaction)
+
+    assert allowed is False
+    interaction.response.send_message.assert_awaited_once()
+    assert "clicked Confirm" in interaction.response.send_message.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_confirm_anyway_reports_a_stale_game_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Someone else confirmed/rejected/voided the game between the two clicks."""
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    public_message = SimpleNamespace(edit=AsyncMock())
+    view = game_confirm._ConfirmAnywayView(
+        guild_id=123, game_id=42, actor=actor, public_message=public_message
+    )
+    error = ConflictError("That game has already been confirmed, rejected, or voided.")
+    monkeypatch.setattr(game_confirm.game_service, "confirm_game", AsyncMock(side_effect=error))
+    handler = AsyncMock()
+    monkeypatch.setattr(game_confirm, "handle_interaction_error", handler)
+    interaction = _dialog_interaction(user_id=456)
+
+    await view.confirm_anyway(interaction)
+
+    handler.assert_awaited_once()
+    assert handler.await_args.args[1] is error
+    assert handler.await_args.kwargs == {"command_name": "game:confirm-anyway"}
+    public_message.edit.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +502,12 @@ async def test_leaderboard_post_fires_only_on_confirm_not_reject(
     actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
     monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
     monkeypatch.setattr(game_confirm.game_service, service_name, AsyncMock(return_value=object()))
+    if action == "confirm":
+        monkeypatch.setattr(
+            game_confirm.game_service,
+            "confirm_preflight",
+            AsyncMock(return_value=_preflight_status(complete=True)),
+        )
     monkeypatch.setattr(
         game_confirm.formatting, "build_game_status_embed", lambda _: discord.Embed(title="Done")
     )

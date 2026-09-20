@@ -355,13 +355,16 @@ class GameCog(commands.Cog):
 
     @game_group.command(name="history", description="Show recent games.")
     @app_commands.describe(
-        member="Only show this player's games.", limit="How many games to show (1-25)."
+        member="Only show this player's games.",
+        limit="How many games to show (1-25).",
+        include_voided="Include voided games. Defaults to hiding them.",
     )
     async def history_command(
         self,
         interaction: discord.Interaction,
         member: discord.Member | None = None,
         limit: app_commands.Range[int, 1, 25] | None = None,
+        include_voided: bool = False,
     ) -> None:
         guild_id = guild_id_from_interaction(interaction)
         await interaction.response.defer(thinking=True)
@@ -370,6 +373,7 @@ class GameCog(commands.Cog):
             guild_id,
             user_id=member.id if member is not None else None,
             limit=limit or _DEFAULT_HISTORY_LIMIT,
+            include_voided=include_voided,
         )
         embed = formatting.build_game_history_embed(
             games, member_id=member.id if member is not None else None

@@ -1,18 +1,24 @@
 """`/config` -- announcement channel, timezone, admin role, and a read-back.
 
-Every subcommand is thin: build an `Actor`, call one `config_service`
+Most subcommands are thin: build an `Actor`, call one `config_service`
 function with the guild id from the interaction, render the result with
 `formatting`, respond. `/config show` additionally requires Manage Server
 itself before reading the config back (`context.require_manage_guild`,
 called directly here since `config_service.get_config` has no actor check
 of its own -- this is the M4 requirement the M3b audit added).
+
+`/config leaderboard` is the exception: every option but `mode` is optional,
+and an omitted one must leave that field's stored value alone rather than
+resetting it to a default -- see `leaderboard_command`'s own comments for
+how that "only pass what was actually supplied" behavior is built, and
+`config_service.set_leaderboard_settings`'s docstring for how it is
+threaded down to the repository layer.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from datetime import time
 from functools import cache
 from importlib.resources import files
 
@@ -44,7 +50,6 @@ _LEADERBOARD_SCOPE_CHOICES = [
     app_commands.Choice(name="season", value="season"),
     app_commands.Choice(name="all-time", value="all_time"),
 ]
-_DEFAULT_LEADERBOARD_TIME = time(22, 0)
 _NO_LEADERBOARD_CHANNEL = (
     "Choose a channel, or configure an announcement channel first with /config channel."
 )
@@ -198,9 +203,12 @@ class ConfigCog(commands.Cog):
     )
     @app_commands.describe(
         mode="off: never post. per-game: after every confirmed game. daily: once a day.",
-        channel="Where to post it. Defaults to the announcement channel.",
-        scope="season or all-time standings. Defaults to season.",
-        time="Local time for the daily post (HH:MM or h:MMam/pm). Defaults to 10:00 PM.",
+        channel="Where to post it. Omitted leaves the current channel (or, if none has "
+        "ever been set, falls back to the announcement channel).",
+        scope="season or all-time standings. Omitted leaves the current scope.",
+        time="Local time for the daily post (h:MMam/pm, e.g. 7:30pm, or 24-hour HH:MM). "
+        "Omitted leaves the current time -- 10:00 PM the first time this is configured.",
+        clear_channel="Clear the configured leaderboard channel instead of setting one.",
     )
     @app_commands.choices(mode=_LEADERBOARD_MODE_CHOICES, scope=_LEADERBOARD_SCOPE_CHOICES)
     async def leaderboard_command(
@@ -210,45 +218,63 @@ class ConfigCog(commands.Cog):
         channel: discord.TextChannel | None = None,
         scope: app_commands.Choice[str] | None = None,
         time: app_commands.Range[str, 1, 16] | None = None,
+        clear_channel: bool = False,
     ) -> None:
         actor = actor_from_interaction(interaction)
         guild_id = guild_id_from_interaction(interaction)
         # Checked up front (matching /config show's own explicit check):
-        # this command both reads back the announce-channel fallback below
-        # and writes, so gating it before either happens avoids doing any
-        # work -- including a Discord permission probe -- for someone who
-        # isn't allowed to change this in the first place.
+        # this command both may read the current config below and always
+        # writes, so gating it before either happens avoids doing any work
+        # -- including a Discord permission probe -- for someone who isn't
+        # allowed to change this in the first place.
         require_manage_guild(actor)
 
-        scope_value = scope.value if scope is not None else "season"
-        daily_time = parse_time(time) if time is not None else _DEFAULT_LEADERBOARD_TIME
-
-        # "channel unset -> fall back to the announcement channel" applies
-        # every time this command runs, regardless of mode: there is no
-        # separate, remembered "leaderboard channel" to fall back to
-        # instead, by design -- every call fully replaces every setting.
-        destination = channel
-        if destination is None:
-            current = await config_service.get_config(self.bot.pool, guild_id)
-            if current.announce_channel_id is not None and interaction.guild is not None:
-                destination = interaction.guild.get_channel(current.announce_channel_id)
-        if destination is not None:
-            validate_publish_channel(interaction, destination)
-        elif mode.value != "off":
-            # A disabled post never sends anything, so it's the one mode
-            # that doesn't need a resolvable destination at all.
+        if channel is not None and clear_channel:
+            raise DomainValidationError("Choose either a channel or clear_channel, not both.")
+        if clear_channel and mode.value != "off":
+            # Mirrors the "no destination" check below: a mode that posts
+            # somewhere can't be saved with no channel at all.
             raise DomainValidationError(_NO_LEADERBOARD_CHANNEL)
-        channel_id = destination.id if destination is not None else None
+
+        # Every option except `mode` is genuinely optional, matching
+        # `/game update`'s "omitted means unchanged" convention: a kwarg
+        # this cog never adds to `settings_kwargs` is never passed to
+        # `config_service.set_leaderboard_settings` at all, so that field's
+        # already-stored value survives untouched (see that function's
+        # docstring for how the omission is threaded down to the repository
+        # layer's own partial-update sentinel).
+        settings_kwargs: dict[str, object] = {}
+        if scope is not None:
+            settings_kwargs["scope"] = scope.value
+        if time is not None:
+            settings_kwargs["daily_time"] = parse_time(time)
+        if channel is not None:
+            validate_publish_channel(interaction, channel)
+            settings_kwargs["channel_id"] = channel.id
+        elif clear_channel:
+            settings_kwargs["channel_id"] = None
+
+        if "channel_id" not in settings_kwargs and mode.value != "off":
+            # The channel is being left as-is. That's fine as long as one is
+            # already on file; if a leaderboard channel has never been
+            # configured, fall back to the announcement channel (the same
+            # first-time convenience this command has always offered) so
+            # this mode has somewhere to post. Only reached for a mode that
+            # actually needs a destination, and only costs the extra read
+            # in that case.
+            current = await config_service.get_config(self.bot.pool, guild_id)
+            if current.leaderboard_channel_id is None:
+                fallback = None
+                if current.announce_channel_id is not None and interaction.guild is not None:
+                    fallback = interaction.guild.get_channel(current.announce_channel_id)
+                if fallback is None:
+                    raise DomainValidationError(_NO_LEADERBOARD_CHANNEL)
+                validate_publish_channel(interaction, fallback)
+                settings_kwargs["channel_id"] = fallback.id
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         config = await config_service.set_leaderboard_settings(
-            self.bot.pool,
-            guild_id,
-            actor,
-            mode=mode.value,
-            channel_id=channel_id,
-            scope=scope_value,
-            daily_time=daily_time,
+            self.bot.pool, guild_id, actor, mode=mode.value, **settings_kwargs
         )
         embed = formatting.build_config_show_embed(config)
         await interaction.edit_original_response(

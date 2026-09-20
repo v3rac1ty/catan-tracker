@@ -10,21 +10,37 @@ status, so it has nothing in common with `_confirm_result_error`/
 so the buttons keep working after a restart -- discord.py reconstructs a
 fresh instance from the `custom_id` alone (via `from_custom_id`) every time
 one is pressed, with no persisted Python state in between.
+
+Phase 5: since scores now arrive gradually via per-player DMs, a Confirm
+click can land before every participant has submitted. `GameActionButton`
+confirms immediately, with no extra step, once collection is complete --
+but for a partial roster it shows `_ConfirmAnywayView`, an ephemeral,
+owner-locked second step naming who hasn't submitted yet. That dialog is
+deliberately a plain `discord.ui.View`, *not* a `DynamicItem`: it lives only
+as long as the interaction token that created it (about 15 minutes, and
+this one times out itself well before that), so nothing is gained -- and
+restart-durability would be misleadingly implied -- by making it
+`custom_id`-addressed like the persistent buttons above.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
+from contextlib import suppress
 from time import monotonic
-from typing import Literal
+from typing import Any, Literal
 
 import discord
 
 from catan_bot import formatting
+from catan_bot.db.models import GameWithParticipants
 from catan_bot.errors import handle_interaction_error
 from catan_bot.permissions import actor_from_interaction, guild_id_from_interaction
 from catan_bot.services import game_service, leaderboard_service
+from catan_bot.services.context import Actor
 from catan_bot.services.errors import PermissionDeniedError
+from catan_bot.services.results import ScoreCollectionStatus
 
 _CUSTOM_ID_TEMPLATE = re.compile(r"game:(?P<action>confirm|reject):(?P<id>[0-9]{1,19})")
 _NUDGE_CUSTOM_ID_TEMPLATE = re.compile(r"game:nudge:(?P<id>[0-9]{1,19})")
@@ -37,6 +53,9 @@ _STYLES: dict[str, discord.ButtonStyle] = {
     "reject": discord.ButtonStyle.danger,
 }
 _LABELS: dict[str, str] = {"confirm": "Confirm", "reject": "Reject"}
+
+_CONFIRM_ANYWAY_TIMEOUT_SECONDS = 120.0
+_DIALOG_WRONG_OWNER_TEXT = "Only the person who clicked Confirm can respond to this."
 
 
 GameAction = Literal["confirm", "reject"]
@@ -101,6 +120,23 @@ class GameActionButton(discord.ui.DynamicItem[discord.ui.Button], template=_CUST
             if not (1 <= self.game_id <= _BIGINT_MAX):
                 raise ValueError("game action button has an invalid game id")
             pool = interaction.client.pool  # type: ignore[attr-defined]
+
+            if self.action == "confirm":
+                # Permission is decided here, before anything is shown, so a
+                # reporter or non-participant gets the same permission error
+                # `confirm_game` would raise instead of a confirmation
+                # prompt for an action they were never allowed to take.
+                status = await game_service.confirm_preflight(pool, guild_id, self.game_id, actor)
+                if not status.complete:
+                    await _prompt_confirm_anyway(
+                        interaction,
+                        guild_id=guild_id,
+                        game_id=self.game_id,
+                        actor=actor,
+                        status=status,
+                    )
+                    return
+
             await interaction.response.defer()
             if self.action == "confirm":
                 updated = await game_service.confirm_game(pool, guild_id, self.game_id, actor)
@@ -117,6 +153,185 @@ class GameActionButton(discord.ui.DynamicItem[discord.ui.Button], template=_CUST
                 await _post_leaderboard_after_confirm(interaction.client, guild_id)
         except Exception as exc:  # routed through the shared handler below
             await handle_interaction_error(interaction, exc, command_name=f"game:{self.action}")
+
+
+def _list_mentions(user_ids: Sequence[int]) -> str:
+    """A natural-language mention list: "@A", "@A and @B", or "@A, @B, and @C"."""
+    names = [formatting.mention(uid) for uid in user_ids]
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return ", ".join(names[:-1]) + f", and {names[-1]}"
+
+
+async def _prompt_confirm_anyway(
+    interaction: discord.Interaction,
+    *,
+    guild_id: int,
+    game_id: int,
+    actor: Actor,
+    status: ScoreCollectionStatus,
+) -> None:
+    """Show the ephemeral "confirm anyway" second step for a partially-scored game.
+
+    Only ever reached once `game_service.confirm_preflight` has already
+    confirmed `actor` is allowed to confirm this game -- this function's
+    only job is the extra click, never a permission decision. The dialog
+    captures `interaction.message` -- the *public* message the Confirm
+    button lives on -- so its own buttons can edit that message directly
+    rather than `edit_original_response`, which would only ever reach this
+    new ephemeral dialog. See `_ConfirmAnywayView`.
+    """
+    outstanding = status.outstanding_ids
+    verb = "hasn't" if len(outstanding) == 1 else "haven't"
+    content = (
+        f"{_list_mentions(outstanding)} {verb} entered their points yet. "
+        "Confirm anyway and save the game with partial scores?"
+    )
+    view = _ConfirmAnywayView(
+        guild_id=guild_id, game_id=game_id, actor=actor, public_message=interaction.message
+    )
+    await interaction.response.send_message(
+        content, view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+    )
+    view.message = await interaction.original_response()
+
+
+async def _resolve_public_message(
+    client: object, public_message: discord.Message | None, game: GameWithParticipants
+) -> discord.Message:
+    """The public game message to edit after a delayed ("Confirm anyway") confirm.
+
+    Prefers `public_message`, captured from the interaction that first
+    showed the dialog -- ordinarily just the message the Confirm button
+    lives on. If that reference is unavailable, it's re-resolved the same
+    way `views/score_entry.py`'s `_refresh_public_message` does: from the
+    game's own stored `channel_id`/`message_id`, never from anything
+    client-supplied. Unlike that helper this is *not* best-effort:
+    `confirm_game` has already durably committed by the time this runs, so
+    a failure here should surface to the user (via the caller's error
+    handler) rather than silently leaving a stale Confirm button on an
+    already-confirmed game.
+    """
+    if public_message is not None:
+        return public_message
+    channel_id, message_id = game.game.channel_id, game.game.message_id
+    if channel_id is None or message_id is None:
+        raise RuntimeError(f"game {game.game.game_id} has no stored public message to update")
+    channel = client.get_channel(channel_id)  # type: ignore[attr-defined]
+    if channel is None:
+        channel = await client.fetch_channel(channel_id)  # type: ignore[attr-defined]
+    return await channel.fetch_message(message_id)
+
+
+class _ConfirmAnywayButton(discord.ui.Button[Any]):
+    def __init__(self, dialog: _ConfirmAnywayView) -> None:
+        self.dialog = dialog
+        super().__init__(style=discord.ButtonStyle.success, label="Confirm anyway")
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.dialog.confirm_anyway(interaction)
+
+
+class _CancelConfirmButton(discord.ui.Button[Any]):
+    def __init__(self, dialog: _ConfirmAnywayView) -> None:
+        self.dialog = dialog
+        super().__init__(style=discord.ButtonStyle.secondary, label="Cancel")
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.dialog.cancel(interaction)
+
+
+class _ConfirmAnywayView(discord.ui.View):
+    """The ephemeral, owner-locked second step for confirming a partial game.
+
+    Scoped to the single click that created it: `owner_id` gates every
+    button via `interaction_check`, and both buttons disable themselves
+    (immediately on use, or via `on_timeout`) so this can't be used twice or
+    left clickable indefinitely. `public_message` is the message this
+    dialog's own success path must edit -- never `edit_original_response`
+    here, which would only reach this ephemeral message, not the public one
+    the persistent Confirm button lives on.
+    """
+
+    def __init__(
+        self,
+        *,
+        guild_id: int,
+        game_id: int,
+        actor: Actor,
+        public_message: discord.Message | None,
+    ) -> None:
+        super().__init__(timeout=_CONFIRM_ANYWAY_TIMEOUT_SECONDS)
+        self.guild_id = guild_id
+        self.game_id = game_id
+        self.actor = actor
+        self.owner_id = actor.user_id
+        self.public_message = public_message
+        self.message: discord.Message | None = None
+        self.add_item(_ConfirmAnywayButton(self))
+        self.add_item(_CancelConfirmButton(self))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user is not None and interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            _DIALOG_WRONG_OWNER_TEXT,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return False
+
+    def _disable_all(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+
+    async def on_timeout(self) -> None:
+        self._disable_all()
+        if self.message is not None:
+            with suppress(discord.HTTPException):
+                await self.message.edit(view=self)
+
+    async def confirm_anyway(self, interaction: discord.Interaction) -> None:
+        try:
+            self._disable_all()
+            await interaction.response.edit_message(view=self)
+            pool = interaction.client.pool  # type: ignore[attr-defined]
+            updated = await game_service.confirm_game(pool, self.guild_id, self.game_id, self.actor)
+            embed = formatting.build_game_status_embed(updated)
+            public_message = await _resolve_public_message(
+                interaction.client, self.public_message, updated
+            )
+            await public_message.edit(
+                embed=embed, view=None, allowed_mentions=discord.AllowedMentions.none()
+            )
+            await interaction.edit_original_response(
+                content="Confirmed -- game saved with partial scores.",
+                view=None,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            # The game is already durably confirmed above -- this is purely
+            # a best-effort extra post from here on, exactly as it is on the
+            # direct (no-dialog) Confirm path.
+            await _post_leaderboard_after_confirm(interaction.client, self.guild_id)
+        except Exception as exc:
+            await handle_interaction_error(interaction, exc, command_name="game:confirm-anyway")
+        finally:
+            self.stop()
+
+    async def cancel(self, interaction: discord.Interaction) -> None:
+        try:
+            self._disable_all()
+            await interaction.response.edit_message(
+                content="Cancelled -- the game stays pending.", view=self
+            )
+        except Exception as exc:
+            await handle_interaction_error(
+                interaction, exc, command_name="game:confirm-anyway-cancel"
+            )
+        finally:
+            self.stop()
 
 
 # In-memory, per-game nudge cooldown (Phase 2). `time.monotonic` is exactly

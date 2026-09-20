@@ -24,7 +24,7 @@ MAX_TIMEZONE_INPUT_LEN = 64
 _UTC = ZoneInfo("UTC")
 
 _DATE_FORMAT_HINT = "Use YYYY-MM-DD or MM/DD/YYYY (or 'today' / 'yesterday')."
-_TIME_FORMAT_HINT = "Use 24-hour HH:MM (e.g. 19:30) or 12-hour h:MMam/pm (e.g. 7:30pm)."
+_TIME_FORMAT_HINT = "Use 12-hour h:MMam/pm (e.g. 7:30pm) or 24-hour HH:MM (e.g. 19:30)."
 _TIMEZONE_HINT = "That isn't a recognized timezone name. Pick one from the list."
 _OUT_OF_RANGE_HINT = "That date or time is too far in the past or future to schedule."
 

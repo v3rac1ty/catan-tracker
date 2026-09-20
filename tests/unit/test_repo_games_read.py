@@ -1,9 +1,11 @@
-"""Unit coverage for the atomic game-details read."""
+"""Unit coverage for the atomic game-details read and the recent-games listings."""
 
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from typing import Any
+
+import pytest
 
 from catan_bot.db.repositories import games
 from catan_bot.domain.scoring import PlayerScore, ScoreEntry
@@ -93,3 +95,68 @@ async def test_get_game_unknown_game_uses_one_fetchrow() -> None:
 
     assert await games.get_game(conn, 20, 404) is None  # type: ignore[arg-type]
     assert conn.fetchrow_calls == [(games._SELECT_GAME_SQL, (20, 404))]
+
+
+# ---------------------------------------------------------------------------
+# list_recent_games / list_recent_games_for_player: `include_voided` threading.
+#
+# The voided-status filter lives inside the single statement as a
+# parameterized predicate (`AND (status <> 'voided' OR $n)`), not a second
+# query text chosen in Python -- these tests only prove the right boolean
+# reaches the right positional argument; the filter's actual SQL semantics
+# (that hiding voided games doesn't starve the limit) is covered against a
+# real database in tests/integration/test_repo_games.py, since a fake
+# connection can't exercise real WHERE/LIMIT interaction.
+# ---------------------------------------------------------------------------
+
+
+class _ListConnection:
+    def __init__(self) -> None:
+        self.fetch_calls: list[tuple[object, tuple[object, ...]]] = []
+
+    async def fetch(self, query: object, *args: object) -> list[dict[str, object]]:
+        self.fetch_calls.append((query, args))
+        return []
+
+
+async def test_list_recent_games_defaults_to_excluding_voided() -> None:
+    conn = _ListConnection()
+
+    result = await games.list_recent_games(conn, 20, 10)  # type: ignore[arg-type]
+
+    assert result == []
+    assert conn.fetch_calls == [(games._LIST_RECENT_GAMES_SQL, (20, 10, False))]
+
+
+async def test_list_recent_games_include_voided_threads_through() -> None:
+    conn = _ListConnection()
+
+    await games.list_recent_games(conn, 20, 10, include_voided=True)  # type: ignore[arg-type]
+
+    assert conn.fetch_calls == [(games._LIST_RECENT_GAMES_SQL, (20, 10, True))]
+
+
+async def test_list_recent_games_rejects_a_non_bool_include_voided() -> None:
+    conn = _ListConnection()
+
+    with pytest.raises(ValueError, match="include_voided"):
+        await games.list_recent_games(conn, 20, 10, include_voided="yes")  # type: ignore[arg-type]
+
+    assert conn.fetch_calls == []
+
+
+async def test_list_recent_games_for_player_defaults_to_excluding_voided() -> None:
+    conn = _ListConnection()
+
+    result = await games.list_recent_games_for_player(conn, 20, 5, 10)  # type: ignore[arg-type]
+
+    assert result == []
+    assert conn.fetch_calls == [(games._LIST_RECENT_GAMES_FOR_PLAYER_SQL, (20, 5, 10, False))]
+
+
+async def test_list_recent_games_for_player_include_voided_threads_through() -> None:
+    conn = _ListConnection()
+
+    await games.list_recent_games_for_player(conn, 20, 5, 10, include_voided=True)  # type: ignore[arg-type]
+
+    assert conn.fetch_calls == [(games._LIST_RECENT_GAMES_FOR_PLAYER_SQL, (20, 5, 10, True))]

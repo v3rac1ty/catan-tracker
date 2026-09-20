@@ -8,6 +8,7 @@ fixed-message `ServiceError` (failure) -- never a raw repository outcome.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime
 from typing import cast
@@ -47,11 +48,14 @@ from catan_bot.services.errors import (
     ServiceError,
 )
 from catan_bot.services.results import (
+    DueScorePrompt,
     PlayerScoreState,
     PreparedGameReport,
     PreparedGameUpdate,
     ScoreCollectionStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 _HISTORY_MIN_LIMIT, _HISTORY_MAX_LIMIT = 1, 25
 # `games.confirm_game`/`reject_game` still guard `pending`; score collection
@@ -121,9 +125,13 @@ async def prepare_game_report(
     scenario: str | None = None,
     target_points: int | None = None,
 ) -> PreparedGameReport:
-    """Validate game metadata before displaying a score sheet.
+    """Validate game metadata ahead of creating the game and its participants.
 
-    This operation deliberately creates no player or game rows.  Guild
+    This operation deliberately creates no player or game rows -- the game
+    is created by the immediately-following `submit_game_report` call, not
+    by anything shown back to the reporter first (there is no longer a
+    reporter-facing draft to display; see `views/game_scores.py`'s
+    docstring for how Phase 2 moved that to per-player DMs). Guild
     configuration may be initialized for a first-time guild, matching the
     other services' ``ensure_guild`` behavior.
     """
@@ -602,6 +610,40 @@ async def confirm_game(
         return await _load_or_die(conn, guild_id, game_id)
 
 
+async def confirm_preflight(
+    pool: asyncpg.Pool, guild_id: int, game_id: int, actor: Actor
+) -> ScoreCollectionStatus:
+    """Whether `actor` may confirm `game_id`, plus its live score-collection status.
+
+    `views/game_confirm.py` calls this *before* it ever decides whether to
+    show the "confirm anyway" dialog for a partially-scored game: a
+    reporter or a non-participant must see the same permission error
+    `confirm_game` would raise, not a confirmation prompt for an action
+    they were never allowed to take in the first place. This deliberately
+    mirrors `db.repositories.games.confirm_game`'s own classification
+    order -- not found, then not pending, then reporter, then not a
+    participant -- so the two can never disagree about *why* someone can't
+    confirm.
+
+    This is read-only and purely advisory: it never mutates the game, and
+    `confirm_game` re-runs its own checks -- inside a locked transaction --
+    the moment a confirmation is actually attempted, so nothing here is
+    ever trusted as the real authorization decision. Nothing about the
+    dialog UI is decided here either; that's the caller's job, based on
+    `ScoreCollectionStatus.complete`.
+    """
+    status = await score_collection_status(pool, guild_id, game_id)
+    game = status.game
+    if game.game.status != "pending":
+        raise ConflictError(_GAME_NOT_PENDING)
+    if game.game.reported_by == actor.user_id:
+        raise PermissionDeniedError(_REPORTER_CANNOT_CONFIRM)
+    participant_ids = (game.winner_id, *game.loser_ids)
+    if actor.user_id not in participant_ids:
+        raise PermissionDeniedError(_CONFIRM_NOT_PARTICIPANT)
+    return status
+
+
 async def reject_game(
     pool: asyncpg.Pool, guild_id: int, game_id: int, actor: Actor
 ) -> GameWithParticipants:
@@ -783,6 +825,95 @@ async def score_collection_status(
     )
 
 
+def _log_score_prompt_read_failure(game_id: int, guild_id: int, exc: Exception) -> None:
+    """Log a claimed prompt's failed game read, without leaking row contents.
+
+    Same no-DETAIL rule as `event_service._log_reminder_read_failure`: never
+    `str(exc)` (a `PostgresError`'s message can carry DETAIL/HINT text with
+    row contents), never those fields directly, and no traceback -- only the
+    ids and the exception's type name, plus `sqlstate` for a `PostgresError`
+    (a fixed 5-character error class code, not server-supplied text).
+    """
+    if isinstance(exc, asyncpg.PostgresError):
+        logger.error(
+            "Score prompt read failed for game_id=%s guild_id=%s: %s (sqlstate=%s)",
+            game_id,
+            guild_id,
+            type(exc).__name__,
+            exc.sqlstate,
+        )
+    else:
+        logger.error(
+            "Score prompt read failed for game_id=%s guild_id=%s: %s",
+            game_id,
+            guild_id,
+            type(exc).__name__,
+        )
+
+
+async def due_score_prompts(pool: asyncpg.Pool, now: datetime, limit: int) -> list[DueScorePrompt]:
+    """Claim every score request due for a re-prompt and pair each with its live game.
+
+    Two phases, on separate connections, mirroring `event_service.
+    due_reminders`:
+
+    1. **Claim**, in its own transaction that commits before anything else
+       runs. `score_requests.claim_due_prompts` increments `prompts_sent`
+       and pushes `next_prompt_at` 24 hours out in the same statement, so
+       every claimed row is already durably re-armed (or, past
+       `_MAX_PROMPTS`, simply no longer claimable) by the time this
+       function returns -- no matter what the scheduler does with the
+       result. That makes a re-prompt at-most-once: whatever happens next
+       (a dropped connection, a failed DM, a crash), a claimed row is never
+       claimed again for the same round, so the worst case is that a player
+       loses one of their three total chases, never that they get a
+       duplicate DM.
+    2. **Read**, one game at a time, cached per `game_id` since a game with
+       several outstanding players claims several rows in the same sweep.
+       The claim query knows nothing about game status -- it happily claims
+       (and reschedules) a row that belongs to a since-rejected/voided game
+       too, since `game_score_requests` carries no such check. That's
+       harmless: a claimed-then-dropped row is simply never claimed again
+       (the same "consumed, not retried" outcome as any other claim here),
+       which is exactly correct for a game whose roster is already final
+       and owes nobody anything. Only `pending`/`confirmed` games --
+       `_SCORE_COLLECTION_OPEN_STATUSES`, the same two statuses
+       `record_player_score` still accepts -- actually produce a prompt. A
+       game whose read itself fails is logged and dropped, matching
+       `event_service._read_reminder`'s isolation: one bad read must never
+       cost every other claimed prompt in the same sweep, including a
+       different player's prompt for a *different* game.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        claimed = await score_requests.claim_due_prompts(conn, now, limit)
+
+    games_by_id: dict[int, GameWithParticipants | None] = {}
+    due: list[DueScorePrompt] = []
+    for request in claimed:
+        if request.game_id not in games_by_id:
+            try:
+                async with pool.acquire() as conn:
+                    games_by_id[request.game_id] = await games.get_game(
+                        conn, request.guild_id, request.game_id
+                    )
+            except Exception as exc:
+                _log_score_prompt_read_failure(request.game_id, request.guild_id, exc)
+                games_by_id[request.game_id] = None
+        game = games_by_id[request.game_id]
+        if game is None or game.game.status not in _SCORE_COLLECTION_OPEN_STATUSES:
+            continue
+        due.append(
+            DueScorePrompt(
+                game=game,
+                user_id=request.user_id,
+                dm_channel_id=request.dm_channel_id,
+                dm_message_id=request.dm_message_id,
+                delivery_status=request.delivery_status,
+            )
+        )
+    return due
+
+
 async def find_open_score_request_game_id(
     pool: asyncpg.Pool, guild_id: int, user_id: int
 ) -> int | None:
@@ -812,10 +943,19 @@ async def get_game_for_player(
 
 
 async def game_history(
-    pool: asyncpg.Pool, guild_id: int, *, user_id: int | None, limit: int
+    pool: asyncpg.Pool,
+    guild_id: int,
+    *,
+    user_id: int | None,
+    limit: int,
+    include_voided: bool = False,
 ) -> list[Game]:
+    """Recent games, newest first. Voided games stay in the database but are
+    excluded from this listing unless `include_voided` is set."""
     n = _clamp(limit, _HISTORY_MIN_LIMIT, _HISTORY_MAX_LIMIT)
     async with pool.acquire() as conn:
         if user_id is not None:
-            return await games.list_recent_games_for_player(conn, guild_id, user_id, n)
-        return await games.list_recent_games(conn, guild_id, n)
+            return await games.list_recent_games_for_player(
+                conn, guild_id, user_id, n, include_voided=include_voided
+            )
+        return await games.list_recent_games(conn, guild_id, n, include_voided=include_voided)

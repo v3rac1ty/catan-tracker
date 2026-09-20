@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, time
 from fractions import Fraction
 from zoneinfo import ZoneInfo
 
@@ -327,6 +327,19 @@ def _game_rules(game: Game) -> GameRules | None:
         return None
 
 
+def format_time_12h(value: time) -> str:
+    """Render a wall-clock time as 12-hour with AM/PM, e.g. `7:30 PM` (no leading zero).
+
+    `%-I` (no leading zero) is a glibc/macOS-only strftime extension, not
+    portable to Windows -- so this computes the 12-hour hour directly
+    instead of formatting with `%I` and stripping a zero, which also
+    sidesteps any locale dependence in `%p`'s "AM"/"PM" spelling.
+    """
+    hour_12 = value.hour % 12 or 12
+    period = "AM" if value.hour < 12 else "PM"
+    return f"{hour_12}:{value.minute:02d} {period}"
+
+
 def _played_label(game: Game) -> str:
     """Render the stable game date and, when available, its local time."""
 
@@ -341,7 +354,7 @@ def _played_label(game: Game) -> str:
     except (KeyError, TypeError, ValueError):
         return f"{date_label}\nTime not recorded"
     timezone = escape_user_text(game.played_timezone)
-    return f"{date_label} at {local_time:%H:%M} ({timezone})"
+    return f"{date_label} at {format_time_12h(local_time.time())} ({timezone})"
 
 
 def _history_played_label(game: Game) -> str:
@@ -626,7 +639,12 @@ def build_game_history_embed(games: Sequence[Game], *, member_id: int | None) ->
         _add_field(embed, "Games", "No games recorded yet.", inline=False)
         return embed
     rows: list[tuple[str, str]] = []
-    for game in games[:EMBED_MAX_FIELDS]:
+    # `position` numbers the visible rows in the listing's own date/time
+    # order (1-indexed) -- purely a display aid for scanning a long history
+    # at a glance. `Game #<id>` stays right after it, unabbreviated, since
+    # that id (not the position) is the stable value `/game show` and
+    # `/game update` take.
+    for position, game in enumerate(games[:EMBED_MAX_FIELDS], start=1):
         parts = [_status_label(game.status), f"Reported by {mention(game.reported_by)}"]
         if game.status == "confirmed" and game.confirmed_by is not None:
             parts.append(f"Confirmed by {mention(game.confirmed_by)}")
@@ -643,7 +661,7 @@ def build_game_history_embed(games: Sequence[Game], *, member_id: int | None) ->
             editor = mention(updated_by) if type(updated_by) is int else "unknown editor"
             parts.append(f"Updated r{revision} by {editor}")
         field_name = (
-            f"Game #{game.game_id} -- {_game_type_label(game.game_type)} -- "
+            f"{position}. Game #{game.game_id} -- {_game_type_label(game.game_type)} -- "
             f"{_history_played_label(game)}"
         )
         rows.append((field_name, " | ".join(parts)))
@@ -1025,11 +1043,9 @@ def build_config_show_embed(config: GuildConfig) -> discord.Embed:
         value=_LEADERBOARD_SCOPE_LABELS.get(config.leaderboard_scope, config.leaderboard_scope),
         inline=True,
     )
-    # 24-hour HH:MM, matching `domain.dates.parse_time`'s own 24-hour default
-    # representation; a friendlier 12-hour display is Phase 4 work.
     embed.add_field(
         name="Leaderboard daily time",
-        value=config.leaderboard_daily_time.strftime("%H:%M"),
+        value=format_time_12h(config.leaderboard_daily_time),
         inline=True,
     )
     return embed
@@ -1060,6 +1076,7 @@ __all__ = [
     "channel_mention",
     "escape_user_text",
     "format_game_score_table",
+    "format_time_12h",
     "format_win_rate",
     "mention",
     "role_mention",

@@ -1,4 +1,5 @@
-"""Periodic season announcements, event reminders, and leaderboard posts.
+"""Periodic season announcements, event reminders, score-request chases, and
+leaderboard posts.
 
 The database services own claiming and state transitions. This module owns
 the Discord boundary: locating a channel in the expected guild, rendering
@@ -8,11 +9,14 @@ one guild cannot block another.
 Announcements are retryable and are marked only after a successful send.
 That ordering can duplicate an announcement if the process dies between the
 send and the mark; exactly-once delivery is not possible without a durable
-Discord-side idempotency key. Reminders and the daily leaderboard digest use
-the opposite, documented at-most-once tradeoff: the service commits each
-claim before this module attempts delivery, so a failed send is not
-retried -- see `services.leaderboard_service`'s module docstring for why
-that's the right call for a digest specifically.
+Discord-side idempotency key. Reminders, the daily leaderboard digest, and
+score-request chases (a fresh DM plus a channel notice to whoever still
+hasn't submitted a score) use the opposite, documented at-most-once
+tradeoff: the service commits each claim before this module attempts
+delivery, so a failed send is not retried -- see
+`services.leaderboard_service`'s module docstring for why that's the right
+call for a digest specifically, and `_send_score_prompts` for why it's also
+right for a chase capped at a handful of total rounds.
 """
 
 from __future__ import annotations
@@ -27,8 +31,20 @@ import discord
 from discord.ext import tasks
 
 from catan_bot import formatting
-from catan_bot.services import config_service, event_service, leaderboard_service, season_service
-from catan_bot.services.results import Announcement, LeaderboardPost, ReminderToSend
+from catan_bot.services import (
+    config_service,
+    event_service,
+    game_service,
+    leaderboard_service,
+    season_service,
+)
+from catan_bot.services.results import (
+    Announcement,
+    DueScorePrompt,
+    LeaderboardPost,
+    ReminderToSend,
+)
+from catan_bot.views import score_entry
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -39,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 _ANNOUNCEMENT_LIMIT = 50
 _DAILY_LEADERBOARD_LIMIT = 50
+_SCORE_PROMPT_LIMIT = 50
 _MAX_MESSAGE_LENGTH = 2000
 _MAX_ALLOWED_USERS = 100
 _BIGINT_MAX = 2**63 - 1
@@ -125,6 +142,23 @@ def _mention_batches(user_ids: Iterable[int]) -> list[tuple[str | None, tuple[in
     if current_ids:
         batches.append((" ".join(current_mentions), tuple(current_ids)))
     return batches or [(None, ())]
+
+
+def _group_score_prompts_by_game(
+    prompts: Iterable[DueScorePrompt],
+) -> list[list[DueScorePrompt]]:
+    """Group claimed prompts by game, preserving each game's first-seen order.
+
+    A game with several outstanding players claims several `DueScorePrompt`
+    rows in the same sweep (`game_service.due_score_prompts`); grouping them
+    here is what lets `_send_score_prompt_group` post exactly one channel
+    notice per game -- naming everyone still outstanding -- instead of one
+    per player.
+    """
+    groups: dict[int, list[DueScorePrompt]] = {}
+    for prompt in prompts:
+        groups.setdefault(prompt.game.game.game_id, []).append(prompt)
+    return list(groups.values())
 
 
 def _validated_role_id(role_id: object) -> int | None:
@@ -219,6 +253,7 @@ class CatanScheduler:
             await self._send_announcements()
             await self._send_reminders(now)
             await self._complete_events(now)
+            await self._send_score_prompts(now)
             await self._send_daily_leaderboards(now)
 
     async def _resolve_seasons(self, now: datetime) -> None:
@@ -351,6 +386,130 @@ class CatanScheduler:
             await event_service.complete_past_events(self.pool, now)
         except Exception as exc:
             _log_failure("event completion", exc)
+
+    async def _send_score_prompts(self, now: datetime) -> None:
+        """Chase every player who's due for another "you still owe a score" nudge.
+
+        Cheap when nothing is due: `game_service.due_score_prompts` does all
+        the "is anything actually due, and is its game still alive"
+        filtering itself (see its docstring), so a normal tick costs one
+        query here and returns an empty list. The claim already committed
+        inside `due_score_prompts` -- by the time a prompt reaches
+        `_send_score_prompt_group` it is already durably re-armed (or, past
+        the third round, simply done being chased) no matter what happens
+        below, so a DM or channel-notice failure here is only ever logged,
+        never retried. That's the same at-most-once tradeoff `_send_reminders`
+        and the daily leaderboard digest document: a dropped prompt costs a
+        player at most one of their three total rounds, never a duplicate DM.
+        """
+        try:
+            prompts = await game_service.due_score_prompts(self.pool, now, _SCORE_PROMPT_LIMIT)
+        except Exception as exc:
+            _log_failure("score prompt claim", exc)
+            return
+
+        for group in _group_score_prompts_by_game(prompts):
+            game = group[0].game.game
+            try:
+                await self._send_score_prompt_group(group)
+            except Exception as exc:
+                _log_failure(
+                    "score prompt processing", exc, guild_id=game.guild_id, game_id=game.game_id
+                )
+
+    async def _send_score_prompt_group(self, prompts: list[DueScorePrompt]) -> None:
+        """DM every outstanding player in one game a fresh sheet, then post one shared notice.
+
+        `prompts` is already grouped by game (`_group_score_prompts_by_game`),
+        so a game with three outstanding players lands here once, producing
+        exactly one channel notice naming all three -- never three separate
+        notices. The notice names everyone in the group, not just whoever's
+        DM happened to succeed: it's exactly as useful to someone whose DMs
+        are closed (they can still see it in-channel and run `/game scores`)
+        as to someone who might have muted the bot. Each player's DM is
+        isolated inside `_send_score_prompt_dm`, matching the fan-out in
+        `GameCog.report_command`: one blocked DM must never stop the rest of
+        this game's players or the notice that follows.
+        """
+        game = prompts[0].game
+        guild_id = game.game.guild_id
+        game_id = game.game.game_id
+
+        for prompt in prompts:
+            await self._send_score_prompt_dm(prompt)
+
+        if game.game.channel_id is None:
+            logger.warning(
+                "Score prompt game has no public channel guild_id=%s game_id=%s",
+                guild_id,
+                game_id,
+            )
+            return
+        channel = await self._guild_channel(guild_id, game.game.channel_id)
+        if channel is None:
+            logger.warning(
+                "Score prompt channel unavailable guild_id=%s game_id=%s channel_id=%s",
+                guild_id,
+                game_id,
+                game.game.channel_id,
+            )
+            return
+        outstanding_ids = tuple(prompt.user_id for prompt in prompts)
+        mentions = " ".join(formatting.mention(user_id) for user_id in outstanding_ids)
+        await channel.send(
+            f"{mentions} -- you still haven't submitted a score for game #{game_id}. "
+            "Check your DMs, or run `/game scores`.",
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                roles=False,
+                users=[discord.Object(id=user_id) for user_id in outstanding_ids],
+            ),
+        )
+
+    async def _send_score_prompt_dm(self, prompt: DueScorePrompt) -> None:
+        """Send one player a fresh score sheet, or record their DM as blocked.
+
+        Mirrors the initial per-player fan-out in `GameCog.report_command`:
+        `discord.HTTPException` is caught (not just `Forbidden`) so a
+        one-off 5xx/network blip hitting a single player's DM can never
+        abort this game's remaining players or its channel notice -- it's
+        simply recorded as `blocked`, same as a genuinely closed-DM
+        rejection, and the next claimed round (up to `_MAX_PROMPTS` total)
+        tries again.
+        """
+        game = prompt.game
+        guild_id = game.game.guild_id
+        game_id = game.game.game_id
+        rules = score_entry.rules_for_game(game.game)
+        embed = score_entry.build_score_entry_embed(game, prompt.user_id)
+        view = score_entry.build_score_entry_view(guild_id, game_id, prompt.user_id, rules)
+        try:
+            user = self.bot.get_user(prompt.user_id)
+            if user is None:
+                user = await self.bot.fetch_user(prompt.user_id)
+            dm_message = await user.send(
+                embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.HTTPException:
+            await game_service.record_score_request_delivery(
+                self.pool,
+                guild_id,
+                game_id,
+                prompt.user_id,
+                channel_id=None,
+                message_id=None,
+                delivered=False,
+            )
+            return
+        await game_service.record_score_request_delivery(
+            self.pool,
+            guild_id,
+            game_id,
+            prompt.user_id,
+            channel_id=dm_message.channel.id,
+            message_id=dm_message.id,
+            delivered=True,
+        )
 
     async def _send_daily_leaderboards(self, now: datetime) -> None:
         """Claim, then send, every daily-mode guild's digest that's due at `now`.

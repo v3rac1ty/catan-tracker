@@ -1,7 +1,7 @@
 """Unit coverage for Phase 2's per-player DM score-collection service functions:
 `open_score_collection`, `record_score_request_delivery`, `record_player_score`,
 `clear_player_score`, `score_collection_status`, `find_open_score_request_game_id`,
-and `get_game_for_player`.
+`get_game_for_player`, Phase 5's `confirm_preflight`, and Phase 6's `due_score_prompts`.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import pytest
 from catan_bot.domain.errors import DomainValidationError
 from catan_bot.domain.scoring import PlayerScore, ScoreEntry
 from catan_bot.services import game_service
+from catan_bot.services.context import Actor
 from catan_bot.services.errors import ConflictError, NotFoundError, PermissionDeniedError
 
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
@@ -58,6 +59,7 @@ def _game(
     winner_id: int = 1,
     loser_ids: tuple[int, ...] = (2,),
     scores: tuple[PlayerScore, ...] = (),
+    reported_by: int = 999,
 ) -> SimpleNamespace:
     game = SimpleNamespace(
         game_id=7,
@@ -66,6 +68,7 @@ def _game(
         scenario=None,
         target_points=10,
         status=status,
+        reported_by=reported_by,
     )
     return SimpleNamespace(game=game, winner_id=winner_id, loser_ids=loser_ids, scores=scores)
 
@@ -437,3 +440,247 @@ async def test_get_game_for_player_rejects_non_participant(
 
     with pytest.raises(PermissionDeniedError):
         await game_service.get_game_for_player(pool, 123, 7, 99)
+
+
+# ---------------------------------------------------------------------------
+# confirm_preflight (Phase 5): the pre-dialog permission check ahead of
+# `views/game_confirm.py`'s "confirm anyway" second step. Deliberately
+# mirrors `db.repositories.games.confirm_game`'s own classification order
+# (not found -> not pending -> reporter -> not a participant).
+# ---------------------------------------------------------------------------
+
+
+def _actor(user_id: int) -> Actor:
+    return Actor(user_id=user_id, has_manage_guild=False, role_ids=frozenset())
+
+
+@pytest.mark.asyncio
+async def test_confirm_preflight_returns_status_for_an_eligible_participant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _Pool()
+    game = _game(winner_id=1, loser_ids=(2, 3), reported_by=9)
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=game))
+    monkeypatch.setattr(
+        game_service.score_requests,
+        "list_score_requests",
+        AsyncMock(
+            return_value=[
+                _request(1, submitted=True),
+                _request(2, submitted=True),
+                _request(3),
+            ]
+        ),
+    )
+
+    status = await game_service.confirm_preflight(pool, 123, 7, _actor(2))
+
+    assert status.complete is False
+    assert status.outstanding_ids == (3,)
+
+
+@pytest.mark.asyncio
+async def test_confirm_preflight_returns_complete_status_when_every_row_is_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _Pool()
+    game = _game(winner_id=1, loser_ids=(2,), reported_by=9)
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=game))
+    monkeypatch.setattr(
+        game_service.score_requests,
+        "list_score_requests",
+        AsyncMock(return_value=[_request(1, submitted=True), _request(2, submitted=True)]),
+    )
+
+    status = await game_service.confirm_preflight(pool, 123, 7, _actor(2))
+
+    assert status.complete is True
+
+
+@pytest.mark.asyncio
+async def test_confirm_preflight_rejects_the_reporter(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = _Pool()
+    game = _game(winner_id=1, loser_ids=(2,), reported_by=1)
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=game))
+    monkeypatch.setattr(
+        game_service.score_requests, "list_score_requests", AsyncMock(return_value=[])
+    )
+
+    with pytest.raises(PermissionDeniedError, match="reported this game"):
+        await game_service.confirm_preflight(pool, 123, 7, _actor(1))
+
+
+@pytest.mark.asyncio
+async def test_confirm_preflight_rejects_a_non_participant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _Pool()
+    game = _game(winner_id=1, loser_ids=(2,), reported_by=9)
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=game))
+    monkeypatch.setattr(
+        game_service.score_requests, "list_score_requests", AsyncMock(return_value=[])
+    )
+
+    with pytest.raises(PermissionDeniedError, match="Only a player"):
+        await game_service.confirm_preflight(pool, 123, 7, _actor(99))
+
+
+@pytest.mark.asyncio
+async def test_confirm_preflight_rejects_a_non_pending_game(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _Pool()
+    game = _game(status="confirmed", winner_id=1, loser_ids=(2,), reported_by=9)
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=game))
+    monkeypatch.setattr(
+        game_service.score_requests, "list_score_requests", AsyncMock(return_value=[])
+    )
+
+    with pytest.raises(ConflictError):
+        await game_service.confirm_preflight(pool, 123, 7, _actor(2))
+
+
+@pytest.mark.asyncio
+async def test_confirm_preflight_missing_game_raises_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _Pool()
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=None))
+
+    with pytest.raises(NotFoundError):
+        await game_service.confirm_preflight(pool, 123, 999, _actor(1))
+
+
+# ---------------------------------------------------------------------------
+# due_score_prompts (Phase 6): claims via `score_requests.claim_due_prompts`,
+# then pairs each claimed row with its live game -- dropping anything whose
+# game has since left `pending`/`confirmed`.
+# ---------------------------------------------------------------------------
+
+
+def _claimed(
+    game_id: int,
+    guild_id: int,
+    user_id: int,
+    *,
+    dm_channel_id: int | None = 555,
+    dm_message_id: int | None = 777,
+    delivery_status: str = "delivered",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        game_id=game_id,
+        guild_id=guild_id,
+        user_id=user_id,
+        dm_channel_id=dm_channel_id,
+        dm_message_id=dm_message_id,
+        delivery_status=delivery_status,
+    )
+
+
+@pytest.mark.asyncio
+async def test_due_score_prompts_claims_then_pairs_with_its_live_game(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _Pool()
+    claim = AsyncMock(return_value=[_claimed(7, 123, 2)])
+    monkeypatch.setattr(game_service.score_requests, "claim_due_prompts", claim)
+    game = _game()
+    get_game = AsyncMock(return_value=game)
+    monkeypatch.setattr(game_service.games, "get_game", get_game)
+
+    due = await game_service.due_score_prompts(pool, NOW, 50)
+
+    claim.assert_awaited_once_with(pool.connection, NOW, 50)
+    get_game.assert_awaited_once_with(pool.connection, 123, 7)
+    assert len(due) == 1
+    assert due[0].game is game
+    assert due[0].user_id == 2
+    assert due[0].dm_channel_id == 555
+    assert due[0].dm_message_id == 777
+    assert due[0].delivery_status == "delivered"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["rejected", "voided"])
+async def test_due_score_prompts_drops_a_claim_for_a_dead_game(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """The claim query has no idea about game status, so it still claims (and
+    reschedules) a since-rejected/voided game's row -- harmless, since the
+    row is simply never claimed again. This proves the dead game produces no
+    prompt for the scheduler to act on."""
+    pool = _Pool()
+    monkeypatch.setattr(
+        game_service.score_requests,
+        "claim_due_prompts",
+        AsyncMock(return_value=[_claimed(7, 123, 2)]),
+    )
+    monkeypatch.setattr(
+        game_service.games, "get_game", AsyncMock(return_value=_game(status=status))
+    )
+
+    due = await game_service.due_score_prompts(pool, NOW, 50)
+
+    assert due == []
+
+
+@pytest.mark.asyncio
+async def test_due_score_prompts_reads_each_game_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three outstanding players in the same game claim three rows, but the
+    game itself should only be read once, not once per row."""
+    pool = _Pool()
+    monkeypatch.setattr(
+        game_service.score_requests,
+        "claim_due_prompts",
+        AsyncMock(return_value=[_claimed(7, 123, 2), _claimed(7, 123, 3), _claimed(7, 123, 4)]),
+    )
+    game = _game(winner_id=2, loser_ids=(3, 4))
+    get_game = AsyncMock(return_value=game)
+    monkeypatch.setattr(game_service.games, "get_game", get_game)
+
+    due = await game_service.due_score_prompts(pool, NOW, 50)
+
+    get_game.assert_awaited_once()
+    assert [prompt.user_id for prompt in due] == [2, 3, 4]
+    assert all(prompt.game is game for prompt in due)
+
+
+@pytest.mark.asyncio
+async def test_due_score_prompts_drops_only_the_game_whose_read_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read failure for one claimed game's row must not cost prompts already
+    claimed for a different game in the same sweep."""
+    pool = _Pool()
+    monkeypatch.setattr(
+        game_service.score_requests,
+        "claim_due_prompts",
+        AsyncMock(return_value=[_claimed(7, 123, 2), _claimed(9, 123, 5)]),
+    )
+    good_game = _game(winner_id=5, loser_ids=())
+    get_game = AsyncMock(side_effect=[RuntimeError("boom"), good_game])
+    monkeypatch.setattr(game_service.games, "get_game", get_game)
+
+    due = await game_service.due_score_prompts(pool, NOW, 50)
+
+    assert len(due) == 1
+    assert due[0].user_id == 5
+    assert due[0].game is good_game
+
+
+@pytest.mark.asyncio
+async def test_due_score_prompts_returns_nothing_when_nothing_is_claimed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _Pool()
+    claim = AsyncMock(return_value=[])
+    monkeypatch.setattr(game_service.score_requests, "claim_due_prompts", claim)
+    get_game = AsyncMock()
+    monkeypatch.setattr(game_service.games, "get_game", get_game)
+
+    due = await game_service.due_score_prompts(pool, NOW, 50)
+
+    assert due == []
+    get_game.assert_not_awaited()

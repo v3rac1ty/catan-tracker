@@ -187,6 +187,30 @@ class ScoreCollectionStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class DueScorePrompt:
+    """One outstanding participant the scheduler must chase again (Phase 6).
+
+    Produced by `services.game_service.due_score_prompts` after it claims a
+    due row (`db.repositories.score_requests.claim_due_prompts`) and
+    confirms the row's game is still `pending`/`confirmed` -- a claim for a
+    since-rejected/voided game never reaches this dataclass at all. Carries
+    the *whole* game (not just its id) because `scheduler._send_score_prompt_
+    dm` needs the full roster and ruleset to rebuild the same DM sheet
+    `views/score_entry.py` sent the first time, and `dm_channel_id`/
+    `dm_message_id`/`delivery_status` are exposed even though a fresh DM is
+    always sent regardless, in case a future caller wants to reason about
+    the player's *previous* delivery outcome (e.g. someone who was
+    `blocked` last round) without a second repository round trip.
+    """
+
+    game: GameWithParticipants
+    user_id: int
+    dm_channel_id: int | None
+    dm_message_id: int | None
+    delivery_status: ScoreRequestDeliveryStatus
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedGameUpdate:
     """Validated, immutable draft for editing one confirmed game.
 

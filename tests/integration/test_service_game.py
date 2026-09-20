@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import pytest
 
 from catan_bot.db.repositories import games as games_repo
+from catan_bot.db.repositories import score_requests
 from catan_bot.domain.errors import DomainValidationError
 from catan_bot.domain.validation import ParticipantRef
 from catan_bot.services import config_service, game_service, season_service, stats_service
@@ -95,6 +96,48 @@ async def test_confirm_already_confirmed_game_raises_conflict(
     await game_service.confirm_game(pool, guild_id, created.game.game_id, _actor(2))
     with pytest.raises(ConflictError):
         await game_service.confirm_game(pool, guild_id, created.game.game_id, _actor(2))
+
+
+# ---------------------------------------------------------------------------
+# confirm_preflight (Phase 5): the pre-dialog permission check ahead of
+# `views/game_confirm.py`'s "confirm anyway" second step. Mirrors
+# `confirm_game`'s own classification for the same guild/game/actor triples
+# exercised above -- see also the pure-logic coverage in
+# `tests/unit/test_game_service_scores.py`.
+# ---------------------------------------------------------------------------
+
+
+async def test_confirm_preflight_reporter_matches_confirm_game(
+    pool: asyncpg.Pool, guild_id: int
+) -> None:
+    created = await _report(pool, guild_id, reporter=1, winner=1, losers=[2])
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        await game_service.confirm_preflight(pool, guild_id, created.game.game_id, _actor(1))
+    assert "reported this game" in exc_info.value.user_message
+
+
+async def test_confirm_preflight_non_participant_matches_confirm_game(
+    pool: asyncpg.Pool, guild_id: int
+) -> None:
+    created = await _report(pool, guild_id, reporter=1, winner=1, losers=[2])
+    with pytest.raises(PermissionDeniedError):
+        await game_service.confirm_preflight(pool, guild_id, created.game.game_id, _actor(99))
+
+
+async def test_confirm_preflight_unknown_game_raises_not_found(
+    pool: asyncpg.Pool, guild_id: int
+) -> None:
+    with pytest.raises(NotFoundError):
+        await game_service.confirm_preflight(pool, guild_id, 999_999, _actor(1))
+
+
+async def test_confirm_preflight_already_confirmed_game_raises_conflict(
+    pool: asyncpg.Pool, guild_id: int
+) -> None:
+    created = await _report(pool, guild_id, reporter=1, winner=1, losers=[2])
+    await game_service.confirm_game(pool, guild_id, created.game.game_id, _actor(2))
+    with pytest.raises(ConflictError):
+        await game_service.confirm_preflight(pool, guild_id, created.game.game_id, _actor(2))
 
 
 # ---------------------------------------------------------------------------
@@ -376,3 +419,98 @@ async def test_game_history_filters_by_user_and_clamps_limit(
     assert len(clamped_low) == 1
     clamped_negative = await game_service.game_history(pool, guild_id, user_id=None, limit=-5)
     assert len(clamped_negative) == 1
+
+
+async def test_game_history_excludes_voided_unless_include_voided_is_set(
+    pool: asyncpg.Pool, guild_id: int
+) -> None:
+    kept = [await _report(pool, guild_id, reporter=1, winner=1, losers=[2]) for _ in range(2)]
+    voided = await _report(pool, guild_id, reporter=1, winner=1, losers=[2])
+    await game_service.void_game(
+        pool, guild_id, voided.game.game_id, _actor(1, admin=True), "cleanup"
+    )
+
+    default_history = await game_service.game_history(pool, guild_id, user_id=None, limit=10)
+    assert {g.game_id for g in default_history} == {g.game.game_id for g in kept}
+
+    with_voided = await game_service.game_history(
+        pool, guild_id, user_id=None, limit=10, include_voided=True
+    )
+    assert voided.game.game_id in {g.game_id for g in with_voided}
+
+
+# ---------------------------------------------------------------------------
+# due_score_prompts (Phase 6): claims due re-prompts and pairs them with
+# their live game, end to end through the real `score_requests` claim query.
+# ---------------------------------------------------------------------------
+
+
+async def _opened(
+    pool: asyncpg.Pool, guild_id: int, *, reporter: int, winner: int, losers: list[int]
+):
+    created = await _report(pool, guild_id, reporter=reporter, winner=winner, losers=losers)
+    participant_ids = (created.winner_id, *created.loser_ids)
+    await game_service.open_score_collection(
+        pool, guild_id, created.game.game_id, participant_ids, NOW
+    )
+    return created
+
+
+async def test_due_score_prompts_pairs_every_outstanding_player_with_the_game(
+    pool: asyncpg.Pool, guild_id: int
+) -> None:
+    created = await _opened(pool, guild_id, reporter=99, winner=1, losers=[2, 3])
+    due_now = NOW + timedelta(hours=24, minutes=1)
+
+    due = await game_service.due_score_prompts(pool, due_now, 50)
+
+    assert {prompt.user_id for prompt in due} == {1, 2, 3}
+    for prompt in due:
+        assert prompt.game.game.game_id == created.game.game_id
+        assert prompt.delivery_status == "pending"
+
+
+async def test_due_score_prompts_is_empty_before_the_24_hour_checkpoint(
+    pool: asyncpg.Pool, guild_id: int
+) -> None:
+    await _opened(pool, guild_id, reporter=99, winner=1, losers=[2])
+
+    assert await game_service.due_score_prompts(pool, NOW + timedelta(hours=23), 50) == []
+
+
+@pytest.mark.parametrize("close", ["reject", "void"])
+async def test_due_score_prompts_produces_nothing_for_a_closed_game(
+    pool: asyncpg.Pool, guild_id: int, close: str
+) -> None:
+    """A rejected/voided game's roster is final -- its due row is still
+    consumed by the claim (harmless: it will never be claimed again), but it
+    must never surface as something for the scheduler to actually chase."""
+    created = await _opened(pool, guild_id, reporter=99, winner=1, losers=[2])
+    if close == "reject":
+        await game_service.reject_game(pool, guild_id, created.game.game_id, _actor(99))
+    else:
+        await game_service.void_game(
+            pool, guild_id, created.game.game_id, _actor(1, admin=True), None
+        )
+    due_now = NOW + timedelta(hours=24, minutes=1)
+
+    assert await game_service.due_score_prompts(pool, due_now, 50) == []
+
+    async with pool.acquire() as conn:
+        requests = await score_requests.list_score_requests(conn, guild_id, created.game.game_id)
+    assert all(r.prompts_sent == 1 for r in requests)
+
+
+async def test_due_score_prompts_goes_quiet_after_the_third_round(
+    pool: asyncpg.Pool, guild_id: int
+) -> None:
+    await _opened(pool, guild_id, reporter=99, winner=1, losers=[2])
+    checkpoint = NOW
+
+    for _round in range(3):
+        checkpoint += timedelta(hours=24, minutes=1)
+        due = await game_service.due_score_prompts(pool, checkpoint, 50)
+        assert {prompt.user_id for prompt in due} == {1, 2}
+
+    checkpoint += timedelta(hours=24, minutes=1)
+    assert await game_service.due_score_prompts(pool, checkpoint, 50) == []

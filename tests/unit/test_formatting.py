@@ -25,6 +25,7 @@ from catan_bot.formatting import (
     build_season_history_embed,
     escape_user_text,
     format_game_score_table,
+    format_time_12h,
 )
 from catan_bot.services.results import (
     Leaderboard,
@@ -185,6 +186,32 @@ def test_config_show_escapes_stored_timezone_text() -> None:
     assert r"\*\*UTC\*\*" in timezone_field.value
 
 
+# ---------------------------------------------------------------------------
+# format_time_12h
+# ---------------------------------------------------------------------------
+
+
+def test_format_time_12h_midnight_is_12_am() -> None:
+    assert format_time_12h(time(0, 0)) == "12:00 AM"
+
+
+def test_format_time_12h_noon_is_12_pm() -> None:
+    assert format_time_12h(time(12, 0)) == "12:00 PM"
+
+
+def test_format_time_12h_single_digit_hour_has_no_leading_zero() -> None:
+    assert format_time_12h(time(7, 30)) == "7:30 AM"
+    assert format_time_12h(time(19, 30)) == "7:30 PM"
+
+
+def test_format_time_12h_morning_single_digit_hour() -> None:
+    assert format_time_12h(time(7, 5)) == "7:05 AM"
+
+
+def test_format_time_12h_pads_minutes_below_ten() -> None:
+    assert format_time_12h(time(23, 5)) == "11:05 PM"
+
+
 def _detailed_game(*, game_type: str = "normal", scenario: str | None = None) -> Game:
     now = datetime(2026, 1, 1, tzinfo=UTC)
     return Game(
@@ -280,7 +307,7 @@ def test_six_player_combined_score_table_stays_compact_and_uses_player_labels() 
         for field in embed.fields
     )
     assert any(field.name == "Extension" for field in embed.fields)
-    assert any(field.name == "Date" and "13:30" in field.value for field in embed.fields)
+    assert any(field.name == "Date" and "1:30 PM" in field.value for field in embed.fields)
     assert any(
         field.name == "Scenario"
         and "@everyone" not in field.value
@@ -398,6 +425,20 @@ def test_revised_game_history_is_succinct_and_mentions_revision() -> None:
     embed = build_game_history_embed([game], member_id=None)
 
     assert "Updated r3 by <@77>" in embed.fields[0].value
+
+
+def test_game_history_rows_are_prefixed_with_position_but_keep_the_real_game_id() -> None:
+    """Rows are numbered 1., 2., ... in the listing's own order, but the
+    real `Game #<id>` stays visible right after -- /game show and /game
+    update still take that id, not the display position."""
+    games = [_game(101, "voided"), _game(55, "voided"), _game(9, "voided")]
+
+    embed = build_game_history_embed(games, member_id=None)
+
+    names = [field.name for field in embed.fields]
+    assert names[0].startswith("1. Game #101")
+    assert names[1].startswith("2. Game #55")
+    assert names[2].startswith("3. Game #9")
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +606,7 @@ def test_config_show_embed_includes_leaderboard_settings() -> None:
     assert fields["Leaderboard post"] == "Daily digest"
     assert fields["Leaderboard channel"] == "<#555>"
     assert fields["Leaderboard scope"] == "All-time"
-    assert fields["Leaderboard daily time"] == "09:30"
+    assert fields["Leaderboard daily time"] == "9:30 AM"
 
 
 def test_config_show_embed_leaderboard_defaults_when_unconfigured() -> None:
@@ -586,4 +627,4 @@ def test_config_show_embed_leaderboard_defaults_when_unconfigured() -> None:
     assert fields["Leaderboard post"] == "Off"
     assert fields["Leaderboard channel"] == "Not set"
     assert fields["Leaderboard scope"] == "Season"
-    assert fields["Leaderboard daily time"] == "22:00"
+    assert fields["Leaderboard daily time"] == "10:00 PM"
