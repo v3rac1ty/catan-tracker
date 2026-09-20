@@ -64,6 +64,7 @@ _EXPECTED_RELATIVE_PATHS = frozenset(
         "game_service.py",
         "stats_service.py",
         "event_service.py",
+        "leaderboard_service.py",
     }
 )
 

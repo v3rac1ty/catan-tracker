@@ -1,4 +1,4 @@
-"""Periodic season announcements and event reminders.
+"""Periodic season announcements, event reminders, and leaderboard posts.
 
 The database services own claiming and state transitions. This module owns
 the Discord boundary: locating a channel in the expected guild, rendering
@@ -8,9 +8,11 @@ one guild cannot block another.
 Announcements are retryable and are marked only after a successful send.
 That ordering can duplicate an announcement if the process dies between the
 send and the mark; exactly-once delivery is not possible without a durable
-Discord-side idempotency key. Reminders use the opposite, documented
-at-most-once tradeoff: the service commits each claim before this module
-attempts delivery, so a failed send is not retried.
+Discord-side idempotency key. Reminders and the daily leaderboard digest use
+the opposite, documented at-most-once tradeoff: the service commits each
+claim before this module attempts delivery, so a failed send is not
+retried -- see `services.leaderboard_service`'s module docstring for why
+that's the right call for a digest specifically.
 """
 
 from __future__ import annotations
@@ -25,8 +27,8 @@ import discord
 from discord.ext import tasks
 
 from catan_bot import formatting
-from catan_bot.services import config_service, event_service, season_service
-from catan_bot.services.results import Announcement, ReminderToSend
+from catan_bot.services import config_service, event_service, leaderboard_service, season_service
+from catan_bot.services.results import Announcement, LeaderboardPost, ReminderToSend
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -36,6 +38,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ANNOUNCEMENT_LIMIT = 50
+_DAILY_LEADERBOARD_LIMIT = 50
 _MAX_MESSAGE_LENGTH = 2000
 _MAX_ALLOWED_USERS = 100
 _BIGINT_MAX = 2**63 - 1
@@ -216,6 +219,7 @@ class CatanScheduler:
             await self._send_announcements()
             await self._send_reminders(now)
             await self._complete_events(now)
+            await self._send_daily_leaderboards(now)
 
     async def _resolve_seasons(self, now: datetime) -> None:
         try:
@@ -347,6 +351,45 @@ class CatanScheduler:
             await event_service.complete_past_events(self.pool, now)
         except Exception as exc:
             _log_failure("event completion", exc)
+
+    async def _send_daily_leaderboards(self, now: datetime) -> None:
+        """Claim, then send, every daily-mode guild's digest that's due at `now`.
+
+        Cheap on a tick where nothing is due: `due_daily_leaderboards` does
+        all the "is anything actually due" filtering itself (see its
+        docstring), so a normal tick costs one query here and returns an
+        empty list. The claim already happened inside `due_daily_leaderboards`
+        -- by the time a post reaches `_send_leaderboard_post` it is already
+        durably marked as today's post for that guild, so a delivery failure
+        here is simply logged, never retried (the same at-most-once tradeoff
+        `leaderboard_service`'s module docstring explains for the claim
+        itself).
+        """
+        try:
+            posts = await leaderboard_service.due_daily_leaderboards(
+                self.pool, now, _DAILY_LEADERBOARD_LIMIT
+            )
+        except Exception as exc:
+            _log_failure("daily leaderboard claim", exc)
+            return
+
+        for post in posts:
+            try:
+                await self._send_leaderboard_post(post)
+            except Exception as exc:
+                _log_failure("daily leaderboard delivery", exc, guild_id=post.guild_id)
+
+    async def _send_leaderboard_post(self, post: LeaderboardPost) -> None:
+        channel = await self._guild_channel(post.guild_id, post.channel_id)
+        if channel is None:
+            logger.warning(
+                "Daily leaderboard channel unavailable guild_id=%s channel_id=%s",
+                post.guild_id,
+                post.channel_id,
+            )
+            return
+        embed = formatting.build_leaderboard_post_embed(post)
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     async def _guild_channel(self, guild_id: int, channel_id: int) -> Any | None:
         guild = self.bot.get_guild(guild_id)

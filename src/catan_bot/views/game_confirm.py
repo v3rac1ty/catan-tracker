@@ -23,7 +23,7 @@ import discord
 from catan_bot import formatting
 from catan_bot.errors import handle_interaction_error
 from catan_bot.permissions import actor_from_interaction, guild_id_from_interaction
-from catan_bot.services import game_service
+from catan_bot.services import game_service, leaderboard_service
 from catan_bot.services.errors import PermissionDeniedError
 
 _CUSTOM_ID_TEMPLATE = re.compile(r"game:(?P<action>confirm|reject):(?P<id>[0-9]{1,19})")
@@ -44,6 +44,33 @@ GameAction = Literal["confirm", "reject"]
 
 def _custom_id(action: GameAction, game_id: int) -> str:
     return f"game:{action}:{game_id}"
+
+
+async def _post_leaderboard_after_confirm(client: object, guild_id: int) -> None:
+    """Best-effort recurring leaderboard post, right after a game is confirmed.
+
+    Mirrors `views/score_entry.py`'s `_refresh_public_message`: the
+    confirmation this follows is already durably committed by the time this
+    runs, so a failure here (`per_game` mode is off, no channel is
+    configured, a transient Discord/DB hiccup, ...) must never surface as
+    the confirmation itself having failed -- every exception is swallowed.
+    `leaderboard_service.leaderboard_after_game` already returns `None`
+    (not an error) for the common "nothing to post" cases; this still
+    wraps the whole thing in `try/except` for the uncommon ones (a
+    connection drop, a deleted/permission-less channel, ...).
+    """
+    try:
+        pool = client.pool  # type: ignore[attr-defined]
+        post = await leaderboard_service.leaderboard_after_game(pool, guild_id)
+        if post is None:
+            return
+        channel = client.get_channel(post.channel_id)  # type: ignore[attr-defined]
+        if channel is None:
+            channel = await client.fetch_channel(post.channel_id)  # type: ignore[attr-defined]
+        embed = formatting.build_leaderboard_post_embed(post)
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:  # noqa: S110 -- best-effort post, see docstring above.
+        return
 
 
 class GameActionButton(discord.ui.DynamicItem[discord.ui.Button], template=_CUSTOM_ID_TEMPLATE):
@@ -84,6 +111,10 @@ class GameActionButton(discord.ui.DynamicItem[discord.ui.Button], template=_CUST
             await interaction.edit_original_response(
                 embed=embed, view=None, allowed_mentions=discord.AllowedMentions.none()
             )
+            if self.action == "confirm":
+                # The game is already durably confirmed above -- this is
+                # purely a best-effort extra post from here on.
+                await _post_leaderboard_after_confirm(interaction.client, guild_id)
         except Exception as exc:  # routed through the shared handler below
             await handle_interaction_error(interaction, exc, command_name=f"game:{self.action}")
 

@@ -135,11 +135,17 @@ class GameCog(commands.Cog):
                     view=sheet_view,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
-            except discord.Forbidden:
-                # One player's closed DMs must not break the report for
-                # everyone else -- record it as blocked and keep going;
-                # `/game scores` is their fallback, and the public
-                # message's progress field marks them distinctly.
+            except discord.HTTPException:
+                # One player's failed DM -- closed DMs (`discord.Forbidden`,
+                # a subclass of `HTTPException`) or any other transient HTTP
+                # error -- must not break the report for everyone else --
+                # record it as blocked and keep going; `/game scores` is
+                # their fallback, and the public message's progress field
+                # marks them distinctly. Catching the wider `HTTPException`
+                # (not just `Forbidden`) means a one-off 5xx/network blip
+                # hitting a single participant's DM no longer aborts the
+                # whole loop before the remaining participants are ever
+                # messaged.
                 blocked.append(member)
                 await game_service.record_score_request_delivery(
                     self.bot.pool,
@@ -336,8 +342,14 @@ class GameCog(commands.Cog):
         guild_id = guild_id_from_interaction(interaction)
         await interaction.response.defer(thinking=True)
         game = await game_service.get_game(self.bot.pool, guild_id, game_id)
+        # A game whose public message failed to send (or whose message/view
+        # was otherwise lost) has no Confirm/Reject buttons anywhere and can
+        # never be confirmed -- re-attaching the view here whenever the game
+        # is still pending gives it a way back, without needing a re-report.
+        view = build_game_action_view(game_id) if game.game.status == "pending" else None
         await interaction.edit_original_response(
             embed=formatting.build_game_status_embed(game),
+            view=view,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 

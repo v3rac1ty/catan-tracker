@@ -7,6 +7,8 @@ reassign that role to someone else (or themselves).
 
 from __future__ import annotations
 
+from datetime import time
+
 import asyncpg
 
 from catan_bot.db.models import GuildConfig
@@ -74,4 +76,38 @@ async def set_player_role(
         updated = await guilds.set_player_role(conn, guild_id, role_id)
     if updated is None:  # pragma: no cover -- ensure_guild above guarantees the row exists.
         raise RuntimeError(f"guild_config row for guild {guild_id} vanished during set_player_role")
+    return updated
+
+
+async def set_leaderboard_settings(
+    pool: asyncpg.Pool,
+    guild_id: int,
+    actor: Actor,
+    *,
+    mode: str,
+    channel_id: int | None,
+    scope: str,
+    daily_time: time,
+) -> GuildConfig:
+    """Replace every recurring-leaderboard setting in one call (`/config leaderboard`).
+
+    Unlike the repository layer's `guilds.set_leaderboard_settings` (which
+    supports a partial update, via its own `_UNSET` sentinel, for callers
+    that only want to change one field), `/config leaderboard` is a single
+    command that always submits a complete set of values: the cog resolves
+    `scope`'s and `daily_time`'s defaults, and `channel_id`'s
+    announce-channel fallback, before this is ever called. There is
+    therefore nothing partial to represent at this layer -- every field
+    below is always explicitly supplied to the repository call.
+    """
+    require_manage_guild(actor)
+    async with pool.acquire() as conn, conn.transaction():
+        await guilds.ensure_guild(conn, guild_id)
+        updated = await guilds.set_leaderboard_settings(
+            conn, guild_id, mode=mode, channel_id=channel_id, scope=scope, daily_time=daily_time
+        )
+    if updated is None:  # pragma: no cover -- ensure_guild above guarantees the row exists.
+        raise RuntimeError(
+            f"guild_config row for guild {guild_id} vanished during set_leaderboard_settings"
+        )
     return updated

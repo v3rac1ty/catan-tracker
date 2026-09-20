@@ -6,9 +6,10 @@ no rounding surprises, since a tied bet payout hinges on it.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+from typing import Literal
 
 from catan_bot.domain.errors import DomainValidationError
 from catan_bot.domain.validation import validate_min_games
@@ -105,3 +106,66 @@ def rank_players(stats: Iterable[PlayerStats], *, min_games: int) -> list[Ranked
         )
         previous_tie_key = tie_key
     return ranked
+
+
+# ---------------------------------------------------------------------------
+# Movement: comparing two ordered (top-to-bottom) rankings, for the
+# recurring leaderboard post's movement arrows (Phase 3).
+# ---------------------------------------------------------------------------
+
+MovementDirection = Literal["up", "down", "new", "unchanged"]
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerMovement:
+    """One player's change in leaderboard *position* since the last post.
+
+    Position, not `RankedPlayer.rank`, is what moves here: two players tied
+    on win rate/wins/games share a `rank`, but still occupy distinct list
+    positions in the ordered board -- a swap between two tied players is
+    real movement even though neither player's `rank` number changed.
+    `change` is the number of positions moved: always positive for
+    `"up"`/`"down"`, always `0` for `"new"`/`"unchanged"`.
+    """
+
+    user_id: int
+    direction: MovementDirection
+    change: int
+
+
+def compute_movement(
+    previous: Sequence[int] | None, current: Sequence[int]
+) -> tuple[PlayerMovement, ...]:
+    """Compare two ordered (top-to-bottom) rankings and derive each player's movement.
+
+    `previous` is `None` the very first time a board is ever posted for a
+    guild (`GuildConfig.leaderboard_last_ranking`'s "no board posted yet"
+    state, distinct from an *empty* previously-posted board, `()`) -- every
+    player in `current` is reported `"new"` rather than compared against an
+    empty list, since "moved up from nowhere" isn't a meaningful number of
+    positions. An empty `previous` produces the same result for a different
+    reason: every id is simply absent from it, so each lookup below misses
+    and falls into the same `"new"` case naturally, with no special-casing
+    needed.
+
+    A dropped player -- present in `previous`, absent from `current` (no
+    longer eligible, or no longer tracked at all) -- has no row left to
+    attach an arrow to, and is silently left out of the result; this
+    function only ever produces one entry per id in `current`.
+    """
+    if previous is None:
+        return tuple(PlayerMovement(user_id, "new", 0) for user_id in current)
+
+    previous_position = {user_id: index for index, user_id in enumerate(previous)}
+    movements: list[PlayerMovement] = []
+    for index, user_id in enumerate(current):
+        earlier = previous_position.get(user_id)
+        if earlier is None:
+            movements.append(PlayerMovement(user_id, "new", 0))
+        elif earlier == index:
+            movements.append(PlayerMovement(user_id, "unchanged", 0))
+        elif earlier > index:
+            movements.append(PlayerMovement(user_id, "up", earlier - index))
+        else:
+            movements.append(PlayerMovement(user_id, "down", index - earlier))
+    return tuple(movements)

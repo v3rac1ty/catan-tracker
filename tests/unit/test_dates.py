@@ -15,6 +15,7 @@ from catan_bot.domain.dates import (
     _first_instant_of_local_date,
     combine_local,
     ensure_aware,
+    local_time_in_timezone,
     parse_date,
     parse_time,
     season_end_instant,
@@ -143,6 +144,34 @@ def test_today_in_timezone_rejects_naive_now() -> None:
 def test_today_in_timezone_rejects_bad_zone() -> None:
     with pytest.raises(DomainValidationError):
         today_in_timezone("Mars/Base", now=datetime(2026, 9, 14, 4, 30, tzinfo=UTC))
+
+
+# ---------------------------------------------------------------------------
+# local_time_in_timezone
+# ---------------------------------------------------------------------------
+
+
+def test_local_time_in_timezone_differs_from_utc_late_at_night() -> None:
+    now = datetime(2026, 9, 14, 4, 30, tzinfo=UTC)
+    # America/Chicago is UTC-5 in September (CDT): 04:30 UTC is 23:30 the
+    # previous local day.
+    assert local_time_in_timezone("America/Chicago", now=now) == time(23, 30)
+    assert now.time() == time(4, 30)
+
+
+def test_local_time_in_timezone_utc_matches_utc_time() -> None:
+    now = datetime(2026, 9, 14, 4, 30, tzinfo=UTC)
+    assert local_time_in_timezone("UTC", now=now) == time(4, 30)
+
+
+def test_local_time_in_timezone_rejects_naive_now() -> None:
+    with pytest.raises(ValueError, match="aware"):
+        local_time_in_timezone("UTC", now=datetime(2026, 9, 14, 4, 30))
+
+
+def test_local_time_in_timezone_rejects_bad_zone() -> None:
+    with pytest.raises(DomainValidationError):
+        local_time_in_timezone("Mars/Base", now=datetime(2026, 9, 14, 4, 30, tzinfo=UTC))
 
 
 # ---------------------------------------------------------------------------

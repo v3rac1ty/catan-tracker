@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from fractions import Fraction
 from zoneinfo import ZoneInfo
@@ -40,11 +40,12 @@ from catan_bot.db.models import (
     RsvpRoster,
     Season,
 )
-from catan_bot.domain.ranking import RankedPlayer
+from catan_bot.domain.ranking import PlayerMovement, RankedPlayer
 from catan_bot.domain.scoring import GameRules, ScoreSource, score_sources
 from catan_bot.services.results import (
     Announcement,
     Leaderboard,
+    LeaderboardPost,
     PlayerStatsView,
     ScoreCollectionStatus,
     SeasonInfo,
@@ -506,17 +507,47 @@ def _add_game_audit(embed: discord.Embed, game: Game) -> None:
         _add_field(embed, "Update reason", escape_user_text(reason), inline=False)
 
 
+# Escape sequences (not raw glyphs) so `tests/static/test_source_hygiene.py`
+# never has to reason about which emoji codepoints are "default emoji
+# presentation" and which need an invisible VS16 appended -- these three are
+# all default-emoji already (matching the precedent `_score_collection_icon_line`
+# sets with checkmark/hourglass/no-entry), but spelling them as escapes makes
+# that a non-issue rather than something to get right by eye.
+_MOVEMENT_ARROWS: dict[str, str] = {
+    "up": "\U0001f53c",
+    "down": "\U0001f53d",
+    "new": "\U0001f195",
+    "unchanged": "-",
+}
+
+
+def _movement_suffix(movement: PlayerMovement | None) -> str:
+    """A trailing ` <arrow>[N]` marker, or `""` when there's nothing to show."""
+    if movement is None:
+        return ""
+    arrow = _MOVEMENT_ARROWS[movement.direction]
+    return f" {arrow}{movement.change}" if movement.change else f" {arrow}"
+
+
 def _standings_lines(
-    players: Sequence[RankedPlayer], *, needs_more: bool, min_games: int = 0
+    players: Sequence[RankedPlayer],
+    *,
+    needs_more: bool,
+    min_games: int = 0,
+    movements: Mapping[int, PlayerMovement] | None = None,
 ) -> list[str]:
+    def suffix(user_id: int) -> str:
+        return _movement_suffix(movements.get(user_id)) if movements is not None else ""
+
     if needs_more:
         return [
             f"{mention(p.user_id)} -- needs {max(min_games - p.games, 0)} more game(s)"
+            f"{suffix(p.user_id)}"
             for p in players
         ]
     return [
         f"#{p.rank} {mention(p.user_id)} -- {p.wins}-{p.games - p.wins} "
-        f"({format_win_rate(p.win_rate)})"
+        f"({format_win_rate(p.win_rate)}){suffix(p.user_id)}"
         for p in players
     ]
 
@@ -627,13 +658,30 @@ def build_game_history_embed(games: Sequence[Game], *, member_id: int | None) ->
 _SCOPE_TITLES = {"season": "Season Leaderboard", "all_time": "All-Time Leaderboard"}
 
 
-def build_leaderboard_embed(board: Leaderboard) -> discord.Embed:
+def _build_leaderboard_embed(
+    board: Leaderboard,
+    *,
+    movements: Mapping[int, PlayerMovement] | None = None,
+    lead_field: tuple[str, str] | None = None,
+) -> discord.Embed:
+    """Shared by `build_leaderboard_embed` and `build_leaderboard_post_embed`.
+
+    `lead_field` (the recurring post's "Today's Results") is added -- via
+    the same budget-aware `_add_field` every other field here uses -- before
+    the standings fields, not after: adding it afterward could exceed
+    Discord's total-embed-size limit once the standings fields had already
+    spent most of the budget, since `_add_field` only ever looks at how much
+    room is left *at the time it's called*.
+    """
     embed = discord.Embed(title=_SCOPE_TITLES[board.scope], color=discord.Color.blurple())
     if board.scope == "season":
         if board.season is None:
             embed.description = "There's no active season."
             return embed
         _set_description(embed, f"Season: {escape_user_text(board.season.name)}")
+
+    if lead_field is not None:
+        _add_field(embed, lead_field[0], lead_field[1], inline=False)
 
     eligible = [p for p in board.ranked if p.eligible]
     ineligible = [p for p in board.ranked if not p.eligible]
@@ -642,7 +690,7 @@ def build_leaderboard_embed(board: Leaderboard) -> discord.Embed:
         _add_field(embed, "Standings", "No confirmed games yet.", inline=False)
         return embed
 
-    standings = _standings_lines(eligible, needs_more=False)
+    standings = _standings_lines(eligible, needs_more=False, movements=movements)
     _add_field(
         embed,
         "Standings",
@@ -650,8 +698,38 @@ def build_leaderboard_embed(board: Leaderboard) -> discord.Embed:
         inline=False,
     )
     if ineligible:
-        needs_more = _standings_lines(ineligible, needs_more=True, min_games=board.min_games)
+        needs_more = _standings_lines(
+            ineligible, needs_more=True, min_games=board.min_games, movements=movements
+        )
         _add_field(embed, "Needs more games", "\n".join(needs_more), inline=False)
+    return embed
+
+
+def build_leaderboard_embed(board: Leaderboard) -> discord.Embed:
+    return _build_leaderboard_embed(board)
+
+
+def _day_result_line(game: GameWithParticipants) -> str:
+    losers = ", ".join(mention(uid) for uid in game.loser_ids) or "no one"
+    return f"{mention(game.winner_id)} beat {losers}"
+
+
+def build_leaderboard_post_embed(post: LeaderboardPost) -> discord.Embed:
+    """The recurring leaderboard post: today's results first, then movement-annotated standings.
+
+    Reuses `_build_leaderboard_embed`'s field-budget-aware construction
+    (via its `movements`/`lead_field` parameters) instead of building a
+    second, parallel embed and copying fields over afterward -- see that
+    function's docstring for why field *order* matters here, not just
+    content.
+    """
+    movements_by_id = {movement.user_id: movement for movement in post.movements}
+    lead_field: tuple[str, str] | None = None
+    if post.games:
+        lines = [_day_result_line(game) for game in post.games]
+        lead_field = ("Today's Results", "\n".join(lines))
+    embed = _build_leaderboard_embed(post.board, movements=movements_by_id, lead_field=lead_field)
+    embed.title = truncate(f"{_SCOPE_TITLES[post.board.scope]} Update", EMBED_TITLE_MAX)
     return embed
 
 
@@ -911,6 +989,10 @@ def build_event_reminder_embed(event: Event, offset_minutes: int) -> discord.Emb
 # ---------------------------------------------------------------------------
 
 
+_LEADERBOARD_MODE_LABELS = {"off": "Off", "per_game": "After each game", "daily": "Daily digest"}
+_LEADERBOARD_SCOPE_LABELS = {"season": "Season", "all_time": "All-time"}
+
+
 def build_config_show_embed(config: GuildConfig) -> discord.Embed:
     embed = discord.Embed(title="Server Configuration", color=discord.Color.blurple())
     channel_value = (
@@ -927,6 +1009,29 @@ def build_config_show_embed(config: GuildConfig) -> discord.Embed:
     player_role_value = role_mention(config.player_role_id) if config.player_role_id else "Not set"
     embed.add_field(name="Event player role", value=player_role_value, inline=True)
     embed.add_field(name="Default minimum games", value=str(config.default_min_games), inline=True)
+    embed.add_field(
+        name="Leaderboard post",
+        value=_LEADERBOARD_MODE_LABELS.get(config.leaderboard_mode, config.leaderboard_mode),
+        inline=True,
+    )
+    leaderboard_channel_value = (
+        channel_mention(config.leaderboard_channel_id)
+        if config.leaderboard_channel_id
+        else "Not set"
+    )
+    embed.add_field(name="Leaderboard channel", value=leaderboard_channel_value, inline=True)
+    embed.add_field(
+        name="Leaderboard scope",
+        value=_LEADERBOARD_SCOPE_LABELS.get(config.leaderboard_scope, config.leaderboard_scope),
+        inline=True,
+    )
+    # 24-hour HH:MM, matching `domain.dates.parse_time`'s own 24-hour default
+    # representation; a friendlier 12-hour display is Phase 4 work.
+    embed.add_field(
+        name="Leaderboard daily time",
+        value=config.leaderboard_daily_time.strftime("%H:%M"),
+        inline=True,
+    )
     return embed
 
 
@@ -946,6 +1051,7 @@ __all__ = [
     "build_game_report_embed",
     "build_game_status_embed",
     "build_leaderboard_embed",
+    "build_leaderboard_post_embed",
     "build_season_announcement_embed",
     "build_season_history_embed",
     "build_season_info_embed",

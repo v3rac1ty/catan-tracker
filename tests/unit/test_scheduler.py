@@ -14,7 +14,7 @@ import pytest
 
 from catan_bot.db.models import Event, GuildConfig, Season, SeasonResultRow
 from catan_bot.scheduler import CatanScheduler, _deliverable_role_id, _mention_batches
-from catan_bot.services.results import Announcement, ReminderToSend
+from catan_bot.services.results import Announcement, Leaderboard, LeaderboardPost, ReminderToSend
 
 NOW = datetime(2026, 1, 2, 12, tzinfo=UTC)
 
@@ -134,10 +134,14 @@ async def test_run_tick_isolates_failed_stage_and_sanitizes_logs(
     announcements = AsyncMock(return_value=[])
     reminders = AsyncMock(return_value=[])
     complete = AsyncMock(return_value=0)
+    daily_leaderboards = AsyncMock(return_value=[])
     monkeypatch.setattr("catan_bot.scheduler.season_service.resolve_due_seasons", resolve)
     monkeypatch.setattr("catan_bot.scheduler.season_service.pending_announcements", announcements)
     monkeypatch.setattr("catan_bot.scheduler.event_service.due_reminders", reminders)
     monkeypatch.setattr("catan_bot.scheduler.event_service.complete_past_events", complete)
+    monkeypatch.setattr(
+        "catan_bot.scheduler.leaderboard_service.due_daily_leaderboards", daily_leaderboards
+    )
 
     with caplog.at_level(logging.ERROR, logger="catan_bot.scheduler"):
         await scheduler.run_tick(NOW)
@@ -145,6 +149,7 @@ async def test_run_tick_isolates_failed_stage_and_sanitizes_logs(
     announcements.assert_awaited_once()
     reminders.assert_awaited_once_with(scheduler.pool, NOW)
     complete.assert_awaited_once_with(scheduler.pool, NOW)
+    daily_leaderboards.assert_awaited_once()
     assert "RuntimeError" in caplog.text
     assert "password" not in caplog.text
     assert "DETAIL" not in caplog.text
@@ -165,6 +170,7 @@ async def test_overlapping_tick_is_skipped(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(scheduler, "_send_announcements", AsyncMock())
     monkeypatch.setattr(scheduler, "_send_reminders", AsyncMock())
     monkeypatch.setattr(scheduler, "_complete_events", AsyncMock())
+    monkeypatch.setattr(scheduler, "_send_daily_leaderboards", AsyncMock())
 
     first = asyncio.create_task(scheduler.run_tick(NOW))
     try:
@@ -203,6 +209,7 @@ async def test_chained_postgres_stage_failure_isolated_and_safely_logged(
     announcements = AsyncMock(return_value=[])
     reminders = AsyncMock(return_value=[])
     complete = AsyncMock(return_value=0)
+    daily_leaderboards = AsyncMock(return_value=[])
     if failing_stage == "season_lock":
         resolve.side_effect = chained
     else:
@@ -211,6 +218,9 @@ async def test_chained_postgres_stage_failure_isolated_and_safely_logged(
     monkeypatch.setattr("catan_bot.scheduler.season_service.pending_announcements", announcements)
     monkeypatch.setattr("catan_bot.scheduler.event_service.due_reminders", reminders)
     monkeypatch.setattr("catan_bot.scheduler.event_service.complete_past_events", complete)
+    monkeypatch.setattr(
+        "catan_bot.scheduler.leaderboard_service.due_daily_leaderboards", daily_leaderboards
+    )
 
     with caplog.at_level(logging.ERROR, logger="catan_bot.scheduler"):
         await scheduler.run_tick(NOW)
@@ -218,6 +228,7 @@ async def test_chained_postgres_stage_failure_isolated_and_safely_logged(
     announcements.assert_awaited_once()
     reminders.assert_awaited_once()
     complete.assert_awaited_once_with(scheduler.pool, NOW)
+    daily_leaderboards.assert_awaited_once()
     assert "23514" in caplog.text
     assert "InterfaceError" in caplog.text
     assert marker not in caplog.text
@@ -472,6 +483,109 @@ async def test_one_reminder_processing_failure_does_not_block_another(
     assert send.await_count == 2
     assert "RuntimeError" in caplog.text
     assert "secret" not in caplog.text
+
+
+def _leaderboard_post(guild_id: int, channel_id: int) -> LeaderboardPost:
+    board = Leaderboard(scope="all_time", season=None, min_games=2, ranked=[])
+    return LeaderboardPost(guild_id=guild_id, channel_id=channel_id, board=board, movements=())
+
+
+@pytest.mark.asyncio
+async def test_send_daily_leaderboards_delivers_each_due_post_to_its_own_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = _channel(1)
+    scheduler = _scheduler({(1, 101): channel})
+    post = _leaderboard_post(1, 101)
+    monkeypatch.setattr(
+        "catan_bot.scheduler.leaderboard_service.due_daily_leaderboards",
+        AsyncMock(return_value=[post]),
+    )
+    embed = discord.Embed(title="Digest")
+    render = Mock(return_value=embed)
+    monkeypatch.setattr("catan_bot.scheduler.formatting.build_leaderboard_post_embed", render)
+
+    await scheduler._send_daily_leaderboards(NOW)
+
+    render.assert_called_once_with(post)
+    channel.send.assert_awaited_once()
+    assert channel.send.await_args.kwargs["embed"] is embed
+    assert channel.send.await_args.kwargs["allowed_mentions"].to_dict() == {"parse": []}
+
+
+@pytest.mark.asyncio
+async def test_send_daily_leaderboards_is_cheap_and_silent_when_nothing_is_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _scheduler()
+    due = AsyncMock(return_value=[])
+    monkeypatch.setattr("catan_bot.scheduler.leaderboard_service.due_daily_leaderboards", due)
+
+    await scheduler._send_daily_leaderboards(NOW)
+
+    due.assert_awaited_once_with(scheduler.pool, NOW, 50)
+
+
+@pytest.mark.asyncio
+async def test_send_daily_leaderboards_claim_read_failure_is_isolated_and_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    scheduler = _scheduler()
+    due = AsyncMock(side_effect=RuntimeError("password=secret"))
+    monkeypatch.setattr("catan_bot.scheduler.leaderboard_service.due_daily_leaderboards", due)
+
+    with caplog.at_level(logging.ERROR, logger="catan_bot.scheduler"):
+        await scheduler._send_daily_leaderboards(NOW)
+
+    assert "RuntimeError" in caplog.text
+    assert "secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_send_daily_leaderboards_one_guild_delivery_failure_does_not_block_another(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    failed = _channel(1)
+    failed.send.side_effect = discord.HTTPException(
+        SimpleNamespace(status=500, reason="secret", text="secret"), "secret"
+    )
+    succeeded = _channel(2)
+    scheduler = _scheduler({(1, 101): failed, (2, 102): succeeded})
+    posts = [_leaderboard_post(1, 101), _leaderboard_post(2, 102)]
+    monkeypatch.setattr(
+        "catan_bot.scheduler.leaderboard_service.due_daily_leaderboards",
+        AsyncMock(return_value=posts),
+    )
+    monkeypatch.setattr(
+        "catan_bot.scheduler.formatting.build_leaderboard_post_embed",
+        Mock(return_value=discord.Embed()),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="catan_bot.scheduler"):
+        await scheduler._send_daily_leaderboards(NOW)
+
+    failed.send.assert_awaited_once()
+    succeeded.send.assert_awaited_once()
+    assert "HTTPException" in caplog.text
+    assert "secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_send_daily_leaderboards_skips_unavailable_channel_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler = _scheduler()  # no channel registered anywhere -> unavailable
+    post = _leaderboard_post(1, 101)
+    monkeypatch.setattr(
+        "catan_bot.scheduler.leaderboard_service.due_daily_leaderboards",
+        AsyncMock(return_value=[post]),
+    )
+    render = Mock(return_value=discord.Embed())
+    monkeypatch.setattr("catan_bot.scheduler.formatting.build_leaderboard_post_embed", render)
+
+    await scheduler._send_daily_leaderboards(NOW)
+
+    render.assert_not_called()
 
 
 @pytest.mark.asyncio

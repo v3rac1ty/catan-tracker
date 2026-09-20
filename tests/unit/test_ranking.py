@@ -10,7 +10,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from catan_bot.domain.errors import DomainValidationError
-from catan_bot.domain.ranking import PlayerStats, RankedPlayer, rank_players
+from catan_bot.domain.ranking import PlayerStats, RankedPlayer, compute_movement, rank_players
 
 
 class _IdEnum(IntEnum):
@@ -338,3 +338,89 @@ def test_ranked_player_is_frozen_dataclass() -> None:
     )
     with pytest.raises(AttributeError):
         player.rank = 2  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# compute_movement
+# ---------------------------------------------------------------------------
+
+
+def test_compute_movement_no_previous_board_marks_everyone_new() -> None:
+    movements = compute_movement(None, [3, 1, 2])
+    by_id = {m.user_id: m for m in movements}
+    assert {m.direction for m in movements} == {"new"}
+    assert all(m.change == 0 for m in movements)
+    assert set(by_id) == {1, 2, 3}
+
+
+def test_compute_movement_empty_previous_board_also_marks_everyone_new() -> None:
+    """An empty *previously posted* board (`()`) is a real prior post -- distinct
+    from `None`, "never posted" -- but produces the same per-player result:
+    every current id is simply absent from an empty previous ranking."""
+    movements = compute_movement((), [1, 2])
+    assert {(m.user_id, m.direction, m.change) for m in movements} == {
+        (1, "new", 0),
+        (2, "new", 0),
+    }
+
+
+def test_compute_movement_unchanged_when_order_is_identical() -> None:
+    movements = compute_movement([1, 2, 3], [1, 2, 3])
+    assert all(m.direction == "unchanged" and m.change == 0 for m in movements)
+
+
+def test_compute_movement_detects_upward_and_downward_moves() -> None:
+    # Player 3 climbs from last to first (up 2); player 1 falls from first
+    # to last (down 2); player 2 stays put in the middle.
+    movements = compute_movement([1, 2, 3], [3, 2, 1])
+    by_id = {m.user_id: m for m in movements}
+    assert by_id[3].direction == "up"
+    assert by_id[3].change == 2
+    assert by_id[1].direction == "down"
+    assert by_id[1].change == 2
+    assert by_id[2].direction == "unchanged"
+    assert by_id[2].change == 0
+
+
+def test_compute_movement_new_player_not_in_previous_board() -> None:
+    movements = compute_movement([1, 2], [1, 4, 2])
+    by_id = {m.user_id: m for m in movements}
+    assert by_id[4].direction == "new"
+    assert by_id[4].change == 0
+    # The other two both moved down one position to make room for the new
+    # entrant at position 1 -- confirms "new" doesn't corrupt neighboring
+    # players' own position-based comparisons.
+    assert by_id[1].direction == "unchanged"
+    assert by_id[2].direction == "down"
+    assert by_id[2].change == 1
+
+
+def test_compute_movement_dropped_player_produces_no_entry() -> None:
+    """A player present before but absent now (e.g. no longer eligible) has
+    no row left to attach an arrow to and must not appear in the result."""
+    movements = compute_movement([1, 2, 3], [1, 3])
+    assert {m.user_id for m in movements} == {1, 3}
+    assert 2 not in {m.user_id for m in movements}
+
+
+def test_compute_movement_tied_players_still_have_distinct_positions() -> None:
+    """Two players who share a leaderboard `rank` (a tie) still occupy
+    distinct list *positions* -- a swap between them is real movement even
+    though `RankedPlayer.rank` never changes for either of them."""
+    movements = compute_movement([10, 20], [20, 10])
+    by_id = {m.user_id: m for m in movements}
+    assert by_id[10].direction == "down"
+    assert by_id[10].change == 1
+    assert by_id[20].direction == "up"
+    assert by_id[20].change == 1
+
+
+def test_compute_movement_current_empty_produces_no_entries() -> None:
+    assert compute_movement([1, 2], []) == ()
+
+
+def test_compute_movement_is_a_tuple_of_frozen_dataclasses() -> None:
+    movements = compute_movement(None, [1])
+    assert isinstance(movements, tuple)
+    with pytest.raises(AttributeError):
+        movements[0].change = 5  # type: ignore[misc]

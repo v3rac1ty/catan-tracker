@@ -20,7 +20,7 @@ from catan_bot.db.models import (
     SeasonResultRow,
 )
 from catan_bot.domain.bet import BetOutcome
-from catan_bot.domain.ranking import PlayerStats, RankedPlayer
+from catan_bot.domain.ranking import PlayerMovement, PlayerStats, RankedPlayer
 from catan_bot.domain.scoring import GameRules, PlayerScore
 
 LeaderboardScope = Literal["season", "all_time"]
@@ -65,6 +65,27 @@ class PlayerStatsView:
     user_id: int
     season: PlayerStats | None
     all_time: PlayerStats
+
+
+@dataclass(frozen=True, slots=True)
+class LeaderboardPost:
+    """A recurring leaderboard post, ready for `formatting`/`scheduler` (Phase 3).
+
+    Produced by `services.leaderboard_service` for both delivery paths --
+    the daily digest sweep and the per-game trigger -- so `formatting.
+    build_leaderboard_post_embed` and the scheduler/view that sends it never
+    need to know which path built it. `games` is only ever non-empty for a
+    daily digest (that day's confirmed games, so the post can lead with
+    "who beat whom" before the standings); a per-game post has nothing to
+    add here since the game itself is already visible in its own public
+    message.
+    """
+
+    guild_id: int
+    channel_id: int
+    board: Leaderboard
+    movements: tuple[PlayerMovement, ...]
+    games: tuple[GameWithParticipants, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

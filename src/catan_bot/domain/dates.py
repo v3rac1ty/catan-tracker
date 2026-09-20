@@ -89,6 +89,21 @@ def today_in_timezone(tz_name: str, *, now: datetime) -> date:
     return now.astimezone(zone).date()
 
 
+def local_time_in_timezone(tz_name: str, *, now: datetime) -> time:
+    """The wall-clock time-of-day `now` falls on, local to `tz_name`.
+
+    Companion to `today_in_timezone`: the recurring daily leaderboard digest
+    (`services.leaderboard_service.due_daily_leaderboards`) needs both --
+    the date to check "has today already been posted" and the time to check
+    "has the configured post time passed yet" -- computed from the exact
+    same `now`/timezone pair so the two never disagree about what "now"
+    locally means.
+    """
+    ensure_aware(now, name="now")
+    zone = ZoneInfo(validate_timezone(tz_name))
+    return now.astimezone(zone).time()
+
+
 def parse_date(text: str | None, *, today: date) -> date:
     """Parse a user-supplied date, defaulting to `today` when omitted."""
     stripped = "" if text is None else text.strip()
