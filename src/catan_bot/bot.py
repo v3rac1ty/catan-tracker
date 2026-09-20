@@ -13,7 +13,8 @@ from catan_bot.db.pool import create_pool
 from catan_bot.errors import on_tree_error
 from catan_bot.scheduler import CatanScheduler
 from catan_bot.views.event_rsvp import EventRsvpButton
-from catan_bot.views.game_confirm import GameActionButton
+from catan_bot.views.game_confirm import GameActionButton, GameNudgeButton
+from catan_bot.views.score_entry import ScoreAwardSelect, ScoreClearButton, ScoreEntryButton
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,14 @@ class CatanBot(commands.Bot):
         logger.info("Database pool created")
 
         self.tree.on_error = on_tree_error
-        self.add_dynamic_items(GameActionButton, EventRsvpButton)
+        self.add_dynamic_items(
+            GameActionButton,
+            GameNudgeButton,
+            EventRsvpButton,
+            ScoreEntryButton,
+            ScoreAwardSelect,
+            ScoreClearButton,
+        )
 
         for extension in INITIAL_COGS:
             await self.load_extension(extension)

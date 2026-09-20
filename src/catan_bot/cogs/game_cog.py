@@ -1,4 +1,4 @@
-"""`/game` commands, including the private score-sheet report workflow."""
+"""`/game` commands: reporting, per-player DM score collection, and admin edits."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from catan_bot.cogs.season_cog import filter_date_choices
 from catan_bot.domain.validation import ParticipantRef
 from catan_bot.permissions import actor_from_interaction, guild_id_from_interaction
 from catan_bot.services import game_service
+from catan_bot.views import score_entry
+from catan_bot.views.game_confirm import build_game_action_view
 from catan_bot.views.game_scores import GameScoreSheet
 
 _DEFAULT_HISTORY_LIMIT = 10
@@ -82,6 +84,7 @@ class GameCog(commands.Cog):
         guild_id = guild_id_from_interaction(interaction)
         losers = [m for m in (loser1, loser2, loser3, loser4, loser5) if m is not None]
         winner_ref, loser_refs = _participants(winner, losers)
+        members_by_id = {winner.id: winner, **{loser.id: loser for loser in losers}}
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         prepared = await game_service.prepare_game_report(
@@ -98,19 +101,116 @@ class GameCog(commands.Cog):
             scenario=scenario,
             target_points=target_points,
         )
-        view = GameScoreSheet(
-            pool=self.bot.pool,
-            guild_id=guild_id,
-            actor=actor,
-            prepared=prepared,
-            channel=interaction.channel,
+        # The pending game is created immediately -- Phase 2 no longer waits
+        # for a reporter-facing Submit click. Its public message carries the
+        # existing Confirm/Reject/Nudge buttons and doubles as the live
+        # score sheet; each participant separately gets their own DM to
+        # fill in only their own row (`views/score_entry.py`).
+        created = await game_service.submit_game_report(
+            self.bot.pool, guild_id, actor, prepared, scores=None, now=datetime.now(UTC)
         )
-        private_message = await interaction.edit_original_response(
-            embed=view.embed(),
-            view=view,
+        game_id = created.game.game_id
+        public_message = await interaction.channel.send(
+            embed=formatting.build_game_report_embed(created),
+            view=build_game_action_view(game_id),
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        view.private_message = private_message
+        await game_service.record_game_message(
+            self.bot.pool, guild_id, game_id, public_message.channel.id, public_message.id
+        )
+        participant_ids = (created.winner_id, *created.loser_ids)
+        await game_service.open_score_collection(
+            self.bot.pool, guild_id, game_id, participant_ids, datetime.now(UTC)
+        )
+
+        rules = score_entry.rules_for_game(created.game)
+        blocked: list[discord.Member] = []
+        for user_id in participant_ids:
+            member = members_by_id[user_id]
+            sheet_embed = score_entry.build_score_entry_embed(created, user_id)
+            sheet_view = score_entry.build_score_entry_view(guild_id, game_id, user_id, rules)
+            try:
+                dm_message = await member.send(
+                    embed=sheet_embed,
+                    view=sheet_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.Forbidden:
+                # One player's closed DMs must not break the report for
+                # everyone else -- record it as blocked and keep going;
+                # `/game scores` is their fallback, and the public
+                # message's progress field marks them distinctly.
+                blocked.append(member)
+                await game_service.record_score_request_delivery(
+                    self.bot.pool,
+                    guild_id,
+                    game_id,
+                    user_id,
+                    channel_id=None,
+                    message_id=None,
+                    delivered=False,
+                )
+                continue
+            await game_service.record_score_request_delivery(
+                self.bot.pool,
+                guild_id,
+                game_id,
+                user_id,
+                channel_id=dm_message.channel.id,
+                message_id=dm_message.id,
+                delivered=True,
+            )
+
+        status = await game_service.score_collection_status(self.bot.pool, guild_id, game_id)
+        await public_message.edit(
+            embed=formatting.build_game_report_embed(created, collection=status),
+            view=build_game_action_view(game_id),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        summary = f"Game #{game_id} reported: {public_message.jump_url}"
+        if blocked:
+            names = ", ".join(formatting.mention(member.id) for member in blocked)
+            summary += f"\nCouldn't DM {names} (DMs closed) -- they can run `/game scores` instead."
+        await interaction.edit_original_response(
+            content=summary, embed=None, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    @game_group.command(name="scores", description="Open your own score-entry sheet for a game.")
+    @app_commands.describe(
+        game_id="The game to enter scores for. Defaults to your most recent game "
+        "still awaiting your score."
+    )
+    async def scores_command(
+        self,
+        interaction: discord.Interaction,
+        game_id: app_commands.Range[int, 1, _DISCORD_INTEGER_MAX] | None = None,
+    ) -> None:
+        actor = actor_from_interaction(interaction)
+        guild_id = guild_id_from_interaction(interaction)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        resolved_id = game_id
+        if resolved_id is None:
+            resolved_id = await game_service.find_open_score_request_game_id(
+                self.bot.pool, guild_id, actor.user_id
+            )
+            if resolved_id is None:
+                await interaction.edit_original_response(
+                    content="You have no games waiting on your score."
+                )
+                return
+        game = await game_service.get_game_for_player(
+            self.bot.pool, guild_id, resolved_id, actor.user_id
+        )
+        rules = score_entry.rules_for_game(game.game)
+        embed = score_entry.build_score_entry_embed(game, actor.user_id)
+        selected = score_entry.selected_awards_for(game, actor.user_id, rules)
+        view = score_entry.build_score_entry_view(
+            guild_id, resolved_id, actor.user_id, rules, selected_awards=selected
+        )
+        await interaction.edit_original_response(
+            embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none()
+        )
 
     @game_group.command(name="update", description="Correct a confirmed game (admin).")
     @app_commands.describe(
@@ -193,7 +293,6 @@ class GameCog(commands.Cog):
             actor=actor,
             prepared=prepared,
             channel=interaction.channel,
-            mode="update",
             bot=self.bot,
         )
         private_message = await interaction.edit_original_response(

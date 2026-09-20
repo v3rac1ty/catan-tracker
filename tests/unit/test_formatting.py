@@ -22,6 +22,7 @@ from catan_bot.formatting import (
     escape_user_text,
     format_game_score_table,
 )
+from catan_bot.services.results import PlayerScoreState, ScoreCollectionStatus
 
 
 def _game(game_id: int, reason: str) -> Game:
@@ -296,6 +297,72 @@ def test_game_report_and_status_preserve_score_details_and_legacy_time_message()
         field.name == "Date" and "Time not recorded" in field.value for field in status.fields
     )
     assert not any(field.name == "Revision" for field in status.fields)
+
+
+def test_score_table_marks_unsubmitted_players_with_an_em_dash() -> None:
+    """A partial score sheet (Phase 2 collection still in progress) must
+    never invent a value for a participant who hasn't submitted yet --
+    `format_game_score_table` already handles this via the same NULL-aware
+    lookups it uses for a legacy report's missing rows."""
+    game = _detailed_game()
+    rules = GameRules("normal", extension_5_6=False, target_points=10)
+    partial = GameWithParticipants(
+        game=game, winner_id=10, loser_ids=(20,), scores=(_zero_score(10, rules),)
+    )
+
+    table = format_game_score_table(partial)
+
+    total_line = table.splitlines()[-2]
+    assert "Total" in total_line
+    assert total_line.count("—") == 1
+
+
+def test_score_collection_field_shows_progress_icons_for_each_state() -> None:
+    game = _detailed_game()
+    report = GameWithParticipants(game=game, winner_id=10, loser_ids=(20, 30))
+    status = ScoreCollectionStatus(
+        game=report,
+        requests=(
+            PlayerScoreState(user_id=10, delivery_status="delivered", submitted=True),
+            PlayerScoreState(user_id=20, delivery_status="blocked", submitted=False),
+            PlayerScoreState(user_id=30, delivery_status="pending", submitted=False),
+        ),
+    )
+
+    embed = build_game_report_embed(report, collection=status)
+
+    field = next(f for f in embed.fields if f.name == "Score entry")
+    assert "1 of 3 received" in field.value
+    assert "✅ <@10>" in field.value
+    assert "🚫 <@20>" in field.value
+    assert "/game scores" in field.value
+    assert "⏳ <@30>" in field.value
+
+
+def test_score_collection_field_shows_completion_state() -> None:
+    game = _detailed_game()
+    report = GameWithParticipants(game=game, winner_id=10, loser_ids=(20,))
+    status = ScoreCollectionStatus(
+        game=report,
+        requests=(
+            PlayerScoreState(user_id=10, delivery_status="delivered", submitted=True),
+            PlayerScoreState(user_id=20, delivery_status="delivered", submitted=True),
+        ),
+    )
+
+    embed = build_game_status_embed(report, collection=status)
+
+    field = next(f for f in embed.fields if f.name == "Score entry")
+    assert "All scores received (2/2)" in field.value
+
+
+def test_score_collection_field_is_omitted_without_a_status() -> None:
+    game = _detailed_game()
+    report = GameWithParticipants(game=game, winner_id=10, loser_ids=(20,))
+
+    embed = build_game_report_embed(report)
+
+    assert not any(field.name == "Score entry" for field in embed.fields)
 
 
 def test_revised_game_status_shows_safe_audit_metadata() -> None:

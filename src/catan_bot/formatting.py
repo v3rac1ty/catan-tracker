@@ -46,6 +46,7 @@ from catan_bot.services.results import (
     Announcement,
     Leaderboard,
     PlayerStatsView,
+    ScoreCollectionStatus,
     SeasonInfo,
     SeasonResolution,
 )
@@ -435,6 +436,40 @@ def _add_game_scores(embed: discord.Embed, created: GameWithParticipants) -> Non
     _add_field(embed, "Point breakdown", format_game_score_table(created), inline=False)
 
 
+def _score_collection_icon_line(status: ScoreCollectionStatus) -> str:
+    """One ✅/⏳/🚫 icon per participant, in `game_score_requests` order."""
+
+    icons: list[str] = []
+    for request in status.requests:
+        if request.submitted:
+            icons.append(f"✅ {mention(request.user_id)}")
+        elif request.delivery_status == "blocked":
+            icons.append(f"🚫 {mention(request.user_id)} (DMs closed, run /game scores)")
+        else:
+            icons.append(f"⏳ {mention(request.user_id)}")
+    return "   ".join(icons)
+
+
+def _add_score_collection_field(embed: discord.Embed, status: ScoreCollectionStatus | None) -> None:
+    """The public message's live per-player score-entry progress (Phase 2).
+
+    `status` is `None` for a legacy game reported before per-player DM
+    collection existed (no `game_score_requests` rows at all) and for a
+    caller that hasn't fetched collection status -- either way, the field is
+    simply omitted rather than shown empty or wrong.
+    """
+
+    if status is None or not status.requests:
+        return
+    total = len(status.requests)
+    submitted = len(status.submitted_ids)
+    if status.complete:
+        value = f"All scores received ({submitted}/{total})."
+    else:
+        value = f"{submitted} of {total} received\n" + _score_collection_icon_line(status)
+    _add_field(embed, "Score entry", value, inline=False)
+
+
 def _updated_at_label(value: datetime | None) -> str:
     """Render an audit timestamp without trusting or exposing user text."""
 
@@ -491,8 +526,16 @@ def _standings_lines(
 # ---------------------------------------------------------------------------
 
 
-def build_game_report_embed(created: GameWithParticipants) -> discord.Embed:
-    """A freshly reported, still-pending game. Sent publicly with Confirm/Reject buttons."""
+def build_game_report_embed(
+    created: GameWithParticipants, *, collection: ScoreCollectionStatus | None = None
+) -> discord.Embed:
+    """A freshly reported, still-pending game. Sent publicly with Confirm/Reject buttons.
+
+    `collection` is this game's live score-entry progress (Phase 2): passed
+    whenever the caller has it (the report cog after DM fan-out, a DM
+    sheet's public-message refresh), omitted for the very first send before
+    `open_score_collection` has run yet.
+    """
     game = created.game
     embed = discord.Embed(
         title="Game Reported",
@@ -504,11 +547,14 @@ def build_game_report_embed(created: GameWithParticipants) -> discord.Embed:
     embed.add_field(name="Loser(s)", value=losers_text, inline=True)
     _add_game_details(embed, game)
     _add_game_scores(embed, created)
+    _add_score_collection_field(embed, collection)
     embed.set_footer(text=f"Game #{game.game_id}")
     return embed
 
 
-def build_game_status_embed(updated: GameWithParticipants) -> discord.Embed:
+def build_game_status_embed(
+    updated: GameWithParticipants, *, collection: ScoreCollectionStatus | None = None
+) -> discord.Embed:
     """A game after a confirm/reject/void transition. Replaces the report embed."""
     game = updated.game
     colors = {
@@ -525,6 +571,7 @@ def build_game_status_embed(updated: GameWithParticipants) -> discord.Embed:
     embed.add_field(name="Loser(s)", value=losers_text, inline=True)
     _add_game_details(embed, game)
     _add_game_scores(embed, updated)
+    _add_score_collection_field(embed, collection)
     embed.add_field(name="Status", value=_status_label(game.status), inline=True)
     if game.status == "confirmed" and game.confirmed_by is not None:
         embed.add_field(name="Confirmed by", value=mention(game.confirmed_by), inline=True)

@@ -212,6 +212,29 @@ def test_entry_fields_rejects_non_game_rules() -> None:
         entry_fields("normal")  # type: ignore[arg-type]
 
 
+def test_entry_fields_overflow_is_a_design_invariant_not_domain_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog that broke the <=5-numeric-field invariant must fail loudly
+    as a plain `RuntimeError` (a bug in the catalog itself), never dressed up
+    as a `DomainValidationError` a cog might show back to a player."""
+    import catan_bot.domain.scoring as scoring_module
+
+    rules = build_rules("normal")
+
+    def _six_numeric_sources(_rules: object, *, scenario: str | None = None) -> tuple[object, ...]:
+        return tuple(
+            scoring_module._source(f"numeric_{i}", f"Numeric {i}", "help", "board")
+            for i in range(6)
+        )
+
+    monkeypatch.setattr(scoring_module, "score_sources", _six_numeric_sources)
+
+    with pytest.raises(RuntimeError, match="single modal") as excinfo:
+        entry_fields(rules)
+    assert not isinstance(excinfo.value, DomainValidationError)
+
+
 # ---------------------------------------------------------------------------
 # build_player_score
 # ---------------------------------------------------------------------------
@@ -350,7 +373,7 @@ def test_allow_partial_still_rejects_duplicate_or_nonparticipant_rows() -> None:
         validate_game_scores(rules, [dup, dup], [1, 2], winner_id=1, allow_partial=True)
 
     stranger = row(3, rules, settlements=8)
-    with pytest.raises(DomainValidationError, match="exactly one score"):
+    with pytest.raises(DomainValidationError, match="one of this game's participants"):
         validate_game_scores(rules, [stranger], [1, 2], winner_id=1, allow_partial=True)
 
 

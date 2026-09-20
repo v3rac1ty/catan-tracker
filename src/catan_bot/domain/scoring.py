@@ -393,7 +393,13 @@ def entry_fields(
     numeric = tuple(source for source in sources if source.fixed_points is None)
     awards = tuple(source for source in sources if source.fixed_points is not None)
     if len(numeric) > _MAX_MODAL_NUMERIC_FIELDS:
-        raise DomainValidationError(
+        # This is a design invariant, not bad user input: no `rules` a caller
+        # can actually construct trips it today (every real catalog fits),
+        # and no domain-validation error message would make sense shown to a
+        # player. If a future rules change ever breaks the invariant, this
+        # must fail loudly wherever the catalog changed, not be swallowed by
+        # a cog treating it like an ordinary `DomainValidationError`.
+        raise RuntimeError(
             "This rule set needs more numeric score fields than a single modal "
             f"can hold ({len(numeric)} > {_MAX_MODAL_NUMERIC_FIELDS})."
         )
@@ -584,7 +590,15 @@ def validate_game_scores(
         raise DomainValidationError("The same player can't have more than one score.")
     if allow_partial:
         if not set(ids) <= set(participant_list):
-            raise DomainValidationError("Enter exactly one score for every participant.")
+            # Distinct from the "every participant" coverage message below:
+            # under partial collection, *missing* rows are always fine, so
+            # the only way this branch triggers is a row for someone who
+            # isn't a participant at all -- a different mistake that deserves
+            # its own accurate wording rather than reusing the "exactly one"
+            # phrasing, which would be actively misleading here.
+            raise DomainValidationError(
+                "A score can only be recorded for one of this game's participants."
+            )
     elif set(ids) != set(participant_list):
         raise DomainValidationError("Enter exactly one score for every participant.")
     for score in score_list:

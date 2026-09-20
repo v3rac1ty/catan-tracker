@@ -17,7 +17,8 @@ from catan_bot.cogs.season_cog import SeasonCog
 from catan_bot.cogs.stats_cog import StatsCog
 from catan_bot.config import BotSettings
 from catan_bot.views.event_rsvp import EventRsvpButton
-from catan_bot.views.game_confirm import GameActionButton
+from catan_bot.views.game_confirm import GameActionButton, GameNudgeButton
+from catan_bot.views.score_entry import ScoreAwardSelect, ScoreClearButton, ScoreEntryButton
 
 
 def _settings(*, sync: bool, guild_id: int | None = None) -> BotSettings:
@@ -65,6 +66,7 @@ async def test_all_commands_register_in_an_offline_tree() -> None:
         }
         assert {command.name for command in top_level["game"].commands} == {
             "report",
+            "scores",
             "update",
             "void",
             "history",
@@ -98,7 +100,14 @@ async def test_setup_hook_loads_cogs_and_dynamic_button_without_sync(
 
     await bot.setup_hook()
 
-    add_dynamic.assert_called_once_with(GameActionButton, EventRsvpButton)
+    add_dynamic.assert_called_once_with(
+        GameActionButton,
+        GameNudgeButton,
+        EventRsvpButton,
+        ScoreEntryButton,
+        ScoreAwardSelect,
+        ScoreClearButton,
+    )
     assert [call.args[0] for call in load.await_args_list] == list(bot_module.INITIAL_COGS)
     scheduler_factory.assert_called_once_with(bot)
     scheduler.start.assert_called_once_with()

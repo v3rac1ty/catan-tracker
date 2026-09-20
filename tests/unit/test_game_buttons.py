@@ -26,6 +26,7 @@ def test_game_action_view_is_persistent_and_has_stable_ids() -> None:
     assert [item.item.custom_id for item in view.children] == [
         "game:confirm:42",
         "game:reject:42",
+        "game:nudge:42",
     ]
 
 
@@ -130,3 +131,123 @@ async def test_button_edit_failure_uses_shared_error_handler(
 
     handler.assert_awaited_once()
     assert isinstance(handler.await_args.args[1], discord.HTTPException)
+
+
+# ---------------------------------------------------------------------------
+# GameNudgeButton (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def _nudge_interaction(*, guild_id: int = 123, user_id: int = 456) -> SimpleNamespace:
+    return SimpleNamespace(
+        guild_id=guild_id,
+        user=SimpleNamespace(id=user_id),
+        client=SimpleNamespace(pool="pool"),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+
+def _status(
+    *,
+    winner_id: int = 1,
+    loser_ids: tuple[int, ...] = (2, 3),
+    reported_by: int = 1,
+    outstanding: tuple[int, ...] = (2, 3),
+) -> SimpleNamespace:
+    game = SimpleNamespace(reported_by=reported_by)
+    inner = SimpleNamespace(winner_id=winner_id, loser_ids=loser_ids, game=game)
+    return SimpleNamespace(game=inner, outstanding_ids=outstanding)
+
+
+@pytest.mark.asyncio
+async def test_nudge_button_custom_id_round_trip() -> None:
+    match = game_confirm.GameNudgeButton.__discord_ui_compiled_template__.fullmatch(
+        "game:nudge:987"
+    )
+    assert match is not None
+    raw_item = discord.ui.Button(custom_id="game:nudge:987")
+
+    rebuilt = await game_confirm.GameNudgeButton.from_custom_id(SimpleNamespace(), raw_item, match)
+
+    assert rebuilt.game_id == 987
+    assert rebuilt.item.custom_id == "game:nudge:987"
+
+
+@pytest.mark.asyncio
+async def test_nudge_button_pings_only_outstanding_players_with_scoped_mentions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(game_confirm, "_last_nudge_at", {})
+    interaction = _nudge_interaction(user_id=1)  # the reporter, not a loser
+    actor = Actor(user_id=1, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_confirm.game_service, "score_collection_status", AsyncMock(return_value=_status())
+    )
+
+    await game_confirm.GameNudgeButton(42).callback(interaction)
+
+    interaction.response.send_message.assert_awaited_once()
+    content = interaction.response.send_message.await_args.args[0]
+    assert "<@2>" in content
+    assert "<@3>" in content
+    allowed = interaction.response.send_message.await_args.kwargs["allowed_mentions"]
+    assert allowed.everyone is False
+    assert allowed.roles is False
+    assert {user.id for user in allowed.users} == {2, 3}
+
+
+@pytest.mark.asyncio
+async def test_nudge_button_rejects_a_non_participant_non_reporter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(game_confirm, "_last_nudge_at", {})
+    interaction = _nudge_interaction(user_id=999)
+    actor = Actor(user_id=999, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_confirm.game_service, "score_collection_status", AsyncMock(return_value=_status())
+    )
+    handler = AsyncMock()
+    monkeypatch.setattr(game_confirm, "handle_interaction_error", handler)
+
+    await game_confirm.GameNudgeButton(42).callback(interaction)
+
+    interaction.response.send_message.assert_not_awaited()
+    handler.assert_awaited_once()
+    assert handler.await_args.kwargs == {"command_name": "game:nudge"}
+
+
+@pytest.mark.asyncio
+async def test_nudge_button_reports_when_everyone_already_submitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(game_confirm, "_last_nudge_at", {})
+    interaction = _nudge_interaction(user_id=1)
+    actor = Actor(user_id=1, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_confirm.game_service,
+        "score_collection_status",
+        AsyncMock(return_value=_status(outstanding=())),
+    )
+
+    await game_confirm.GameNudgeButton(42).callback(interaction)
+
+    assert "already submitted" in interaction.response.send_message.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_nudge_button_is_rate_limited_per_game(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(game_confirm, "_last_nudge_at", {})
+    actor = Actor(user_id=1, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_confirm.game_service, "score_collection_status", AsyncMock(return_value=_status())
+    )
+
+    await game_confirm.GameNudgeButton(42).callback(_nudge_interaction(user_id=1))
+    second = _nudge_interaction(user_id=1)
+    await game_confirm.GameNudgeButton(42).callback(second)
+
+    assert "try again in" in second.response.send_message.await_args.args[0]

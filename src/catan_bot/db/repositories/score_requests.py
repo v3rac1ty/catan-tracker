@@ -60,6 +60,25 @@ WHERE guild_id = $1 AND game_id = $2
 ORDER BY user_id
 """
 
+# Backs `/game scores` (no game id given): a player's own ephemeral fallback
+# sheet for whichever game most recently asked them for a score and hasn't
+# gotten one yet. Joined against `games` (not just `game_score_requests`)
+# so a request left dangling by a since-rejected/voided game -- which never
+# gets an explicit score_requests cleanup -- doesn't surface a sheet that
+# can no longer accept a write; `record_player_score`/`clear_player_score`
+# re-check the game's live status anyway, but there's no reason to hand a
+# player a dead sheet in the first place.
+_SELECT_LATEST_OPEN_REQUEST_FOR_USER_SQL = """
+SELECT r.game_id, r.guild_id, r.user_id, r.dm_channel_id, r.dm_message_id, r.delivery_status,
+       r.requested_at, r.next_prompt_at, r.prompts_sent, r.submitted_at
+FROM game_score_requests r
+JOIN games g ON g.game_id = r.game_id AND g.guild_id = r.guild_id
+WHERE r.guild_id = $1 AND r.user_id = $2 AND r.submitted_at IS NULL
+      AND g.status IN ('pending', 'confirmed')
+ORDER BY r.requested_at DESC
+LIMIT 1
+"""
+
 # System-wide (no guild_id): the scheduler must see every guild's due
 # re-prompts in one pass, matching `events.claim_due_reminders`. Unlike that
 # query, this one is bounded by a caller-supplied `limit`, and Postgres has
@@ -200,6 +219,21 @@ async def list_score_requests(
     require_id(game_id, name="game_id")
     rows = await conn.fetch(_SELECT_REQUESTS_FOR_GAME_SQL, guild_id, game_id)
     return [_row_to_score_request(row) for row in rows]
+
+
+async def get_latest_open_request(
+    conn: asyncpg.Connection, guild_id: int, user_id: int
+) -> ScoreRequest | None:
+    """The most recently requested game this user hasn't yet submitted a score for.
+
+    `None` when the user has no open request (nothing pending, or every open
+    game's request already got a row -- see `_SELECT_LATEST_OPEN_REQUEST_FOR_USER_SQL`
+    for why a rejected/voided game's leftover request never counts).
+    """
+    require_id(guild_id, name="guild_id")
+    require_id(user_id, name="user_id")
+    row = await conn.fetchrow(_SELECT_LATEST_OPEN_REQUEST_FOR_USER_SQL, guild_id, user_id)
+    return _row_to_score_request(row) if row is not None else None
 
 
 async def claim_due_prompts(

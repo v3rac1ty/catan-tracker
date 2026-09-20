@@ -1,14 +1,33 @@
-"""Private, reporter-owned score-sheet UI for a pending Catan report.
+"""Admin-only score-correction sheet for a confirmed game (`/game update`).
 
-The sheet deliberately has no database identity.  It is a short-lived
-Discord draft; only a successful Submit creates a pending game.  Blank cells
-therefore remain distinct from an explicit zero all the way to the service.
+Phase 2 moved the reporter-facing score sheet to per-player DMs
+(`views/score_entry.py`): `/game report` no longer builds one big paginated
+table here, and this module now serves exactly one workflow -- an
+administrator correcting a *confirmed* game's roster/rules/scores.
+
+Like its predecessor, this sheet deliberately has no database identity of
+its own: it's a short-lived (30-minute) in-memory Discord draft owned by the
+editor, and only a successful Save update mutates anything. It differs from
+`views/score_entry.py` in that it is NOT a `discord.ui.DynamicItem` set: an
+admin session doesn't need to survive 24 hours or a bot restart the way
+per-player score collection does, so a plain, stateful `discord.ui.View`
+(this file's `GameScoreSheet`) is the right tool here, exactly like the
+Confirm/Reject buttons are the wrong tool for something that needs to
+survive a restart and DM sheets are the wrong tool for something this
+short-lived.
+
+One page, one player at a time: a player picker (there's a roster to
+choose from -- unlike `views/score_entry.py`, which only ever edits the one
+player it was DM'd to), a numeric modal (`entry_fields`, <=5 inputs), and an
+award multi-select for whichever player is currently selected. Blank cells
+remain distinct from an explicit zero exactly as before, just tracked per
+player instead of per page: a player's row must be entirely filled or
+entirely blank before Save update will include (or omit) it.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
 from contextlib import suppress
 from time import monotonic
 from typing import TYPE_CHECKING, Any
@@ -17,29 +36,18 @@ import discord
 
 from catan_bot import formatting
 from catan_bot.domain.errors import DomainValidationError
-from catan_bot.domain.scoring import PlayerScore, ScoreEntry, ScoreSource, score_sources
+from catan_bot.domain.scoring import PlayerScore, ScoreEntry, entry_fields, score_sources
 from catan_bot.errors import handle_interaction_error
 from catan_bot.services import game_service
 from catan_bot.services.errors import ServiceError
-from catan_bot.views.game_confirm import build_game_action_view
 
 if TYPE_CHECKING:
     from catan_bot.services.context import Actor
 
 _BLANK = "—"
-_TOTAL_KEY = "__total__"
 _MAX_VALUE = 99
+_TIMEOUT_SECONDS = 1800
 _MAX_UPDATE_REFRESH_ATTEMPTS = 2
-
-
-def score_pages(rules: object) -> tuple[tuple[ScoreSource, ...], ...]:
-    """Split source rows so every edit modal stays within Discord's five inputs."""
-    sources = score_sources(rules)  # type: ignore[arg-type]
-    first = tuple(sources[:4])
-    remaining = tuple(sources[4:])
-    pages: list[tuple[ScoreSource, ...]] = [first]
-    pages.extend(tuple(remaining[index : index + 5]) for index in range(0, len(remaining), 5))
-    return tuple(pages)
 
 
 def parse_score_cell(value: str) -> int | None:
@@ -64,31 +72,20 @@ def _table_label(value: str, width: int = 28) -> str:
     return value if len(value) <= width else value[: width - 1] + "…"
 
 
-class _SheetSelect(discord.ui.Select[Any]):
-    def __init__(self, sheet: GameScoreSheet, *, kind: str) -> None:
+class _PlayerSelect(discord.ui.Select[Any]):
+    def __init__(self, sheet: GameScoreSheet) -> None:
         self.sheet = sheet
-        self.kind = kind
-        if kind == "player":
-            options = [
-                discord.SelectOption(label=f"P{index + 1}: {user_id}", value=str(user_id))
-                for index, user_id in enumerate(sheet.participant_ids)
-            ]
-            placeholder = "Choose player"
-        else:
-            options = [
-                discord.SelectOption(label=f"Score page {index + 1}", value=str(index))
-                for index in range(len(sheet.pages))
-            ]
-            placeholder = "Choose score page"
-        super().__init__(placeholder=placeholder, options=options, row=0 if kind == "player" else 1)
+        options = [
+            discord.SelectOption(label=f"P{index + 1}: {user_id}", value=str(user_id))
+            for index, user_id in enumerate(sheet.participant_ids)
+        ]
+        super().__init__(placeholder="Choose player", options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if not await self.sheet.ensure_editable(interaction):
             return
-        if self.kind == "player":
-            self.sheet.selected_player_id = int(self.values[0])
-        else:
-            self.sheet.selected_page = int(self.values[0])
+        self.sheet.selected_player_id = int(self.values[0])
+        self.sheet.rebuild_award_select()
         await interaction.response.edit_message(
             embed=self.sheet.embed(),
             view=self.sheet,
@@ -96,28 +93,82 @@ class _SheetSelect(discord.ui.Select[Any]):
         )
 
 
+class _AwardSelect(discord.ui.Select[Any]):
+    """Award claims for the currently-selected player.
+
+    Rebuilt (not just re-rendered) every time the selected player changes,
+    so its `default=True` options always reflect that player's own claimed
+    awards -- see `GameScoreSheet.rebuild_award_select`.
+    """
+
+    def __init__(self, sheet: GameScoreSheet) -> None:
+        self.sheet = sheet
+        selected = sheet.claimed_awards(sheet.selected_player_id)
+        options = [
+            discord.SelectOption(
+                label=source.label, value=source.key, default=source.key in selected
+            )
+            for source in sheet.award_sources
+        ]
+        super().__init__(
+            placeholder="Claim awards for the selected player",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.sheet.ensure_editable(interaction):
+            return
+        await self.sheet.set_awards(
+            interaction, player_id=self.sheet.selected_player_id, awards=self.values
+        )
+
+
 class _EditButton(discord.ui.Button[Any]):
     def __init__(self, sheet: GameScoreSheet) -> None:
         self.sheet = sheet
-        super().__init__(label="Edit selected player", style=discord.ButtonStyle.primary, row=2)
+        super().__init__(label="Edit points", style=discord.ButtonStyle.primary, row=2)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if not await self.sheet.ensure_editable(interaction):
             return
         await interaction.response.send_modal(
-            ScorePageModal(
+            ScoreNumericModal(
                 self.sheet,
                 player_id=self.sheet.selected_player_id,
-                page_index=self.sheet.selected_page,
                 revision=self.sheet.revision,
             )
         )
 
 
+class _ClearPlayerButton(discord.ui.Button[Any]):
+    def __init__(self, sheet: GameScoreSheet) -> None:
+        self.sheet = sheet
+        super().__init__(label="Clear selected player", style=discord.ButtonStyle.secondary, row=2)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.sheet.ensure_editable(interaction):
+            return
+        await self.sheet.clear_player(interaction, player_id=self.sheet.selected_player_id)
+
+
+class _ClearAllButton(discord.ui.Button[Any]):
+    """Escape hatch for replacing every player's stored score with SQL NULLs."""
+
+    def __init__(self, sheet: GameScoreSheet) -> None:
+        self.sheet = sheet
+        super().__init__(label="Clear all points", style=discord.ButtonStyle.danger, row=2)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.sheet.clear_all_points(interaction)
+
+
 class _SubmitButton(discord.ui.Button[Any]):
     def __init__(self, sheet: GameScoreSheet) -> None:
         self.sheet = sheet
-        super().__init__(label=sheet.submit_label, style=discord.ButtonStyle.success, row=2)
+        super().__init__(label="Save update", style=discord.ButtonStyle.success, row=2)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await self.sheet.submit(interaction)
@@ -132,19 +183,8 @@ class _CancelButton(discord.ui.Button[Any]):
         await self.sheet.cancel(interaction)
 
 
-class _ClearAllButton(discord.ui.Button[Any]):
-    """Update-only escape hatch for replacing historic scores with SQL NULLs."""
-
-    def __init__(self, sheet: GameScoreSheet) -> None:
-        self.sheet = sheet
-        super().__init__(label="Clear all points", style=discord.ButtonStyle.danger, row=3)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await self.sheet.clear_all_points(interaction)
-
-
 class GameScoreSheet(discord.ui.View):
-    """An ephemeral score draft, owned by the reporter for fifteen minutes."""
+    """An ephemeral admin score-correction draft, owned by the editor for 30 minutes."""
 
     def __init__(
         self,
@@ -154,67 +194,63 @@ class GameScoreSheet(discord.ui.View):
         actor: Actor,
         prepared: object,
         channel: discord.abc.Messageable,
-        mode: str = "report",
         bot: object | None = None,
     ) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=_TIMEOUT_SECONDS)
         self.pool = pool
         self.guild_id = guild_id
         self.actor = actor
         self.prepared = prepared
         self.channel = channel
-        self.mode = mode
         self.bot = bot
-        if self.mode not in {"report", "update"}:
-            raise ValueError("mode must be 'report' or 'update'")
         self.participant_ids = (prepared.winner_id, *prepared.loser_ids)
-        self.pages = score_pages(prepared.rules)
-        self.sources = tuple(source for page in self.pages for source in page)
+        self.rules = prepared.rules
+        self.numeric_sources, self.award_sources = entry_fields(self.rules)
+        self.all_sources = score_sources(self.rules)
         self.values: dict[int, dict[str, int | None]] = {
-            user_id: {_TOTAL_KEY: None, **{source.key: None for source in self.sources}}
+            user_id: {source.key: None for source in self.all_sources}
             for user_id in self.participant_ids
         }
-        if self.is_update:
-            self._prefill_update_scores()
+        self._prefill_from_initial_scores()
         self.selected_player_id = self.participant_ids[0]
-        self.selected_page = 0
         self.revision = 0
-        self.created_report: object | None = None
         self.updated_game: object | None = None
-        self.public_message: discord.Message | None = None
-        self.message_recorded = False
         self.cancelled = False
         self.completed = False
         self.expired = False
         self.private_message: discord.Message | None = None
         self._lock = asyncio.Lock()
-        self._deadline = monotonic() + 900
-        self.add_item(_SheetSelect(self, kind="player"))
-        self.add_item(_SheetSelect(self, kind="page"))
+        self._deadline = monotonic() + _TIMEOUT_SECONDS
+        self._player_select = _PlayerSelect(self)
+        self.add_item(self._player_select)
+        self._award_select = _AwardSelect(self)
+        self.add_item(self._award_select)
         self.add_item(_EditButton(self))
+        self.add_item(_ClearPlayerButton(self))
+        self.add_item(_ClearAllButton(self))
         self.add_item(_SubmitButton(self))
         self.add_item(_CancelButton(self))
-        if self.is_update:
-            self.add_item(_ClearAllButton(self))
 
-    @property
-    def is_update(self) -> bool:
-        return self.mode == "update"
-
-    @property
-    def submit_label(self) -> str:
-        return "Save update" if self.is_update else "Submit report"
-
-    def _prefill_update_scores(self) -> None:
+    def _prefill_from_initial_scores(self) -> None:
         """Copy only compatible stored cells; absent/legacy scores stay genuinely blank."""
         for score in getattr(self.prepared, "initial_scores", ()):
             if score.user_id not in self.values:
                 continue
-            self.values[score.user_id][_TOTAL_KEY] = score.total_points
             source_values = {entry.key: entry.points for entry in score.breakdown}
-            for source in self.sources:
+            for source in self.all_sources:
                 if source.key in source_values:
                     self.values[score.user_id][source.key] = source_values[source.key]
+
+    def claimed_awards(self, player_id: int) -> frozenset[str]:
+        return frozenset(
+            source.key for source in self.award_sources if self.values[player_id].get(source.key)
+        )
+
+    def rebuild_award_select(self) -> None:
+        """Swap in a fresh `_AwardSelect` reflecting the now-selected player's awards."""
+        self.remove_item(self._award_select)
+        self._award_select = _AwardSelect(self)
+        self.add_item(self._award_select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if monotonic() >= self._deadline:
@@ -228,10 +264,7 @@ class GameScoreSheet(discord.ui.View):
                 return False
             return True
         await _ephemeral_notice(
-            interaction,
-            "Only the administrator who started this update can edit this sheet."
-            if self.is_update
-            else "Only the reporter in this server can edit this sheet.",
+            interaction, "Only the administrator who started this update can edit this sheet."
         )
         return False
 
@@ -240,7 +273,7 @@ class GameScoreSheet(discord.ui.View):
             f"{'P' + str(index + 1):>4}" for index in range(len(self.participant_ids))
         )
         rows = [header]
-        for source in self.sources:
+        for source in self.all_sources:
             values = []
             for user_id in self.participant_ids:
                 value = self.values[user_id][source.key]
@@ -249,8 +282,11 @@ class GameScoreSheet(discord.ui.View):
             rows.append(f"{_table_label(source.label):<28}" + cells)
         totals = []
         for user_id in self.participant_ids:
-            value = self.values[user_id][_TOTAL_KEY]
-            totals.append(_BLANK if value is None else str(value))
+            row = self.values[user_id]
+            if any(row[source.key] is None for source in self.all_sources):
+                totals.append(_BLANK)
+            else:
+                totals.append(str(sum(row[source.key] for source in self.all_sources)))  # type: ignore[misc]
         rows.append(f"{'TOTAL':<28}" + "".join(f"{value:>4}" for value in totals))
         legend = " · ".join(
             [
@@ -258,48 +294,44 @@ class GameScoreSheet(discord.ui.View):
                 for index, user_id in enumerate(self.participant_ids)
             ]
         )
-        title = "Update game score sheet" if self.is_update else "Game score sheet"
-        context = ""
-        if self.is_update:
-            original = self.prepared.original
-            current_roster = ", ".join(
-                _mention(user_id)
-                for user_id in (
-                    getattr(original, "winner_id", self.prepared.winner_id),
-                    *getattr(original, "loser_ids", self.prepared.loser_ids),
-                )
+        original = self.prepared.original
+        current_roster = ", ".join(
+            _mention(user_id)
+            for user_id in (
+                getattr(original, "winner_id", self.prepared.winner_id),
+                *getattr(original, "loser_ids", self.prepared.loser_ids),
             )
-            proposed_roster = ", ".join(_mention(user_id) for user_id in self.participant_ids)
-            old_scenario = discord.utils.escape_mentions(
-                str(getattr(original.game, "scenario", None) or "none")
-            )
-            new_scenario = discord.utils.escape_mentions(
-                str(getattr(self.prepared.rules, "scenario", None) or "none")
-            )
-            old = (
-                f"Current: #{self.prepared.game_id} · {original.game.game_type}"
-                f" · {original.game.played_on} · scenario: {old_scenario}"
-            )
-            proposed = (
-                f"Proposed: {self.prepared.rules.game_type} · {self.prepared.played_on}"
-                f" · target {self.prepared.rules.target_points} · scenario: {new_scenario}"
-            )
-            context = (
-                old[:350]
-                + "\n"
-                + proposed[:350]
-                + "\n"
-                + f"Current roster: {current_roster}\nProposed roster: {proposed_roster}\n"
-                + f"Editing revision {self.prepared.expected_revision}.\n"
-            )
+        )
+        proposed_roster = ", ".join(_mention(user_id) for user_id in self.participant_ids)
+        old_scenario = discord.utils.escape_mentions(
+            str(getattr(original.game, "scenario", None) or "none")
+        )
+        new_scenario = discord.utils.escape_mentions(str(self.rules.scenario or "none"))
+        old = (
+            f"Current: #{self.prepared.game_id} · {original.game.game_type}"
+            f" · {original.game.played_on} · scenario: {old_scenario}"
+        )
+        proposed = (
+            f"Proposed: {self.rules.game_type} · {self.prepared.played_on}"
+            f" · target {self.rules.target_points} · scenario: {new_scenario}"
+        )
+        context = (
+            old[:350]
+            + "\n"
+            + proposed[:350]
+            + "\n"
+            + f"Current roster: {current_roster}\nProposed roster: {proposed_roster}\n"
+            + f"Editing revision {self.prepared.expected_revision}. "
+            + f"Selected player: {_mention(self.selected_player_id)}.\n"
+        )
         embed = discord.Embed(
-            title=title, description=context + "```\n" + "\n".join(rows) + "\n```\n" + legend
+            title="Update game score sheet",
+            description=context + "```\n" + "\n".join(rows) + "\n```\n" + legend,
         )
         embed.set_footer(
             text=(
-                "Only you can edit. Blank cells remain unrecorded; explicit 0 is preserved."
-                if not self.is_update
-                else "Only you can edit. Clear all points stores no score data; 0 is preserved."
+                "Only you can edit. A player's row must be entirely filled or entirely "
+                "blank -- Clear selected player resets just one row."
             )
         )
         return embed
@@ -311,7 +343,7 @@ class GameScoreSheet(discord.ui.View):
     def _freeze_after_persist(self) -> None:
         self.revision += 1
         for child in self.children:
-            if getattr(child, "label", None) != self.submit_label:
+            if getattr(child, "label", None) != "Save update":
                 child.disabled = True
 
     async def ensure_editable(self, interaction: discord.Interaction) -> bool:
@@ -321,73 +353,108 @@ class GameScoreSheet(discord.ui.View):
         if monotonic() >= self._deadline:
             self.expired = True
         editable = not (
-            self.expired or self.cancelled or self.completed or self._persisted_result() is not None
+            self.expired or self.cancelled or self.completed or self.updated_game is not None
         )
         if not editable:
             await _ephemeral_notice(interaction, "This score sheet is no longer editable.")
         return editable
 
-    def _scores_or_none(self) -> tuple[PlayerScore, ...] | None:
-        every_value = [value for player in self.values.values() for value in player.values()]
-        if all(value is None for value in every_value):
-            return None
-        if any(value is None for value in every_value):
-            raise ValueError(
-                "This score sheet is partial. Fill every total and point source, or clear every "
-                "cell."
-            )
-        return tuple(
-            PlayerScore(
-                user_id=user_id,
-                total_points=self.values[user_id][_TOTAL_KEY],  # type: ignore[arg-type]
-                breakdown=tuple(
-                    ScoreEntry(key=source.key, points=self.values[user_id][source.key])  # type: ignore[arg-type]
-                    for source in self.sources
-                ),
-            )
-            for user_id in self.participant_ids
-        )
+    def _collect_scores(self) -> tuple[PlayerScore, ...]:
+        """Every player whose row is entirely filled; entirely-blank rows stay absent.
 
-    def _persisted_result(self) -> object | None:
-        return self.updated_game if self.is_update else self.created_report
+        A row with *some* fields set and others blank is a half-finished
+        edit, not real partial-collection data, so it raises rather than
+        silently dropping (or silently zero-filling) the missing cells.
+        """
+        scores: list[PlayerScore] = []
+        for user_id in self.participant_ids:
+            row = self.values[user_id]
+            values = [row[source.key] for source in self.all_sources]
+            if all(value is None for value in values):
+                continue
+            if any(value is None for value in values):
+                raise ValueError(
+                    f"{_mention(user_id)}'s row is partially filled. Finish every field, "
+                    "or use Clear selected player to reset it."
+                )
+            breakdown = tuple(
+                ScoreEntry(source.key, row[source.key])  # type: ignore[arg-type]
+                for source in self.all_sources
+            )
+            total = sum(entry.points for entry in breakdown)
+            scores.append(PlayerScore(user_id=user_id, total_points=total, breakdown=breakdown))
+        return tuple(scores)
+
+    async def clear_player(self, interaction: discord.Interaction, *, player_id: int) -> None:
+        await interaction.response.defer()
+        async with self._lock:
+            if not await self._guard_still_editable(interaction):
+                return
+            for source in self.all_sources:
+                self.values[player_id][source.key] = None
+            self.revision += 1
+        if self.selected_player_id == player_id:
+            self.rebuild_award_select()
+        await self._refresh_private()
 
     async def clear_all_points(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
         async with self._lock:
-            if (
-                self.expired
-                or monotonic() >= self._deadline
-                or self.cancelled
-                or self.completed
-                or self._persisted_result() is not None
-            ):
-                self.expired = self.expired or monotonic() >= self._deadline
-                await _ephemeral_notice(interaction, "This score sheet is no longer editable.")
+            if not await self._guard_still_editable(interaction):
                 return
             for player_values in self.values.values():
                 for key in player_values:
                     player_values[key] = None
             self.revision += 1
+        self.rebuild_award_select()
         await _ephemeral_notice(
             interaction, "All points cleared. Saving will leave score fields unrecorded."
         )
         await self._refresh_private()
 
-    async def save_page(
+    async def _guard_still_editable(self, interaction: discord.Interaction) -> bool:
+        """Same terminal-state guard as `ensure_editable`, for use *inside* the lock."""
+        if (
+            self.expired
+            or monotonic() >= self._deadline
+            or self.cancelled
+            or self.completed
+            or self.updated_game is not None
+        ):
+            self.expired = self.expired or monotonic() >= self._deadline
+            await _ephemeral_notice(interaction, "This score sheet is no longer editable.")
+            return False
+        return True
+
+    async def set_awards(
+        self, interaction: discord.Interaction, *, player_id: int, awards: list[str]
+    ) -> None:
+        await interaction.response.defer()
+        async with self._lock:
+            if not await self._guard_still_editable(interaction):
+                return
+            claimed = set(awards)
+            for source in self.award_sources:
+                self.values[player_id][source.key] = (
+                    source.fixed_points if source.key in claimed else 0
+                )
+            self.revision += 1
+        await self._refresh_private()
+
+    async def save_numeric(
         self,
         interaction: discord.Interaction,
         *,
         player_id: int,
-        page_index: int,
         revision: int,
-        values: Sequence[int | None],
+        values: tuple[int | None, ...],
     ) -> None:
         async with self._lock:
             if self.expired or monotonic() >= self._deadline:
                 self.expired = True
                 await _ephemeral_notice(interaction, "This score sheet has expired.")
                 return
-            if self.cancelled or self.completed or self._persisted_result() is not None:
+            if self.cancelled or self.completed or self.updated_game is not None:
                 await _ephemeral_notice(interaction, "This score sheet is no longer editable.")
                 return
             if revision != self.revision:
@@ -395,14 +462,12 @@ class GameScoreSheet(discord.ui.View):
                     interaction, "That score form is stale. Open it again and retry."
                 )
                 return
-            fields = ((_TOTAL_KEY,) if page_index == 0 else ()) + tuple(
-                source.key for source in self.pages[page_index]
-            )
+            fields = tuple(source.key for source in self.numeric_sources)
             if len(fields) != len(values):
                 raise ValueError("The score form has an unexpected number of fields.")
             self.values[player_id].update(zip(fields, values, strict=True))
             self.revision += 1
-        await _ephemeral_notice(interaction, "Score page saved.")
+        await _ephemeral_notice(interaction, "Points saved.")
         await self._refresh_private()
 
     async def submit(self, interaction: discord.Interaction) -> None:
@@ -416,107 +481,63 @@ class GameScoreSheet(discord.ui.View):
                 await _ephemeral_notice(interaction, "This score sheet was cancelled.")
                 return
             if self.completed:
-                await _ephemeral_notice(
-                    interaction,
-                    "This update has already been saved."
-                    if self.is_update
-                    else "This game report has already been submitted.",
-                )
+                await _ephemeral_notice(interaction, "This update has already been saved.")
                 return
             try:
-                scores = None if self._persisted_result() is not None else self._scores_or_none()
+                scores = None if self.updated_game is not None else self._collect_scores() or None
             except ValueError as exc:
                 await _ephemeral_notice(interaction, str(exc))
                 return
             try:
-                persisted_before_submit = self._persisted_result() is not None
+                persisted_before_submit = self.updated_game is not None
                 if not persisted_before_submit:
-                    if self.is_update:
-                        # Rebuild privileges at the final mutation, not only when opening the draft.
-                        from catan_bot.permissions import actor_from_interaction
+                    # Rebuild privileges at the final mutation, not only when opening the draft.
+                    from catan_bot.permissions import actor_from_interaction
 
-                        self.updated_game = await game_service.submit_game_update(
-                            self.pool,
-                            self.guild_id,
-                            actor_from_interaction(interaction),
-                            self.prepared,
-                            scores=scores,
-                            now=discord.utils.utcnow(),
-                        )
-                    else:
-                        self.created_report = await game_service.submit_game_report(
-                            self.pool,
-                            self.guild_id,
-                            self.actor,
-                            self.prepared,
-                            scores=scores,
-                            now=discord.utils.utcnow(),
-                        )
+                    self.updated_game = await game_service.submit_game_update(
+                        self.pool,
+                        self.guild_id,
+                        actor_from_interaction(interaction),
+                        self.prepared,
+                        scores=scores,
+                        now=discord.utils.utcnow(),
+                    )
                     self._freeze_after_persist()
                     await interaction.edit_original_response(
                         embed=self.embed(),
                         view=self,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
-                if self.is_update:
+                else:
                     # A retry is only a message refresh. Load the authoritative current
                     # row first so this draft cannot re-render stale metadata.
-                    if persisted_before_submit:
-                        self.updated_game = await game_service.get_game(
-                            self.pool, self.guild_id, self.prepared.game_id
-                        )
-                    await self._refresh_updated_message()
-                elif self.public_message is None:
-                    self.public_message = await self.channel.send(
-                        embed=formatting.build_game_report_embed(self.created_report),
-                        view=build_game_action_view(self.created_report.game.game_id),
-                        allowed_mentions=discord.AllowedMentions.none(),
+                    self.updated_game = await game_service.get_game(
+                        self.pool, self.guild_id, self.prepared.game_id
                     )
-                if not self.is_update and not self.message_recorded:
-                    await game_service.record_game_message(
-                        self.pool,
-                        self.guild_id,
-                        self.created_report.game.game_id,
-                        self.public_message.channel.id,
-                        self.public_message.id,
-                    )
-                    self.message_recorded = True
+                await self._refresh_updated_message()
             except (DomainValidationError, ServiceError) as exc:
                 await handle_interaction_error(interaction, exc, command_name="game:score-sheet")
                 return
             except Exception as exc:
-                if self._persisted_result() is None:
+                if self.updated_game is None:
                     await handle_interaction_error(
                         interaction, exc, command_name="game:score-sheet"
                     )
                 else:
-                    message = (
+                    await _ephemeral_notice(
+                        interaction,
                         "The update was saved, but its announcement could not be refreshed. "
-                        "Press Save update to retry; /game show has the current report."
-                        if self.is_update
-                        else (
-                            "The report was saved but could not be fully published. "
-                            "Press Submit to retry."
-                        )
+                        "Press Save update to retry; /game show has the current report.",
                     )
-                    await _ephemeral_notice(interaction, message)
                 return
             self.completed = True
             self._disable_controls()
-        if self.is_update:
-            await interaction.edit_original_response(
-                content=f"Game #{self.prepared.game_id} updated.",
-                embed=formatting.build_game_status_embed(self.updated_game),
-                view=self,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        else:
-            await interaction.edit_original_response(
-                content=f"Report submitted: {self.public_message.jump_url}",
-                embed=None,
-                view=self,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+        await interaction.edit_original_response(
+            content=f"Game #{self.prepared.game_id} updated.",
+            embed=formatting.build_game_status_embed(self.updated_game),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def cancel(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
@@ -526,30 +547,18 @@ class GameScoreSheet(discord.ui.View):
                 await _ephemeral_notice(interaction, "This score sheet has expired.")
                 return
             if self.completed:
-                await _ephemeral_notice(
-                    interaction,
-                    "This update has already been saved."
-                    if self.is_update
-                    else "This game report has already been submitted.",
-                )
+                await _ephemeral_notice(interaction, "This update has already been saved.")
                 return
-            if self._persisted_result() is not None:
+            if self.updated_game is not None:
                 await _ephemeral_notice(
                     interaction,
-                    "This update was already saved and cannot be cancelled from the score sheet."
-                    if self.is_update
-                    else (
-                        "This report was already saved and cannot be cancelled "
-                        "from the score sheet."
-                    ),
+                    "This update was already saved and cannot be cancelled from the score sheet.",
                 )
                 return
             self.cancelled = True
             self._disable_controls()
         await interaction.edit_original_response(
-            content="Game update cancelled. No changes were saved."
-            if self.is_update
-            else "Game report cancelled. No game was created.",
+            content="Game update cancelled. No changes were saved.",
             embed=None,
             view=self,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -618,27 +627,16 @@ class GameScoreSheet(discord.ui.View):
             if self.completed or self.cancelled:
                 return
             self.expired = True
-            created = self._persisted_result() is not None
+            created = self.updated_game is not None
             self._disable_controls()
         if self.private_message is not None:
             with suppress(discord.HTTPException):
                 await self.private_message.edit(
                     content=(
-                        (
-                            "Score sheet expired after an update was saved; "
-                            "its announcement may need refreshing."
-                            if self.is_update
-                            else (
-                                "Score sheet expired after a report was saved; "
-                                "its publication may need retrying."
-                            )
-                        )
+                        "Score sheet expired after an update was saved; "
+                        "its announcement may need refreshing."
                         if created
-                        else (
-                            "Score sheet expired. No changes were saved."
-                            if self.is_update
-                            else "Score sheet expired. No game was created."
-                        )
+                        else "Score sheet expired. No changes were saved."
                     ),
                     embed=None,
                     view=self,
@@ -646,22 +644,17 @@ class GameScoreSheet(discord.ui.View):
                 )
 
 
-class ScorePageModal(discord.ui.Modal, title="Enter Catan points"):
-    def __init__(
-        self, sheet: GameScoreSheet, *, player_id: int, page_index: int, revision: int
-    ) -> None:
+class ScoreNumericModal(discord.ui.Modal, title="Enter Catan points"):
+    def __init__(self, sheet: GameScoreSheet, *, player_id: int, revision: int) -> None:
         super().__init__(timeout=900)
         self.sheet = sheet
         self.player_id = player_id
-        self.page_index = page_index
         self.revision = revision
-        fields = ((_TOTAL_KEY, "Total points"),) if page_index == 0 else ()
-        fields += tuple((source.key, source.label) for source in sheet.pages[page_index])
         self.inputs: list[discord.ui.TextInput[Any]] = []
-        for key, label in fields:
-            existing = sheet.values[player_id][key]
+        for source in sheet.numeric_sources:
+            existing = sheet.values[player_id][source.key]
             item = discord.ui.TextInput(
-                label=label[:45],
+                label=source.label[:45],
                 default="" if existing is None else str(existing),
                 required=False,
                 max_length=2,
@@ -683,10 +676,7 @@ class ScorePageModal(discord.ui.Modal, title="Enter Catan points"):
         ):
             return True
         await _ephemeral_notice(
-            interaction,
-            "Only the administrator who started this update can edit this sheet."
-            if self.sheet.is_update
-            else "Only the reporter in this server can edit this sheet.",
+            interaction, "Only the administrator who started this update can edit this sheet."
         )
         return False
 
@@ -696,7 +686,7 @@ class ScorePageModal(discord.ui.Modal, title="Enter Catan points"):
             self.sheet.expired
             or self.sheet.cancelled
             or self.sheet.completed
-            or self.sheet._persisted_result()
+            or self.sheet.updated_game is not None
         ):
             await _ephemeral_notice(interaction, "This score sheet is no longer editable.")
             return
@@ -705,12 +695,8 @@ class ScorePageModal(discord.ui.Modal, title="Enter Catan points"):
         except ValueError as exc:
             await _ephemeral_notice(interaction, str(exc))
             return
-        await self.sheet.save_page(
-            interaction,
-            player_id=self.player_id,
-            page_index=self.page_index,
-            revision=self.revision,
-            values=values,
+        await self.sheet.save_numeric(
+            interaction, player_id=self.player_id, revision=self.revision, values=values
         )
 
 

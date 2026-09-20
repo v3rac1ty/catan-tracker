@@ -12,7 +12,13 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Literal
 
-from catan_bot.db.models import Event, GameWithParticipants, Season, SeasonResultRow
+from catan_bot.db.models import (
+    Event,
+    GameWithParticipants,
+    ScoreRequestDeliveryStatus,
+    Season,
+    SeasonResultRow,
+)
 from catan_bot.domain.bet import BetOutcome
 from catan_bot.domain.ranking import PlayerStats, RankedPlayer
 from catan_bot.domain.scoring import GameRules, PlayerScore
@@ -107,6 +113,56 @@ class PreparedGameReport:
     played_at: datetime | None
     played_timezone: str | None
     rules: GameRules
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerScoreState:
+    """One participant's DM delivery/submission state for Phase 2's score collection.
+
+    A thin, display-ready projection of `db.models.ScoreRequest` -- everything
+    `formatting`'s progress field and `/game scores`'s access check need,
+    without exposing DM channel/message ids or the re-prompt schedule that
+    only the scheduler cares about.
+    """
+
+    user_id: int
+    delivery_status: ScoreRequestDeliveryStatus
+    submitted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ScoreCollectionStatus:
+    """Per-participant score-collection progress for one game (Phase 2).
+
+    Bundles the authoritative game/roster row with each participant's DM
+    delivery/submission state, in the same user-id order `game_score_requests`
+    is read back in. This is what both the public message's live progress
+    field (`formatting`) and the nudge button (`views.game_confirm`) need to
+    render "who's left" without querying the repository layer directly.
+    """
+
+    game: GameWithParticipants
+    requests: tuple[PlayerScoreState, ...]
+
+    @property
+    def submitted_ids(self) -> tuple[int, ...]:
+        return tuple(request.user_id for request in self.requests if request.submitted)
+
+    @property
+    def outstanding_ids(self) -> tuple[int, ...]:
+        return tuple(request.user_id for request in self.requests if not request.submitted)
+
+    @property
+    def blocked_ids(self) -> tuple[int, ...]:
+        return tuple(
+            request.user_id
+            for request in self.requests
+            if not request.submitted and request.delivery_status == "blocked"
+        )
+
+    @property
+    def complete(self) -> bool:
+        return len(self.requests) > 0 and all(request.submitted for request in self.requests)
 
 
 @dataclass(frozen=True, slots=True)

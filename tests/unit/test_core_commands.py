@@ -11,6 +11,7 @@ from catan_bot.domain.errors import DomainValidationError
 from catan_bot.domain.scoring import GameRules
 from catan_bot.permissions import actor_from_interaction, guild_id_from_interaction
 from catan_bot.services.context import Actor
+from catan_bot.services.errors import PermissionDeniedError
 
 
 def _interaction(*, guild_id: int = 123, user_id: int = 456) -> SimpleNamespace:
@@ -62,6 +63,7 @@ def test_group_cogs_expose_every_m4_subcommand() -> None:
     assert game.name == "game"
     assert {command.name for command in game.commands} == {
         "report",
+        "scores",
         "update",
         "void",
         "history",
@@ -226,13 +228,36 @@ async def test_season_start_defers_before_service_and_edits_original(
     _assert_no_mentions(interaction.edit_original_response.await_args)
 
 
+def _reported_game(*, winner_id: int = 456, loser_ids: tuple[int, ...] = (789,)) -> SimpleNamespace:
+    game = SimpleNamespace(
+        game_id=42,
+        game_type="normal",
+        extension_5_6=False,
+        scenario=None,
+        target_points=10,
+        status="pending",
+        channel_id=None,
+        message_id=None,
+        reported_by=winner_id,
+    )
+    return SimpleNamespace(game=game, winner_id=winner_id, loser_ids=loser_ids, scores=())
+
+
 @pytest.mark.asyncio
-async def test_game_report_prepares_a_private_score_sheet_before_creating_a_game(
+async def test_game_report_creates_the_game_immediately_and_dms_every_participant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Phase 2: `/game report` no longer waits for a reporter Submit click --
+    the pending game and its public message exist before any DM is sent."""
     interaction = _interaction()
-    sent = SimpleNamespace(channel=SimpleNamespace(id=700), id=800)
-    interaction.edit_original_response.return_value = sent
+    interaction.channel.send = AsyncMock(
+        return_value=SimpleNamespace(
+            channel=SimpleNamespace(id=700),
+            id=800,
+            jump_url="https://example.test/800",
+            edit=AsyncMock(),
+        )
+    )
     pool = object()
     cog = game_cog.GameCog(SimpleNamespace(pool=pool))
     actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
@@ -241,25 +266,130 @@ async def test_game_report_prepares_a_private_score_sheet_before_creating_a_game
         loser_ids=(789,),
         rules=GameRules(game_type="normal", target_points=10),
     )
-    winner = SimpleNamespace(id=456, bot=False)
-    loser = SimpleNamespace(id=789, bot=False)
+    created = _reported_game()
+    winner = SimpleNamespace(
+        id=456,
+        bot=False,
+        send=AsyncMock(return_value=SimpleNamespace(channel=SimpleNamespace(id=1), id=2)),
+    )
+    loser = SimpleNamespace(
+        id=789,
+        bot=False,
+        send=AsyncMock(return_value=SimpleNamespace(channel=SimpleNamespace(id=3), id=4)),
+    )
 
     monkeypatch.setattr(game_cog, "actor_from_interaction", lambda _: actor)
-    prepare = AsyncMock(return_value=prepared)
-    submit = AsyncMock()
-    monkeypatch.setattr(game_cog.game_service, "prepare_game_report", prepare)
+    monkeypatch.setattr(
+        game_cog.game_service, "prepare_game_report", AsyncMock(return_value=prepared)
+    )
+    submit = AsyncMock(return_value=created)
     monkeypatch.setattr(game_cog.game_service, "submit_game_report", submit)
+    record_message = AsyncMock()
+    monkeypatch.setattr(game_cog.game_service, "record_game_message", record_message)
+    open_collection = AsyncMock()
+    monkeypatch.setattr(game_cog.game_service, "open_score_collection", open_collection)
+    deliveries: list[object] = []
+
+    async def _record_delivery(*_args: object, **kwargs: object) -> None:
+        deliveries.append(kwargs)
+
+    monkeypatch.setattr(game_cog.game_service, "record_score_request_delivery", _record_delivery)
+    monkeypatch.setattr(
+        game_cog.game_service, "score_collection_status", AsyncMock(return_value=object())
+    )
+    monkeypatch.setattr(
+        game_cog.formatting, "build_game_report_embed", lambda *_a, **_k: discord.Embed()
+    )
+    monkeypatch.setattr(game_cog, "build_game_action_view", lambda _game_id: object())
+    monkeypatch.setattr(
+        game_cog.score_entry, "build_score_entry_embed", lambda *_a: discord.Embed()
+    )
+    monkeypatch.setattr(game_cog.score_entry, "build_score_entry_view", lambda *_a, **_k: object())
     command = game_cog.GameCog.game_group.get_command("report")
     assert command is not None
 
     await command.callback(cog, interaction, winner, loser, None, None, None, None, None)
 
     interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
-    prepare.assert_awaited_once()
-    submit.assert_not_awaited()
+    submit.assert_awaited_once()
+    assert submit.await_args.kwargs["scores"] is None
+    record_message.assert_awaited_once_with(pool, 123, 42, 700, 800)
+    open_collection.assert_awaited_once()
+    assert open_collection.await_args.args[2] == 42
+    assert set(open_collection.await_args.args[3]) == {456, 789}
+    winner.send.assert_awaited_once()
+    loser.send.assert_awaited_once()
+    assert len(deliveries) == 2
+    assert all(kwargs["delivered"] is True for kwargs in deliveries)
     edited = interaction.edit_original_response.await_args
-    assert edited.kwargs["view"].timeout == 900
-    _assert_no_mentions(edited)
+    assert "Game #42 reported" in edited.kwargs["content"]
+    assert "https://example.test/800" in edited.kwargs["content"]
+
+
+@pytest.mark.asyncio
+async def test_game_report_marks_closed_dms_blocked_and_keeps_going(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    interaction.channel.send = AsyncMock(
+        return_value=SimpleNamespace(
+            channel=SimpleNamespace(id=700),
+            id=800,
+            jump_url="https://example.test/800",
+            edit=AsyncMock(),
+        )
+    )
+    cog = game_cog.GameCog(SimpleNamespace(pool=object()))
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    prepared = SimpleNamespace(
+        winner_id=456, loser_ids=(789,), rules=GameRules(game_type="normal", target_points=10)
+    )
+    created = _reported_game()
+    winner = SimpleNamespace(
+        id=456,
+        bot=False,
+        send=AsyncMock(return_value=SimpleNamespace(channel=SimpleNamespace(id=1), id=2)),
+    )
+    forbidden = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "closed")
+    loser = SimpleNamespace(id=789, bot=False, send=AsyncMock(side_effect=forbidden))
+
+    monkeypatch.setattr(game_cog, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_cog.game_service, "prepare_game_report", AsyncMock(return_value=prepared)
+    )
+    monkeypatch.setattr(
+        game_cog.game_service, "submit_game_report", AsyncMock(return_value=created)
+    )
+    monkeypatch.setattr(game_cog.game_service, "record_game_message", AsyncMock())
+    monkeypatch.setattr(game_cog.game_service, "open_score_collection", AsyncMock())
+    deliveries: list[dict[str, object]] = []
+
+    async def _record_delivery(*_args: object, **kwargs: object) -> None:
+        deliveries.append(kwargs)
+
+    monkeypatch.setattr(game_cog.game_service, "record_score_request_delivery", _record_delivery)
+    monkeypatch.setattr(
+        game_cog.game_service, "score_collection_status", AsyncMock(return_value=object())
+    )
+    monkeypatch.setattr(
+        game_cog.formatting, "build_game_report_embed", lambda *_a, **_k: discord.Embed()
+    )
+    monkeypatch.setattr(game_cog, "build_game_action_view", lambda _game_id: object())
+    monkeypatch.setattr(
+        game_cog.score_entry, "build_score_entry_embed", lambda *_a: discord.Embed()
+    )
+    monkeypatch.setattr(game_cog.score_entry, "build_score_entry_view", lambda *_a, **_k: object())
+    command = game_cog.GameCog.game_group.get_command("report")
+    assert command is not None
+
+    await command.callback(cog, interaction, winner, loser, None, None, None, None, None)
+
+    assert len(deliveries) == 2
+    blocked = next(kwargs for kwargs in deliveries if kwargs["delivered"] is False)
+    assert blocked["channel_id"] is None and blocked["message_id"] is None
+    edited = interaction.edit_original_response.await_args
+    assert "DMs closed" in edited.kwargs["content"]
+    assert "<@789>" in edited.kwargs["content"]
 
 
 @pytest.mark.asyncio
@@ -294,8 +424,113 @@ async def test_game_update_prepares_an_ephemeral_sheet_without_submitting(
     assert prepare.await_args.kwargs["losers"] is None
     submit.assert_not_awaited()
     edited = interaction.edit_original_response.await_args
-    assert edited.kwargs["view"].mode == "update"
+    assert edited.kwargs["view"].timeout == 1800
     _assert_no_mentions(edited)
+
+
+@pytest.mark.asyncio
+async def test_game_scores_with_explicit_id_opens_a_participants_sheet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    cog = game_cog.GameCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    game = SimpleNamespace(game=SimpleNamespace())
+    monkeypatch.setattr(game_cog, "actor_from_interaction", lambda _: actor)
+    get_for_player = AsyncMock(return_value=game)
+    monkeypatch.setattr(game_cog.game_service, "get_game_for_player", get_for_player)
+    find_open = AsyncMock()
+    monkeypatch.setattr(game_cog.game_service, "find_open_score_request_game_id", find_open)
+    monkeypatch.setattr(game_cog.score_entry, "rules_for_game", lambda _g: object())
+    monkeypatch.setattr(
+        game_cog.score_entry, "build_score_entry_embed", lambda *_a: discord.Embed()
+    )
+    monkeypatch.setattr(game_cog.score_entry, "selected_awards_for", lambda *_a: frozenset())
+    monkeypatch.setattr(game_cog.score_entry, "build_score_entry_view", lambda *_a, **_k: object())
+    command = game_cog.GameCog.game_group.get_command("scores")
+    assert command is not None
+
+    await command.callback(cog, interaction, 42)
+
+    find_open.assert_not_awaited()
+    get_for_player.assert_awaited_once_with("pool", 123, 42, 456)
+    edited = interaction.edit_original_response.await_args
+    assert isinstance(edited.kwargs["embed"], discord.Embed)
+
+
+@pytest.mark.asyncio
+async def test_game_scores_without_an_id_falls_back_to_the_open_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    cog = game_cog.GameCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_cog, "actor_from_interaction", lambda _: actor)
+    find_open = AsyncMock(return_value=77)
+    monkeypatch.setattr(game_cog.game_service, "find_open_score_request_game_id", find_open)
+    get_for_player = AsyncMock(return_value=SimpleNamespace(game=SimpleNamespace()))
+    monkeypatch.setattr(game_cog.game_service, "get_game_for_player", get_for_player)
+    monkeypatch.setattr(game_cog.score_entry, "rules_for_game", lambda _g: object())
+    monkeypatch.setattr(
+        game_cog.score_entry, "build_score_entry_embed", lambda *_a: discord.Embed()
+    )
+    monkeypatch.setattr(game_cog.score_entry, "selected_awards_for", lambda *_a: frozenset())
+    monkeypatch.setattr(game_cog.score_entry, "build_score_entry_view", lambda *_a, **_k: object())
+    command = game_cog.GameCog.game_group.get_command("scores")
+    assert command is not None
+
+    await command.callback(cog, interaction, None)
+
+    find_open.assert_awaited_once_with("pool", 123, 456)
+    get_for_player.assert_awaited_once_with("pool", 123, 77, 456)
+
+
+@pytest.mark.asyncio
+async def test_game_scores_without_an_open_request_says_so_and_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interaction = _interaction()
+    cog = game_cog.GameCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_cog, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_cog.game_service, "find_open_score_request_game_id", AsyncMock(return_value=None)
+    )
+    get_for_player = AsyncMock()
+    monkeypatch.setattr(game_cog.game_service, "get_game_for_player", get_for_player)
+    command = game_cog.GameCog.game_group.get_command("scores")
+    assert command is not None
+
+    await command.callback(cog, interaction, None)
+
+    get_for_player.assert_not_awaited()
+    edited = interaction.edit_original_response.await_args
+    assert "no games waiting" in edited.kwargs["content"]
+
+
+@pytest.mark.asyncio
+async def test_game_scores_access_control_is_delegated_to_the_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-participant must be rejected -- proven here by asserting the
+    cog calls `get_game_for_player` (whose own tests cover the rejection)
+    rather than the unguarded `get_game`."""
+    interaction = _interaction()
+    cog = game_cog.GameCog(SimpleNamespace(pool="pool"))
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_cog, "actor_from_interaction", lambda _: actor)
+    get_game = AsyncMock()
+    monkeypatch.setattr(game_cog.game_service, "get_game", get_game)
+    get_for_player = AsyncMock(side_effect=PermissionDeniedError("Only a participant..."))
+    monkeypatch.setattr(game_cog.game_service, "get_game_for_player", get_for_player)
+    command = game_cog.GameCog.game_group.get_command("scores")
+    assert command is not None
+
+    with pytest.raises(PermissionDeniedError):
+        await command.callback(cog, interaction, 42)
+
+    get_game.assert_not_awaited()
+    get_for_player.assert_awaited_once()
 
 
 @pytest.mark.asyncio

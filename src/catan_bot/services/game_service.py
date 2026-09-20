@@ -8,14 +8,14 @@ fixed-message `ServiceError` (failure) -- never a raw repository outcome.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime
 from typing import cast
 
 import asyncpg
 
 from catan_bot.db.models import Game, GameWithParticipants, TransitionResult
-from catan_bot.db.repositories import games, guilds, players, seasons
+from catan_bot.db.repositories import games, guilds, players, score_requests, seasons
 from catan_bot.domain.dates import (
     combine_local,
     parse_date,
@@ -24,7 +24,13 @@ from catan_bot.domain.dates import (
     today_in_timezone,
 )
 from catan_bot.domain.errors import DomainValidationError
-from catan_bot.domain.scoring import GameType, PlayerScore, build_rules, validate_game_scores
+from catan_bot.domain.scoring import (
+    GameType,
+    PlayerScore,
+    build_player_score,
+    build_rules,
+    validate_game_scores,
+)
 from catan_bot.domain.validation import (
     VOID_REASON_MAX,
     ParticipantRef,
@@ -40,9 +46,19 @@ from catan_bot.services.errors import (
     PermissionDeniedError,
     ServiceError,
 )
-from catan_bot.services.results import PreparedGameReport, PreparedGameUpdate
+from catan_bot.services.results import (
+    PlayerScoreState,
+    PreparedGameReport,
+    PreparedGameUpdate,
+    ScoreCollectionStatus,
+)
 
 _HISTORY_MIN_LIMIT, _HISTORY_MAX_LIMIT = 1, 25
+# `games.confirm_game`/`reject_game` still guard `pending`; score collection
+# additionally tolerates `confirmed` (an admin may confirm before every
+# participant has submitted -- e.g. after a manual chase outside Discord),
+# but never `rejected`/`voided`.
+_SCORE_COLLECTION_OPEN_STATUSES = ("pending", "confirmed")
 
 _GAME_NOT_FOUND = "That game report doesn't exist."
 _GAME_NOT_PENDING = "That game has already been confirmed, rejected, or voided."
@@ -55,6 +71,8 @@ _UPDATE_STALE = "That game was changed by someone else. Reload it and try again.
 _UPDATE_NOOP = "No changes to save."
 _UPDATE_COMPLETED_SEASON = "Games in a completed season can't change their players or winner."
 _UPDATE_NOT_FOUND = "That game report doesn't exist."
+_SCORE_GAME_NOT_OPEN = "This game is no longer accepting scores."
+_SCORE_NOT_PARTICIPANT = "Only a participant in this game can submit a score for it."
 
 
 def _clamp(n: int, lo: int, hi: int) -> int:
@@ -444,11 +462,17 @@ async def submit_game_update(
     if guild_id != prepared.guild_id or actor.user_id != prepared.editor_id:
         raise PermissionDeniedError("Only the administrator who started this update can submit it.")
     proposed_ids = (prepared.winner_id, *prepared.loser_ids)
+    # `allow_partial=True`: an admin correction can land while a game's
+    # per-player DM score collection (Phase 2) is still in progress, so this
+    # must tolerate the same "some rows present, some not" shape
+    # `record_player_score` does -- never force every participant's row to
+    # be re-supplied just to fix one player's total.
     validated_scores = validate_game_scores(
         prepared.rules,
         scores,
         participant_ids=proposed_ids,
         winner_id=prepared.winner_id,
+        allow_partial=True,
     )
     async with pool.acquire() as conn, conn.transaction():
         config = await guilds.ensure_guild(conn, guild_id)
@@ -516,6 +540,7 @@ async def submit_game_update(
             played_at=prepared.played_at,
             played_timezone=prepared.played_timezone,
             scores=validated_scores,
+            allow_partial=True,
             updated_by=actor.user_id,
             reason=prepared.update_reason,
         )
@@ -606,6 +631,184 @@ async def record_game_message(
 ) -> None:
     async with pool.acquire() as conn:
         await games.set_game_message(conn, guild_id, game_id, channel_id, message_id)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: per-player DM score collection.
+# ---------------------------------------------------------------------------
+
+
+async def open_score_collection(
+    pool: asyncpg.Pool, guild_id: int, game_id: int, user_ids: Sequence[int], now: datetime
+) -> None:
+    """Seed one pending `game_score_requests` row per participant.
+
+    Called once, right after a freshly reported game's public message is
+    sent -- the cog fans a DM out to each `user_id` and records delivery
+    separately via `record_score_request_delivery`, but every participant
+    gets a tracked row here regardless of whether their DM ever lands.
+    """
+    async with pool.acquire() as conn:
+        await score_requests.create_score_requests(conn, guild_id, game_id, user_ids, now)
+
+
+async def record_score_request_delivery(
+    pool: asyncpg.Pool,
+    guild_id: int,
+    game_id: int,
+    user_id: int,
+    *,
+    channel_id: int | None,
+    message_id: int | None,
+    delivered: bool,
+) -> None:
+    """Record one participant's DM outcome: delivered (with its ids) or blocked.
+
+    `delivered=False` covers `discord.Forbidden` (closed DMs) and any other
+    reason the DM couldn't be sent -- the cog's fan-out must keep going for
+    the rest of the roster either way, so this never raises on an unknown
+    guild/game/user; it's simply a no-op update in that case, matching the
+    underlying repository calls.
+    """
+    async with pool.acquire() as conn:
+        if delivered:
+            if channel_id is None or message_id is None:
+                raise ValueError("channel_id and message_id are required when delivered=True")
+            await score_requests.mark_delivered(
+                conn, guild_id, game_id, user_id, channel_id, message_id
+            )
+        else:
+            await score_requests.mark_blocked(conn, guild_id, game_id, user_id)
+
+
+async def record_player_score(
+    pool: asyncpg.Pool,
+    guild_id: int,
+    game_id: int,
+    user_id: int,
+    *,
+    numeric: Mapping[str, int],
+    awards: Iterable[str],
+    now: datetime,
+) -> GameWithParticipants:
+    """Build, validate, and persist one participant's own score row.
+
+    Locks the game row for the duration of the write (matching
+    `submit_game_update`'s optimistic-concurrency pattern, minus the
+    revision token -- there's no draft to go stale here, just a race between
+    two participants submitting at nearly the same moment) so the exclusive-
+    award check below always sees every row already on file. Only `pending`
+    or `confirmed` games accept a score; a rejected or voided game's roster
+    is final and never gets a new row, however the game got there.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        current = await games.lock_game(conn, guild_id, game_id)
+        if current is None:
+            raise NotFoundError(_GAME_NOT_FOUND)
+        if current.game.status not in _SCORE_COLLECTION_OPEN_STATUSES:
+            raise ConflictError(_SCORE_GAME_NOT_OPEN)
+        participant_ids = (current.winner_id, *current.loser_ids)
+        if user_id not in participant_ids:
+            raise PermissionDeniedError(_SCORE_NOT_PARTICIPANT)
+        rules = build_rules(
+            current.game.game_type,
+            extension_5_6=current.game.extension_5_6,
+            scenario=current.game.scenario,
+            target_points=current.game.target_points,
+            player_count=len(participant_ids),
+        )
+        score = build_player_score(rules, user_id, numeric=numeric, awards=awards)
+        # Re-validate the *whole* set -- this row plus every other row
+        # already on file -- so an exclusive-award conflict (e.g. two
+        # players both claiming Longest Road) is caught before either write
+        # lands, with a message that names the conflicting award. The
+        # winner's-target check only fires once the winner's own row is
+        # among these, exactly like every other `allow_partial=True` caller.
+        other_scores = tuple(s for s in current.scores if s.user_id != user_id)
+        validate_game_scores(
+            rules,
+            (*other_scores, score),
+            participant_ids=participant_ids,
+            winner_id=current.winner_id,
+            allow_partial=True,
+        )
+        await games.set_player_score(conn, guild_id, game_id, user_id, score)
+        await score_requests.mark_submitted(conn, guild_id, game_id, user_id, now)
+        return await _load_or_die(conn, guild_id, game_id)
+
+
+async def clear_player_score(
+    pool: asyncpg.Pool, guild_id: int, game_id: int, user_id: int, now: datetime
+) -> GameWithParticipants:
+    """Return one participant's score row to unrecorded (SQL NULL).
+
+    `now` is threaded through even though nothing here reads it yet, for the
+    same reason every other clock-taking function in this module does: a
+    future revision that needs to timestamp the clear -- e.g. resetting
+    `next_prompt_at` so the scheduler resumes chasing them -- shouldn't have
+    to touch every caller's signature (cog, tests, ...) just to add it.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        current = await games.lock_game(conn, guild_id, game_id)
+        if current is None:
+            raise NotFoundError(_GAME_NOT_FOUND)
+        if current.game.status not in _SCORE_COLLECTION_OPEN_STATUSES:
+            raise ConflictError(_SCORE_GAME_NOT_OPEN)
+        participant_ids = (current.winner_id, *current.loser_ids)
+        if user_id not in participant_ids:
+            raise PermissionDeniedError(_SCORE_NOT_PARTICIPANT)
+        await games.set_player_score(conn, guild_id, game_id, user_id, None)
+        return await _load_or_die(conn, guild_id, game_id)
+
+
+async def score_collection_status(
+    pool: asyncpg.Pool, guild_id: int, game_id: int
+) -> ScoreCollectionStatus:
+    """Who has submitted, who hasn't, and who's blocked for one game."""
+    async with pool.acquire() as conn:
+        game = await games.get_game(conn, guild_id, game_id)
+        if game is None:
+            raise NotFoundError(_GAME_NOT_FOUND)
+        requests = await score_requests.list_score_requests(conn, guild_id, game_id)
+    return ScoreCollectionStatus(
+        game=game,
+        requests=tuple(
+            PlayerScoreState(
+                user_id=request.user_id,
+                delivery_status=request.delivery_status,
+                submitted=request.submitted_at is not None,
+            )
+            for request in requests
+        ),
+    )
+
+
+async def find_open_score_request_game_id(
+    pool: asyncpg.Pool, guild_id: int, user_id: int
+) -> int | None:
+    """The most recent game still awaiting `user_id`'s score, if any.
+
+    Backs `/game scores` when no `game_id` is given.
+    """
+    async with pool.acquire() as conn:
+        request = await score_requests.get_latest_open_request(conn, guild_id, user_id)
+    return request.game_id if request is not None else None
+
+
+async def get_game_for_player(
+    pool: asyncpg.Pool, guild_id: int, game_id: int, user_id: int
+) -> GameWithParticipants:
+    """Load a game, but only for one of its own participants (`/game scores`).
+
+    Keeps the "only a participant may open this game's sheet" access check
+    in the services layer rather than the cog, matching every other
+    permission decision in this module.
+    """
+    game = await get_game(pool, guild_id, game_id)
+    participant_ids = (game.winner_id, *game.loser_ids)
+    if user_id not in participant_ids:
+        raise PermissionDeniedError(_SCORE_NOT_PARTICIPANT)
+    return game
 
 
 async def game_history(
