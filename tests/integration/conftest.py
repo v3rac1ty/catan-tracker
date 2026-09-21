@@ -23,12 +23,27 @@ TEST_MIGRATOR_DATABASE_URL = os.environ.get("TEST_MIGRATOR_DATABASE_URL")
 
 integration_env_available = bool(TEST_DATABASE_URL and TEST_MIGRATOR_DATABASE_URL)
 
-# Covers every table created by 0001_init.sql that holds application data,
-# i.e. everything except the migration-tracking `schema_migrations` table.
-# Schema-qualified so a `search_path` trick can't redirect the TRUNCATE.
+# Every application-data table across 0001-0005, i.e. everything except the
+# migration-tracking `schema_migrations` table. Schema-qualified so a
+# `search_path` trick can't redirect the TRUNCATE.
+#
+# `game_updates` (0004) and `game_score_requests` (0005) are listed
+# explicitly even though neither has a sequence of its own (no
+# `GENERATED ALWAYS AS IDENTITY` column -- `game_updates`'s PK is
+# `(game_id, revision)`, `game_score_requests`'s is `(game_id, user_id)`,
+# both plain columns, so RESTART IDENTITY has nothing to reset on either)
+# and both would already be emptied via CASCADE: each has a
+# `FOREIGN KEY (game_id, guild_id) REFERENCES games (game_id, guild_id)`
+# with nothing referencing either of them in turn, so truncating `games`
+# with CASCADE cascades onto both regardless of whether they're named here.
+# Listing them anyway means this cleanup's correctness doesn't silently
+# depend on that cascade continuing to exist -- a future migration that
+# drops the FK, or reworks it to no longer point at `games`, would
+# otherwise leave rows behind with no test failure pointing at why.
 _TRUNCATE_APP_TABLES_SQL = (
     "TRUNCATE TABLE public.guild_config, public.players, public.seasons, "
     "public.season_results, public.games, public.game_participants, "
+    "public.game_updates, public.game_score_requests, "
     "public.events, public.event_rsvps, public.event_reminders "
     "RESTART IDENTITY CASCADE"
 )

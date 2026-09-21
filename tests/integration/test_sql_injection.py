@@ -82,6 +82,7 @@ _ALL_TABLES = frozenset(
         "games",
         "game_participants",
         "game_updates",
+        "game_score_requests",
         "events",
         "event_rsvps",
         "event_reminders",
@@ -97,6 +98,7 @@ _TABLE_COUNT_QUERIES: dict[str, str] = {
     "games": "SELECT COUNT(*) FROM games",
     "game_participants": "SELECT COUNT(*) FROM game_participants",
     "game_updates": "SELECT COUNT(*) FROM game_updates",
+    "game_score_requests": "SELECT COUNT(*) FROM game_score_requests",
     "events": "SELECT COUNT(*) FROM events",
     "event_rsvps": "SELECT COUNT(*) FROM event_rsvps",
     "event_reminders": "SELECT COUNT(*) FROM event_reminders",
@@ -120,7 +122,7 @@ async def _table_counts(conn: asyncpg.Connection) -> dict[str, int]:
 
 
 async def _assert_schema_intact(conn: asyncpg.Connection) -> None:
-    """All 10 tables are still there via both `pg_tables` and
+    """All 11 tables are still there via both `pg_tables` and
     `information_schema` -- proves no payload ever ran as DDL."""
     assert await _table_names(conn) == set(_ALL_TABLES)
     info_rows = await conn.fetch(
