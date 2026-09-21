@@ -13,8 +13,9 @@ import pytest
 
 from catan_bot import formatting
 from catan_bot.cogs import config_cog, game_cog, season_cog, stats_cog
+from catan_bot.db.repositories import score_requests
 from catan_bot.domain.errors import DomainValidationError
-from catan_bot.services import config_service, season_service
+from catan_bot.services import config_service, game_service, season_service
 from catan_bot.services.context import Actor
 from catan_bot.services.errors import PermissionDeniedError
 from catan_bot.views import game_confirm
@@ -39,6 +40,13 @@ class InteractionStub:
                 channel=self.channel,
                 id=801,
                 jump_url="https://discord.com/channels/900001/700/801",
+                # `/game report` refreshes this message with the live
+                # score-collection progress field once its DM fan-out
+                # finishes (`GameCog.report_command`'s `public_message.edit`
+                # call) -- without this the flow below blows up on a plain
+                # `SimpleNamespace` the same way it does on a member stub
+                # with no `send`.
+                edit=AsyncMock(),
             )
         )
         self.response = SimpleNamespace(defer=AsyncMock())
@@ -50,6 +58,24 @@ class InteractionStub:
 
 def _actor(user_id: int, *, manager: bool = False, roles: frozenset[int] = frozenset()) -> Actor:
     return Actor(user_id=user_id, has_manage_guild=manager, role_ids=roles)
+
+
+def _member_stub(user_id: int, *, dm_channel_id: int, dm_message_id: int) -> SimpleNamespace:
+    """A `discord.Member` stand-in that can receive `/game report`'s per-player DM.
+
+    `dm_channel_id`/`dm_message_id` are distinct per member (and from the
+    public message's own `700`/`801`) so a delivery-recording bug that
+    mixes up whose ids are whose can't accidentally pass.
+    """
+    return SimpleNamespace(
+        id=user_id,
+        bot=False,
+        send=AsyncMock(
+            return_value=SimpleNamespace(
+                channel=SimpleNamespace(id=dm_channel_id), id=dm_message_id
+            )
+        ),
+    )
 
 
 def _embed_from(interaction: InteractionStub) -> discord.Embed:
@@ -99,11 +125,14 @@ async def test_game_commands_buttons_and_stats_complete_the_interaction_flow(
     report = game_cog.GameCog.game_group.get_command("report")
     assert report is not None
 
+    reporter_member = _member_stub(reporter.user_id, dm_channel_id=910, dm_message_id=911)
+    other_member = _member_stub(other_player.user_id, dm_channel_id=920, dm_message_id=921)
+
     await report.callback(
         game_cog_instance,
         report_interaction,
-        SimpleNamespace(id=reporter.user_id, bot=False),
-        SimpleNamespace(id=other_player.user_id, bot=False),
+        reporter_member,
+        other_member,
         None,
         None,
         None,
@@ -111,21 +140,39 @@ async def test_game_commands_buttons_and_stats_complete_the_interaction_flow(
         None,
     )
 
+    # The pending game is created immediately -- there's no reporter-facing
+    # Submit click to wait on any more. Its public message carries the
+    # Confirm/Reject/Nudge buttons, and every participant (winner included)
+    # separately got their own DM score sheet.
     report_interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
-    report_embed = _embed_from(report_interaction)
-    assert report_embed.title == "Game score sheet"
-    score_sheet = report_interaction.edit_original_response.await_args.kwargs["view"]
-    submit_button = next(
-        item for item in score_sheet.children if getattr(item, "label", None) == "Submit report"
-    )
-    submit_interaction = InteractionStub(guild_id, reporter.user_id, pool=pool)
-    await submit_button.callback(submit_interaction)
-    submit_interaction.response.defer.assert_awaited_once_with()
-    assert score_sheet.created_report is not None
-    assert score_sheet.completed
-    assert score_sheet.message_recorded
     report_interaction.channel.send.assert_awaited_once()
-    game_id = score_sheet.created_report.game.game_id
+    reporter_member.send.assert_awaited_once()
+    other_member.send.assert_awaited_once()
+
+    game_id = await game_service.find_open_score_request_game_id(pool, guild_id, reporter.user_id)
+    assert game_id is not None
+
+    # Delivery was actually recorded -- the real DM channel/message ids,
+    # not the `pending` placeholder `open_score_collection` seeds -- for
+    # both participants, each against their own DM's ids.
+    async with pool.acquire() as conn:
+        requests = await score_requests.list_score_requests(conn, guild_id, game_id)
+    delivered = {request.user_id: request for request in requests}
+    assert delivered.keys() == {reporter.user_id, other_player.user_id}
+    assert delivered[reporter.user_id].delivery_status == "delivered"
+    assert delivered[reporter.user_id].dm_channel_id == 910
+    assert delivered[reporter.user_id].dm_message_id == 911
+    assert delivered[other_player.user_id].delivery_status == "delivered"
+    assert delivered[other_player.user_id].dm_channel_id == 920
+    assert delivered[other_player.user_id].dm_message_id == 921
+
+    # The public message is refreshed with the live score-collection
+    # progress field once the DM fan-out finishes.
+    public_message = report_interaction.channel.send.return_value
+    public_message.edit.assert_awaited_once()
+    refreshed_embed = public_message.edit.await_args.kwargs["embed"]
+    progress = next(field.value for field in refreshed_embed.fields if field.name == "Score entry")
+    assert progress.startswith("0 of 2 received")
 
     error_handler = AsyncMock()
     monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: reporter)
