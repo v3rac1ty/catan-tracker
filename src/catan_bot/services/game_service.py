@@ -742,6 +742,24 @@ async def record_player_score(
     award check below always sees every row already on file. Only `pending`
     or `confirmed` games accept a score; a rejected or voided game's roster
     is final and never gets a new row, however the game got there.
+
+    Passes ``enforce_winner_target=False`` below: the numeric half and the
+    award half of a score row arrive as two *separate* saves
+    (`views/score_entry.py`'s modal, then its award select), so a winner who
+    only reaches target once an award is counted would otherwise have their
+    first, still-below-target save rejected outright -- and since an award
+    can't be claimed before a row already exists, that rejection is a
+    permanent deadlock, not just an inconvenience. Every row saved here is
+    provisional while collection is in progress regardless (a game already
+    legitimately holds some rows and not others), so there is nothing this
+    check protects mid-collection that isn't already left unchecked for a
+    winner who hasn't submitted at all yet. See `domain.scoring.
+    validate_game_scores`'s docstring for the full rationale, and `views.
+    game_confirm._prompt_confirm_anyway`/`services.results.
+    ScoreCollectionStatus.winner_shortfall` for where this rule is actually
+    enforced instead: once collection is complete, on the confirm path,
+    where a below-target winner now surfaces as a named warning before the
+    game can be confirmed.
     """
     async with pool.acquire() as conn, conn.transaction():
         current = await games.lock_game(conn, guild_id, game_id)
@@ -763,9 +781,10 @@ async def record_player_score(
         # Re-validate the *whole* set -- this row plus every other row
         # already on file -- so an exclusive-award conflict (e.g. two
         # players both claiming Longest Road) is caught before either write
-        # lands, with a message that names the conflicting award. The
-        # winner's-target check only fires once the winner's own row is
-        # among these, exactly like every other `allow_partial=True` caller.
+        # lands, with a message that names the conflicting award.
+        # `enforce_winner_target=False`: see this function's own docstring
+        # for why the winner-target rule must NOT gate an incremental
+        # per-row save.
         other_scores = tuple(s for s in current.scores if s.user_id != user_id)
         validate_game_scores(
             rules,
@@ -773,6 +792,7 @@ async def record_player_score(
             participant_ids=participant_ids,
             winner_id=current.winner_id,
             allow_partial=True,
+            enforce_winner_target=False,
         )
         await games.set_player_score(conn, guild_id, game_id, user_id, score)
         await score_requests.mark_submitted(conn, guild_id, game_id, user_id, now)

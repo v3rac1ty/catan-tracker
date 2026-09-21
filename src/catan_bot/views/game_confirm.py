@@ -21,6 +21,19 @@ as long as the interaction token that created it (about 15 minutes, and
 this one times out itself well before that), so nothing is gained -- and
 restart-durability would be misleadingly implied -- by making it
 `custom_id`-addressed like the persistent buttons above.
+
+The same dialog now also covers a second, unrelated reason to pause: a
+recorded winner whose total is below the game's target score. That check is
+deliberately no longer made at per-row save time
+(`domain.scoring.validate_game_scores`'s `enforce_winner_target`, and
+`services.game_service.record_player_score`'s docstring) since a winner who
+only reaches target via a later-claimed award would otherwise be
+permanently deadlocked -- so this confirm path is where it's enforced
+instead, via `services.results.ScoreCollectionStatus.winner_shortfall`.
+Reusing the existing dialog (rather than adding a second one) means both
+"someone hasn't submitted" and "the winner is short" can be named in the
+same prompt when they both apply, and an admin/participant sees exactly one
+extra click either way.
 """
 
 from __future__ import annotations
@@ -127,7 +140,7 @@ class GameActionButton(discord.ui.DynamicItem[discord.ui.Button], template=_CUST
                 # `confirm_game` would raise instead of a confirmation
                 # prompt for an action they were never allowed to take.
                 status = await game_service.confirm_preflight(pool, guild_id, self.game_id, actor)
-                if not status.complete:
+                if not status.complete or status.winner_shortfall is not None:
                     await _prompt_confirm_anyway(
                         interaction,
                         guild_id=guild_id,
@@ -165,6 +178,32 @@ def _list_mentions(user_ids: Sequence[int]) -> str:
     return ", ".join(names[:-1]) + f", and {names[-1]}"
 
 
+def _confirm_anyway_content(status: ScoreCollectionStatus) -> str:
+    """Build the dialog's warning text from whichever reason(s) triggered it.
+
+    Either or both of "someone hasn't submitted" and "the winner is short of
+    target" can apply at once (e.g. two outstanding players *and* an
+    already-recorded winner below target) -- when both do, this names both
+    rather than picking one, so nothing about the game's actual state is
+    hidden from whoever is about to confirm anyway.
+    """
+    lines: list[str] = []
+    outstanding = status.outstanding_ids
+    if outstanding:
+        verb = "hasn't" if len(outstanding) == 1 else "haven't"
+        lines.append(f"{_list_mentions(outstanding)} {verb} entered their points yet.")
+    shortfall = status.winner_shortfall
+    if shortfall is not None:
+        target = status.game.game.target_points
+        recorded = target - shortfall
+        lines.append(
+            f"{formatting.mention(status.game.winner_id)} is recorded with {recorded} point(s), "
+            f"short of the {target}-point target."
+        )
+    lines.append("Confirm anyway and save the game with partial scores?")
+    return "\n".join(lines)
+
+
 async def _prompt_confirm_anyway(
     interaction: discord.Interaction,
     *,
@@ -173,7 +212,8 @@ async def _prompt_confirm_anyway(
     actor: Actor,
     status: ScoreCollectionStatus,
 ) -> None:
-    """Show the ephemeral "confirm anyway" second step for a partially-scored game.
+    """Show the ephemeral "confirm anyway" second step for a partially-scored
+    or below-target-winner game.
 
     Only ever reached once `game_service.confirm_preflight` has already
     confirmed `actor` is allowed to confirm this game -- this function's
@@ -183,12 +223,7 @@ async def _prompt_confirm_anyway(
     rather than `edit_original_response`, which would only ever reach this
     new ephemeral dialog. See `_ConfirmAnywayView`.
     """
-    outstanding = status.outstanding_ids
-    verb = "hasn't" if len(outstanding) == 1 else "haven't"
-    content = (
-        f"{_list_mentions(outstanding)} {verb} entered their points yet. "
-        "Confirm anyway and save the game with partial scores?"
-    )
+    content = _confirm_anyway_content(status)
     view = _ConfirmAnywayView(
         guild_id=guild_id, game_id=game_id, actor=actor, public_message=interaction.message
     )

@@ -411,3 +411,97 @@ def test_allow_partial_false_default_matches_original_behavior_and_messages() ->
         validate_game_scores(
             rules, [row(1, rules, settlements=10)], [1, 2], winner_id=1, allow_partial=False
         )
+
+
+# ---------------------------------------------------------------------------
+# validate_game_scores(enforce_winner_target=...)
+# ---------------------------------------------------------------------------
+
+
+def test_enforce_winner_target_defaults_true_so_no_existing_caller_changes_behavior() -> None:
+    """Every call site that doesn't pass the new kwarg explicitly must see
+    byte-for-byte the same outcome as before the kwarg existed."""
+    rules = build_rules("normal")
+    short_winner = row(1, rules, settlements=9)
+    with pytest.raises(DomainValidationError, match="winner must reach"):
+        validate_game_scores(rules, [short_winner], [1, 2], winner_id=1, allow_partial=True)
+    # Explicitly passing True is identical to omitting the kwarg.
+    with pytest.raises(DomainValidationError, match="winner must reach"):
+        validate_game_scores(
+            rules,
+            [short_winner],
+            [1, 2],
+            winner_id=1,
+            allow_partial=True,
+            enforce_winner_target=True,
+        )
+    # Also still fires for a full, non-partial sheet.
+    with pytest.raises(DomainValidationError, match="winner must reach"):
+        validate_game_scores(
+            rules, [short_winner, row(2, rules, settlements=9)], [1, 2], winner_id=1
+        )
+
+
+def test_enforce_winner_target_false_skips_only_that_one_check() -> None:
+    """`enforce_winner_target=False` lets a below-target winner row save --
+    the deadlock this exists to break -- while every other rule (per-row
+    validation, exclusive-award limits, duplicate/nonparticipant rows) still
+    applies exactly as with the flag on."""
+    rules = build_rules("normal")
+    short_winner = row(1, rules, settlements=8)
+    result = validate_game_scores(
+        rules, [short_winner], [1, 2], winner_id=1, allow_partial=True, enforce_winner_target=False
+    )
+    assert result == (short_winner,)
+
+    # Exclusive-award totals are still enforced.
+    first = row(1, rules, settlements=8, longest_road=2)
+    duplicate_award = row(2, rules, settlements=8, longest_road=2)
+    with pytest.raises(DomainValidationError, match="Only one"):
+        validate_game_scores(
+            rules,
+            [first, duplicate_award],
+            [1, 2],
+            winner_id=1,
+            allow_partial=True,
+            enforce_winner_target=False,
+        )
+
+    # Duplicate/nonparticipant rows are still rejected.
+    dup = row(1, rules, settlements=8)
+    with pytest.raises(DomainValidationError, match="more than one score"):
+        validate_game_scores(
+            rules, [dup, dup], [1, 2], winner_id=1, allow_partial=True, enforce_winner_target=False
+        )
+
+    # Per-row validation (e.g. odd city count) still fires.
+    with pytest.raises(DomainValidationError, match="even"):
+        validate_game_scores(
+            rules,
+            [row(1, rules, settlements=8, cities=1)],
+            [1, 2],
+            winner_id=1,
+            allow_partial=True,
+            enforce_winner_target=False,
+        )
+
+
+def test_enforce_winner_target_false_then_true_models_claiming_an_award_next() -> None:
+    """The exact deadlock this flag exists to break: a winner's numeric-only
+    row is below target and saves fine with the check off (the per-row save
+    path); a second save that adds a claimed award reaches target, and would
+    also have passed with the check back on."""
+    rules = build_rules("normal")
+    numeric_only = row(1, rules, settlements=8)  # 8 < target of 10
+    validate_game_scores(
+        rules, [numeric_only], [1, 2], winner_id=1, allow_partial=True, enforce_winner_target=False
+    )
+
+    with_award = row(1, rules, settlements=8, longest_road=2)  # 10 >= target
+    result = validate_game_scores(
+        rules, [with_award], [1, 2], winner_id=1, allow_partial=True, enforce_winner_target=False
+    )
+    assert result == (with_award,)
+    # Also passes with the check back on, since the winner now meets target.
+    result = validate_game_scores(rules, [with_award], [1, 2], winner_id=1, allow_partial=True)
+    assert result == (with_award,)

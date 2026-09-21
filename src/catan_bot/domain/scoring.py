@@ -530,6 +530,7 @@ def validate_game_scores(
     participant_ids: Iterable[int] | None = None,
     winner_id: int | None = None,
     allow_partial: bool = False,
+    enforce_winner_target: bool = True,
 ) -> tuple[PlayerScore, ...]:
     """Validate every score row, participant coverage, and shared awards.
 
@@ -553,7 +554,38 @@ def validate_game_scores(
         row against;
       - "the winner must reach the target score" only applies once the
         winner's own row has arrived; it says nothing about a game whose
-        winner hasn't submitted yet.
+        winner hasn't submitted yet -- and only when ``enforce_winner_target``
+        is also true (see below).
+
+    ``enforce_winner_target`` (keyword-only, default ``True``) gates ONLY the
+    "the winner must reach the target score" rule -- every other rule above
+    (per-row validation, exclusive-award limits, duplicate rows, participant
+    membership) always applies regardless of this flag. It exists because a
+    *single incremental save* of one participant's row is the wrong place to
+    assert a *whole-game* invariant: a winner who reaches target only via an
+    award (e.g. 8 numeric points + a 2-point Longest Road on a 10-point
+    target) submits those two pieces through two separate interactions
+    (`views/score_entry.py`'s numeric modal, then its award select), each of
+    which re-validates through this function with `allow_partial=True`. If
+    the target rule stayed on for that first, still-below-target save, it
+    would be rejected outright -- and the award can't be claimed until a row
+    already exists (`_ENTER_POINTS_FIRST_TEXT`), so the player would be
+    permanently deadlocked, unable to ever save either half. Every row is
+    provisional while collection is in progress regardless -- the system
+    already accepts that a game holds some rows and not others -- so there is
+    nothing to protect by rejecting an interim below-target winner row that
+    isn't rejected about an interim *missing* winner row. Callers that build
+    or persist one participant's row in isolation
+    (`services.game_service.record_player_score`) pass ``False`` here for
+    exactly that reason -- see that function's own docstring. The rule is
+    instead enforced where it actually matters: once collection is complete
+    and, in particular, on the confirm path
+    (`views.game_confirm._prompt_confirm_anyway`, driven by
+    `services.results.ScoreCollectionStatus.winner_shortfall`), which warns
+    -- naming the shortfall -- before a below-target winner's game can be
+    confirmed. Every other caller (a full, non-partial report; an admin's
+    `submit_game_update`) leaves this at its default of ``True``, so no
+    existing behavior changes.
     """
 
     if type(rules) is not GameRules:
@@ -615,7 +647,15 @@ def validate_game_scores(
     # Non-partial: the coverage check above already guarantees the winner's
     # row is present, so `next(..., None)` always resolves. Partial: it may
     # legitimately be absent, in which case there's no target to check yet.
+    # `enforce_winner_target=False` additionally skips this specific check
+    # regardless -- see this function's docstring for why an incremental
+    # per-row save (`record_player_score`) needs that escape hatch while
+    # every other rule above still applies unconditionally.
     winner_score = next((score for score in score_list if score.user_id == winner_id), None)
-    if winner_score is not None and winner_score.total_points < (rules.target_points or 0):
+    if (
+        enforce_winner_target
+        and winner_score is not None
+        and winner_score.total_points < (rules.target_points or 0)
+    ):
         raise DomainValidationError("The winner must reach the target score.")
     return tuple(score_list)

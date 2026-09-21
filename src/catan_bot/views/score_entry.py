@@ -54,8 +54,21 @@ _WRONG_OWNER_TEXT = "This score sheet belongs to another player."
 _FILL_EVERY_FIELD_TEXT = (
     "Fill in every point field (0 counts) or use Clear my points instead of leaving one blank."
 )
+# Why awards still require a numeric row to exist first (considered and
+# rejected relaxing this -- see below): an award claim is saved by combining
+# it with whatever numeric values are *already on file*
+# (`ScoreAwardSelect.callback` reads them back off the stored row). With no
+# row yet, there's nothing to combine it with -- filling the numeric half
+# with zeros just to let the award through would invent values the player
+# never actually entered, which is exactly the blank-vs-zero distinction
+# `ScoreClearButton`'s docstring (and `domain.scoring`'s NULL-stays-NULL
+# rule) exists to protect: a genuinely unrecorded row must stay unrecorded,
+# not become a silent "0 everything but the award." So the sequence stays
+# numeric-first; this message explains why rather than just asserting it.
 _ENTER_POINTS_FIRST_TEXT = (
-    "Enter your point totals first (use the button below), then choose your awards."
+    "Awards are saved together with your point total, so there's nothing yet to attach an "
+    'award to. Enter your points first with "Enter / edit your points" below -- even 0s are '
+    "fine -- then come back here to claim your awards."
 )
 
 _NO_MENTIONS = discord.AllowedMentions.none()
@@ -124,6 +137,31 @@ async def _refresh_public_message(
         return
 
 
+def _total_field(game: GameWithParticipants, user_id: int, stored: PlayerScore | None) -> str:
+    """The "Your total" field value: the full recorded total, target-aware for the winner.
+
+    `stored.total_points` already sums every breakdown entry -- numeric
+    fields *and* claimed awards alike (`build_player_score` composes one row
+    from both) -- so the total shown here has always structurally included
+    awards; what a player couldn't previously see is whether that total
+    would actually be enough to win. For the winner specifically, showing
+    the game's own target alongside it makes that visible at a glance,
+    without needing to cross-reference the public message -- especially
+    since `record_player_score` no longer blocks (or even flags) a
+    below-target save while collection is still in progress (see its
+    docstring); the confirm-time warning in `views.game_confirm` is the
+    other half of surfacing this, for whoever confirms the game.
+    """
+    if stored is None:
+        return "Not recorded yet"
+    if user_id != game.winner_id or game.game.target_points is None:
+        return str(stored.total_points)
+    target = game.game.target_points
+    if stored.total_points >= target:
+        return f"{stored.total_points} / {target} -- target reached"
+    return f"{stored.total_points} / {target} -- {target - stored.total_points} short of target"
+
+
 def build_score_entry_embed(game: GameWithParticipants, user_id: int) -> discord.Embed:
     """One player's private score-entry sheet for `game`."""
     rules = rules_for_game(game.game)
@@ -148,8 +186,11 @@ def build_score_entry_embed(game: GameWithParticipants, user_id: int) -> discord
     ]
     embed.add_field(name="Your points", value="\n".join(numeric_lines), inline=True)
     embed.add_field(name="Your awards", value="\n".join(award_lines), inline=True)
-    total_text = str(stored.total_points) if stored is not None else "Not recorded yet"
-    embed.add_field(name="Your total", value=total_text, inline=False)
+    embed.add_field(
+        name="Your total (points + awards)",
+        value=_total_field(game, user_id, stored),
+        inline=False,
+    )
     embed.set_footer(
         text="Only you can edit this sheet. It stays open until this game is confirmed."
     )

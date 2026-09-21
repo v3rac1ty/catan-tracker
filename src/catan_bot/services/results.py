@@ -185,6 +185,38 @@ class ScoreCollectionStatus:
     def complete(self) -> bool:
         return len(self.requests) > 0 and all(request.submitted for request in self.requests)
 
+    @property
+    def winner_shortfall(self) -> int | None:
+        """Points the recorded winner's row is still short of `target_points`.
+
+        `domain.scoring.validate_game_scores`'s winner-target rule is no
+        longer enforced while `record_player_score` saves an individual row
+        (see that function's docstring) -- every row is provisional mid-
+        collection, and a winner who only reaches target via a later-claimed
+        award would otherwise be deadlocked. This is the one place that
+        still needs to know whether the *currently recorded* winner row
+        meets target, so `views.game_confirm._prompt_confirm_anyway` can
+        warn -- naming the shortfall -- before a below-target winner's game
+        is confirmed, reusing the same dialog already shown for a partial
+        (not-everyone-submitted) collection rather than adding a second one.
+
+        Returns `None` -- meaning "nothing to warn about" -- whenever there's
+        no target to compare against (a legacy/ruleless game), the winner
+        hasn't submitted a row yet (nothing recorded to fall short), or the
+        recorded row already meets or exceeds target. Otherwise returns the
+        positive point gap.
+        """
+        target = self.game.game.target_points
+        if target is None:
+            return None
+        winner_score = next(
+            (score for score in self.game.scores if score.user_id == self.game.winner_id), None
+        )
+        if winner_score is None:
+            return None
+        shortfall = target - winner_score.total_points
+        return shortfall if shortfall > 0 else None
+
 
 @dataclass(frozen=True, slots=True)
 class DueScorePrompt:

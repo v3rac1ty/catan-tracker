@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 import discord
@@ -17,6 +18,8 @@ from catan_bot.services import game_service
 from catan_bot.views import score_entry
 from catan_bot.views.game_confirm import build_game_action_view
 from catan_bot.views.game_scores import GameScoreSheet
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_HISTORY_LIMIT = 10
 _REPORT_COOLDOWN_SECONDS = 30.0
@@ -135,7 +138,7 @@ class GameCog(commands.Cog):
                     view=sheet_view,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
-            except discord.HTTPException:
+            except discord.HTTPException as exc:
                 # One player's failed DM -- closed DMs (`discord.Forbidden`,
                 # a subclass of `HTTPException`) or any other transient HTTP
                 # error -- must not break the report for everyone else --
@@ -145,7 +148,16 @@ class GameCog(commands.Cog):
                 # (not just `Forbidden`) means a one-off 5xx/network blip
                 # hitting a single participant's DM no longer aborts the
                 # whole loop before the remaining participants are ever
-                # messaged.
+                # messaged. Logged with the exception TYPE only, never
+                # `str(exc)` or a traceback -- matching `scheduler.py`'s
+                # `_log_failure` discipline -- since a Discord HTTP error's
+                # message can echo back request content.
+                logger.warning(
+                    "Score sheet DM failed user_id=%s game_id=%s: %s",
+                    user_id,
+                    game_id,
+                    type(exc).__name__,
+                )
                 blocked.append(member)
                 await game_service.record_score_request_delivery(
                     self.bot.pool,

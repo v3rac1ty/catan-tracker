@@ -394,6 +394,74 @@ async def test_game_report_marks_closed_dms_blocked_and_keeps_going(
 
 
 @pytest.mark.asyncio
+async def test_game_report_dm_failure_logs_user_id_and_exception_type_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The blocked player never sees this cog's ephemeral reply, so a failed
+    DM must at least be logged -- with the user id and the exception's TYPE
+    only, matching `scheduler.py::_log_failure`'s discipline: never
+    `str(exc)` or a traceback, which could carry user text or tokens."""
+    interaction = _interaction()
+    interaction.channel.send = AsyncMock(
+        return_value=SimpleNamespace(
+            channel=SimpleNamespace(id=700),
+            id=800,
+            jump_url="https://example.test/800",
+            edit=AsyncMock(),
+        )
+    )
+    cog = game_cog.GameCog(SimpleNamespace(pool=object()))
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    prepared = SimpleNamespace(
+        winner_id=456, loser_ids=(789,), rules=GameRules(game_type="normal", target_points=10)
+    )
+    created = _reported_game()
+    winner = SimpleNamespace(
+        id=456,
+        bot=False,
+        send=AsyncMock(return_value=SimpleNamespace(channel=SimpleNamespace(id=1), id=2)),
+    )
+    forbidden = discord.Forbidden(
+        SimpleNamespace(status=403, reason="Forbidden"), "some secret detail"
+    )
+    loser = SimpleNamespace(id=789, bot=False, send=AsyncMock(side_effect=forbidden))
+
+    monkeypatch.setattr(game_cog, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_cog.game_service, "prepare_game_report", AsyncMock(return_value=prepared)
+    )
+    monkeypatch.setattr(
+        game_cog.game_service, "submit_game_report", AsyncMock(return_value=created)
+    )
+    monkeypatch.setattr(game_cog.game_service, "record_game_message", AsyncMock())
+    monkeypatch.setattr(game_cog.game_service, "open_score_collection", AsyncMock())
+    monkeypatch.setattr(game_cog.game_service, "record_score_request_delivery", AsyncMock())
+    monkeypatch.setattr(
+        game_cog.game_service, "score_collection_status", AsyncMock(return_value=object())
+    )
+    monkeypatch.setattr(
+        game_cog.formatting, "build_game_report_embed", lambda *_a, **_k: discord.Embed()
+    )
+    monkeypatch.setattr(game_cog, "build_game_action_view", lambda _game_id: object())
+    monkeypatch.setattr(
+        game_cog.score_entry, "build_score_entry_embed", lambda *_a: discord.Embed()
+    )
+    monkeypatch.setattr(game_cog.score_entry, "build_score_entry_view", lambda *_a, **_k: object())
+    command = game_cog.GameCog.game_group.get_command("report")
+    assert command is not None
+
+    with caplog.at_level("WARNING", logger="catan_bot.cogs.game_cog"):
+        await command.callback(cog, interaction, winner, loser, None, None, None, None, None)
+
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert "789" in record.getMessage()
+    assert "42" in record.getMessage()
+    assert "Forbidden" in record.getMessage()
+    assert "some secret detail" not in record.getMessage()
+
+
+@pytest.mark.asyncio
 async def test_game_report_dm_http_exception_does_not_abort_remaining_participants(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

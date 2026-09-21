@@ -475,7 +475,9 @@ class CatanScheduler:
         abort this game's remaining players or its channel notice -- it's
         simply recorded as `blocked`, same as a genuinely closed-DM
         rejection, and the next claimed round (up to `_MAX_PROMPTS` total)
-        tries again.
+        tries again. Logged via `_log_failure`, so only the ids and the
+        exception's type name are recorded -- never `str(exc)` or a
+        traceback, which a Discord HTTP error's message can echo back.
         """
         game = prompt.game
         guild_id = game.game.guild_id
@@ -490,7 +492,10 @@ class CatanScheduler:
             dm_message = await user.send(
                 embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none()
             )
-        except discord.HTTPException:
+        except discord.HTTPException as exc:
+            _log_failure(
+                "score prompt dm", exc, guild_id=guild_id, game_id=game_id, user_id=prompt.user_id
+            )
             await game_service.record_score_request_delivery(
                 self.pool,
                 guild_id,

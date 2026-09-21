@@ -15,10 +15,11 @@ from catan_bot import formatting
 from catan_bot.cogs import config_cog, game_cog, season_cog, stats_cog
 from catan_bot.db.repositories import score_requests
 from catan_bot.domain.errors import DomainValidationError
+from catan_bot.domain.scoring import ScoreSource, entry_fields
 from catan_bot.services import config_service, game_service, season_service
 from catan_bot.services.context import Actor
 from catan_bot.services.errors import PermissionDeniedError
-from catan_bot.views import game_confirm
+from catan_bot.views import game_confirm, score_entry
 
 pytestmark = [
     pytest.mark.integration,
@@ -49,11 +50,22 @@ class InteractionStub:
                 edit=AsyncMock(),
             )
         )
-        self.response = SimpleNamespace(defer=AsyncMock())
+        self.response = SimpleNamespace(
+            defer=AsyncMock(), send_message=AsyncMock(), edit_message=AsyncMock()
+        )
         self.followup = SimpleNamespace(send=AsyncMock())
         self.edit_original_response = AsyncMock(
             return_value=SimpleNamespace(channel=SimpleNamespace(id=700), id=800)
         )
+        # Only exercised by the "confirm anyway" dialog flow
+        # (`views/game_confirm.py`'s `_prompt_confirm_anyway`/`_ConfirmAnywayView`):
+        # it awaits `interaction.original_response()` right after showing the
+        # ephemeral dialog, and reads `interaction.message` -- the *public*
+        # message the persistent Confirm button lives on -- to know what to
+        # edit once "Confirm anyway" is clicked. A test sets `.message`
+        # explicitly when it needs that path.
+        self.original_response = AsyncMock(return_value=SimpleNamespace(edit=AsyncMock()))
+        self.message: SimpleNamespace | None = None
 
 
 def _actor(user_id: int, *, manager: bool = False, roles: frozenset[int] = frozenset()) -> Actor:
@@ -80,6 +92,28 @@ def _member_stub(user_id: int, *, dm_channel_id: int, dm_message_id: int) -> Sim
 
 def _embed_from(interaction: InteractionStub) -> discord.Embed:
     return interaction.edit_original_response.await_args.kwargs["embed"]
+
+
+def _numeric_values(numeric_sources: tuple[ScoreSource, ...], total: int) -> dict[str, int]:
+    """Distribute `total` points across `numeric_sources`, honoring each
+    source's even-parity requirement.
+
+    Built from `entry_fields` rather than a hardcoded set of keys (e.g.
+    "settlements"/"cities"/"vp_cards") because those only exist for a
+    `normal` game -- a Cities & Knights game has a different numeric
+    catalog entirely (`metropolis_bonus` instead of `vp_cards`, ...), and
+    this helper needs to keep working for whichever rules a test builds.
+    """
+    values = {source.key: 0 for source in numeric_sources}
+    remaining = total
+    for source in numeric_sources:
+        if remaining <= 0:
+            break
+        take = remaining - (remaining % 2) if source.requires_even else remaining
+        values[source.key] = take
+        remaining -= take
+    assert remaining == 0, f"couldn't distribute {total} across {numeric_sources!r}"
+    return values
 
 
 async def test_season_command_escapes_payload_and_config_show_requires_manage_guild(
@@ -174,6 +208,85 @@ async def test_game_commands_buttons_and_stats_complete_the_interaction_flow(
     progress = next(field.value for field in refreshed_embed.fields if field.name == "Score entry")
     assert progress.startswith("0 of 2 received")
 
+    # `record_player_score` has no integration coverage anywhere else, so
+    # this is the natural place to exercise it for real, including the
+    # deadlock the `enforce_winner_target=False` fix protects against: a
+    # winner's numeric and award halves arrive as two separate saves
+    # (`views/score_entry.py`'s modal, then its award select), so the
+    # winner's *first* save -- below target -- must succeed on its own, or
+    # they could never reach the second save that claims the award.
+    game_before_scores = await game_service.get_game(pool, guild_id, game_id)
+    rules = score_entry.rules_for_game(game_before_scores.game)
+    numeric_sources, award_sources = entry_fields(rules)
+    target = rules.target_points
+    assert target is not None
+    assert award_sources, "this test needs at least one fixed-value award to claim"
+    winning_award = award_sources[0]
+    below_target_total = target - winning_award.fixed_points
+    assert 0 <= below_target_total < target
+    below_target_numeric = _numeric_values(numeric_sources, below_target_total)
+
+    await game_service.record_player_score(
+        pool,
+        guild_id,
+        game_id,
+        reporter.user_id,
+        numeric=below_target_numeric,
+        awards=[],
+        now=datetime.now(UTC),
+    )
+    mid_status = await game_service.score_collection_status(pool, guild_id, game_id)
+    mid_game = await game_service.get_game(pool, guild_id, game_id)
+    winner_row = next(score for score in mid_game.scores if score.user_id == reporter.user_id)
+    # The below-target save landed -- it was never rejected -- and the
+    # shortfall it leaves is visible via the same property the confirm
+    # dialog reads from, against a real recorded row rather than a stub.
+    assert winner_row.total_points == below_target_total
+    assert mid_status.winner_shortfall == target - below_target_total
+
+    # Claiming the award now is what pushes the winner's total to (at
+    # least) target -- exactly the save that used to deadlock.
+    await game_service.record_player_score(
+        pool,
+        guild_id,
+        game_id,
+        reporter.user_id,
+        numeric=below_target_numeric,
+        awards=[winning_award.key],
+        now=datetime.now(UTC),
+    )
+
+    other_numeric = _numeric_values(numeric_sources, max(target - 4, 1))
+    await game_service.record_player_score(
+        pool,
+        guild_id,
+        game_id,
+        other_player.user_id,
+        numeric=other_numeric,
+        awards=[],
+        now=datetime.now(UTC),
+    )
+
+    status = await game_service.score_collection_status(pool, guild_id, game_id)
+    assert status.complete
+    assert status.winner_shortfall is None
+
+    # Same refresh report.callback itself does once collection finishes --
+    # the public message's progress field must reflect the now-complete
+    # collection.
+    updated_game = await game_service.get_game(pool, guild_id, game_id)
+    await public_message.edit(
+        embed=formatting.build_game_report_embed(updated_game, collection=status),
+        view=game_confirm.build_game_action_view(game_id),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    assert public_message.edit.await_count == 2
+    complete_embed = public_message.edit.await_args.kwargs["embed"]
+    complete_progress = next(
+        field.value for field in complete_embed.fields if field.name == "Score entry"
+    )
+    assert complete_progress == "All scores received (2/2)."
+
     error_handler = AsyncMock()
     monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: reporter)
     monkeypatch.setattr(game_confirm, "handle_interaction_error", error_handler)
@@ -185,9 +298,14 @@ async def test_game_commands_buttons_and_stats_complete_the_interaction_flow(
     assert isinstance(denied, PermissionDeniedError)
     assert "another player" in denied.user_message
 
+    # Collection is complete and the winner is recorded at target, so this
+    # confirms directly in one click -- no "confirm anyway" dialog, and
+    # `edit_original_response` (not `response.send_message`) carries the
+    # result.
     monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: other_player)
     confirmer_click = InteractionStub(guild_id, other_player.user_id, pool=pool)
     await game_confirm.GameActionButton(game_id, "confirm").callback(confirmer_click)
+    confirmer_click.response.send_message.assert_not_awaited()
     confirmed_embed = _embed_from(confirmer_click)
     assert next(field.value for field in confirmed_embed.fields if field.name == "Status") == (
         "Confirmed"
@@ -210,6 +328,99 @@ async def test_game_commands_buttons_and_stats_complete_the_interaction_flow(
     displayed_reason = next(field.value for field in void_embed.fields if field.name == "Reason")
     assert displayed_reason == formatting.escape_user_text(reason)
     assert reason not in displayed_reason
+
+
+async def test_confirm_button_dialog_for_partial_collection_then_confirm_anyway(
+    pool: asyncpg.Pool, guild_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The branch that broke the happy-path test above, pinned down on its
+    own: clicking Confirm while `game_score_requests` still has open rows
+    must show the ephemeral "confirm anyway" dialog rather than confirming
+    outright (`views.game_confirm.GameActionButton.callback`'s
+    confirm-preflight guard), and only actually confirms -- editing the
+    public message with partial scores -- once that dialog's own
+    "Confirm anyway" button is pressed.
+    """
+    reporter = _actor(11)
+    other_player = _actor(21)
+    report_interaction = InteractionStub(guild_id, reporter.user_id)
+    game_cog_instance = game_cog.GameCog(SimpleNamespace(pool=pool))
+    monkeypatch.setattr(game_cog, "actor_from_interaction", lambda _: reporter)
+    report = game_cog.GameCog.game_group.get_command("report")
+    assert report is not None
+
+    reporter_member = _member_stub(reporter.user_id, dm_channel_id=930, dm_message_id=931)
+    other_member = _member_stub(other_player.user_id, dm_channel_id=940, dm_message_id=941)
+
+    await report.callback(
+        game_cog_instance,
+        report_interaction,
+        reporter_member,
+        other_member,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+    game_id = await game_service.find_open_score_request_game_id(pool, guild_id, reporter.user_id)
+    assert game_id is not None
+    public_message = report_interaction.channel.send.return_value
+    # Only report.callback's own progress refresh has touched it so far.
+    public_message.edit.assert_awaited_once()
+
+    # Neither participant has submitted a score -- both `game_score_requests`
+    # rows are still open, so Confirm must show the dialog, never confirm
+    # directly.
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: other_player)
+    confirm_click = InteractionStub(guild_id, other_player.user_id, pool=pool)
+    # A real component interaction's `.message` is the message its button
+    # lives on -- the public game message, here.
+    confirm_click.message = public_message
+
+    await game_confirm.GameActionButton(game_id, "confirm").callback(confirm_click)
+
+    confirm_click.response.defer.assert_not_awaited()
+    confirm_click.edit_original_response.assert_not_awaited()
+    confirm_click.response.send_message.assert_awaited_once()
+    content = confirm_click.response.send_message.await_args.args[0]
+    assert formatting.mention(reporter.user_id) in content
+    assert formatting.mention(other_player.user_id) in content
+    assert "haven't entered their points" in content
+    assert "short of the" not in content  # no recorded winner row yet
+    dialog_kwargs = confirm_click.response.send_message.await_args.kwargs
+    assert dialog_kwargs["ephemeral"] is True
+    dialog = dialog_kwargs["view"]
+    assert isinstance(dialog, game_confirm._ConfirmAnywayView)
+    assert dialog.public_message is public_message
+    confirm_click.original_response.assert_awaited_once()
+
+    # The game is still pending, and the public message untouched by this
+    # click -- only "Confirm anyway" may change either.
+    still_pending = await game_service.get_game(pool, guild_id, game_id)
+    assert still_pending.game.status == "pending"
+    public_message.edit.assert_awaited_once()
+
+    # Pressing "Confirm anyway" on the dialog now must confirm for real.
+    dialog_click = InteractionStub(guild_id, other_player.user_id, pool=pool)
+    await dialog.confirm_anyway(dialog_click)
+
+    dialog_click.response.edit_message.assert_awaited_once()
+    assert public_message.edit.await_count == 2
+    confirmed_embed = public_message.edit.await_args.kwargs["embed"]
+    assert (
+        next(field.value for field in confirmed_embed.fields if field.name == "Status")
+        == "Confirmed"
+    )
+    assert public_message.edit.await_args.kwargs["view"] is None
+    dialog_click.edit_original_response.assert_awaited_once()
+    final_kwargs = dialog_click.edit_original_response.await_args.kwargs
+    assert final_kwargs["content"] == "Confirmed -- game saved with partial scores."
+    assert final_kwargs["view"] is None
+
+    confirmed_game = await game_service.get_game(pool, guild_id, game_id)
+    assert confirmed_game.game.status == "confirmed"
 
 
 async def test_oversized_season_name_is_rejected_before_write(

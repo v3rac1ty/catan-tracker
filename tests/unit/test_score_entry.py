@@ -650,5 +650,30 @@ def test_build_score_entry_embed_distinguishes_unrecorded_from_recorded() -> Non
     unrecorded = score_entry.build_score_entry_embed(_game(scores=()), 1)
     assert unrecorded.fields[-1].value == "Not recorded yet"
 
+    # user_id 1 is the winner in `_game()`'s defaults (target_points=10), so
+    # a below-target recorded row shows the shortfall, not a bare number.
     recorded = score_entry.build_score_entry_embed(_game(scores=(_score(1, settlements=8),)), 1)
-    assert recorded.fields[-1].value == "8"
+    assert recorded.fields[-1].value == "8 / 10 -- 2 short of target"
+
+
+def test_build_score_entry_embed_shows_the_winners_total_reaching_target() -> None:
+    reached = score_entry.build_score_entry_embed(
+        _game(scores=(_score(1, settlements=8, longest_road=2),)), 1
+    )
+    assert reached.fields[-1].value == "10 / 10 -- target reached"
+
+
+def test_build_score_entry_embed_shows_a_losers_total_without_a_target() -> None:
+    """A loser isn't subject to the target rule, so their sheet just shows
+    the plain total -- no target comparison, which would be misleading."""
+    game = _game(winner_id=1, loser_ids=(2,), scores=(_score(2, settlements=8),))
+    embed = score_entry.build_score_entry_embed(game, 2)
+    assert embed.fields[-1].value == "8"
+
+
+def test_build_score_entry_embed_total_field_name_mentions_awards() -> None:
+    """`stored.total_points` already includes claimed awards structurally --
+    this asserts the field name says so, since that was the visibility gap
+    (not the underlying math)."""
+    embed = score_entry.build_score_entry_embed(_game(scores=()), 1)
+    assert embed.fields[-1].name == "Your total (points + awards)"

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -268,6 +268,95 @@ async def test_record_player_score_detects_exclusive_award_conflict_against_stor
 
 
 @pytest.mark.asyncio
+async def test_record_player_score_lets_the_winner_save_a_below_target_numeric_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Bug 1 deadlock: a winner's numeric-only save (8 points on a
+    10-point target) must succeed -- the winner-target rule is no longer
+    enforced at this per-row save (`enforce_winner_target=False`)."""
+    pool = _Pool()
+    monkeypatch.setattr(game_service.games, "lock_game", AsyncMock(return_value=_game()))
+    set_score = AsyncMock(return_value=True)
+    monkeypatch.setattr(game_service.games, "set_player_score", set_score)
+    monkeypatch.setattr(game_service.score_requests, "mark_submitted", AsyncMock())
+    final = _game(scores=(_score(1, settlements=8),))
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=final))
+
+    result = await game_service.record_player_score(
+        pool,
+        123,
+        7,
+        1,
+        numeric={"settlements": 8, "cities": 0, "vp_cards": 0},
+        awards=[],
+        now=NOW,
+    )
+
+    assert result is final
+    saved_score = set_score.await_args.args[-1]
+    assert saved_score.total_points == 8  # below the game's target of 10
+
+
+@pytest.mark.asyncio
+async def test_record_player_score_then_claiming_an_award_reaches_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the below-target numeric-only save above, a second save that
+    also claims a 2-point award (the sequence `ScoreAwardSelect.callback`
+    performs) brings the winner's row to target -- and still succeeds,
+    since the target rule is skipped at this layer either way."""
+    pool = _Pool()
+    existing = _game(scores=(_score(1, settlements=8),))
+    monkeypatch.setattr(game_service.games, "lock_game", AsyncMock(return_value=existing))
+    set_score = AsyncMock(return_value=True)
+    monkeypatch.setattr(game_service.games, "set_player_score", set_score)
+    monkeypatch.setattr(game_service.score_requests, "mark_submitted", AsyncMock())
+    final = _game(scores=(_score(1, settlements=8, longest_road=2),))
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=final))
+
+    result = await game_service.record_player_score(
+        pool,
+        123,
+        7,
+        1,
+        numeric={"settlements": 8, "cities": 0, "vp_cards": 0},
+        awards=["longest_road"],
+        now=NOW,
+    )
+
+    assert result is final
+    saved_score = set_score.await_args.args[-1]
+    assert saved_score.total_points == 10  # now meets the target
+
+
+@pytest.mark.asyncio
+async def test_record_player_score_passes_enforce_winner_target_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct check that the per-row save always opts out of the winner-
+    target rule, regardless of whether this particular row would pass it."""
+    pool = _Pool()
+    monkeypatch.setattr(game_service.games, "lock_game", AsyncMock(return_value=_game()))
+    monkeypatch.setattr(game_service.games, "set_player_score", AsyncMock(return_value=True))
+    monkeypatch.setattr(game_service.score_requests, "mark_submitted", AsyncMock())
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=_game()))
+    validate = Mock(wraps=game_service.validate_game_scores)
+    monkeypatch.setattr(game_service, "validate_game_scores", validate)
+
+    await game_service.record_player_score(
+        pool,
+        123,
+        7,
+        1,
+        numeric={"settlements": 1, "cities": 0, "vp_cards": 0},
+        awards=[],
+        now=NOW,
+    )
+
+    assert validate.call_args.kwargs["enforce_winner_target"] is False
+
+
+@pytest.mark.asyncio
 async def test_record_player_score_resubmission_replaces_only_that_players_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -495,6 +584,66 @@ async def test_confirm_preflight_returns_complete_status_when_every_row_is_in(
     status = await game_service.confirm_preflight(pool, 123, 7, _actor(2))
 
     assert status.complete is True
+
+
+@pytest.mark.asyncio
+async def test_confirm_preflight_status_reports_winner_shortfall_when_recorded_row_is_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug 1's other half: once collection completes, a winner whose
+    recorded row never reached target (e.g. they saved numerics and never
+    came back to claim the award that would've closed the gap) must still
+    surface -- via `winner_shortfall`, not a raised exception, since the row
+    is already durably saved -- so the confirm dialog can warn."""
+    pool = _Pool()
+    game = _game(winner_id=1, loser_ids=(2,), reported_by=9, scores=(_score(1, settlements=8),))
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=game))
+    monkeypatch.setattr(
+        game_service.score_requests,
+        "list_score_requests",
+        AsyncMock(return_value=[_request(1, submitted=True), _request(2, submitted=True)]),
+    )
+
+    status = await game_service.confirm_preflight(pool, 123, 7, _actor(2))
+
+    assert status.complete is True
+    assert status.winner_shortfall == 2  # target 10 - recorded 8
+
+
+@pytest.mark.asyncio
+async def test_confirm_preflight_status_winner_shortfall_is_none_when_target_is_met(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _Pool()
+    game = _game(winner_id=1, loser_ids=(2,), reported_by=9, scores=(_score(1, settlements=10),))
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=game))
+    monkeypatch.setattr(
+        game_service.score_requests,
+        "list_score_requests",
+        AsyncMock(return_value=[_request(1, submitted=True), _request(2, submitted=True)]),
+    )
+
+    status = await game_service.confirm_preflight(pool, 123, 7, _actor(2))
+
+    assert status.winner_shortfall is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_preflight_status_winner_shortfall_is_none_when_winner_hasnt_submitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _Pool()
+    game = _game(winner_id=1, loser_ids=(2,), reported_by=9, scores=())
+    monkeypatch.setattr(game_service.games, "get_game", AsyncMock(return_value=game))
+    monkeypatch.setattr(
+        game_service.score_requests,
+        "list_score_requests",
+        AsyncMock(return_value=[_request(2, submitted=True)]),
+    )
+
+    status = await game_service.confirm_preflight(pool, 123, 7, _actor(2))
+
+    assert status.winner_shortfall is None
 
 
 @pytest.mark.asyncio

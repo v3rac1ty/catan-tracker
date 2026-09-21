@@ -822,6 +822,48 @@ async def test_score_prompt_blocked_dm_is_recorded_and_does_not_stop_other_playe
 
 
 @pytest.mark.asyncio
+async def test_score_prompt_dm_failure_is_logged_with_ids_and_exception_type_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A re-prompt DM failure must be logged too -- the blocked player only
+    ever sees the in-channel notice, never this. Matches `_log_failure`'s
+    discipline: fixed ids plus the exception TYPE only, never `str(exc)` or
+    a traceback (which could carry user text or tokens)."""
+    game = _score_game(7, 1, channel_id=701)
+    channel = _channel(1)
+    blocked_user = SimpleNamespace(
+        id=2,
+        send=AsyncMock(
+            side_effect=discord.HTTPException(
+                SimpleNamespace(status=403, reason="Forbidden"), "some secret detail"
+            )
+        ),
+    )
+    scheduler = _scheduler({(1, 701): channel}, {2: blocked_user})
+    monkeypatch.setattr(
+        "catan_bot.scheduler.game_service.record_score_request_delivery", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "catan_bot.scheduler.score_entry.build_score_entry_embed",
+        Mock(return_value=discord.Embed()),
+    )
+    monkeypatch.setattr(
+        "catan_bot.scheduler.score_entry.build_score_entry_view",
+        Mock(return_value=discord.ui.View(timeout=None)),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="catan_bot.scheduler"):
+        await scheduler._send_score_prompt_dm(_due_prompt(game, 2))
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "user_id=2" in message
+    assert "game_id=7" in message
+    assert "HTTPException" in message
+    assert "some secret detail" not in message
+
+
+@pytest.mark.asyncio
 async def test_score_prompt_one_games_failure_does_not_block_another(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

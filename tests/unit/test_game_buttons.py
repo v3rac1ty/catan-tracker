@@ -34,8 +34,21 @@ def _dialog_interaction(*, user_id: int = 456) -> SimpleNamespace:
     )
 
 
-def _preflight_status(*, complete: bool, outstanding: tuple[int, ...] = ()) -> SimpleNamespace:
-    return SimpleNamespace(complete=complete, outstanding_ids=outstanding)
+def _preflight_status(
+    *,
+    complete: bool,
+    outstanding: tuple[int, ...] = (),
+    winner_shortfall: int | None = None,
+    winner_id: int = 1,
+    target_points: int = 10,
+) -> SimpleNamespace:
+    game = SimpleNamespace(game=SimpleNamespace(target_points=target_points), winner_id=winner_id)
+    return SimpleNamespace(
+        complete=complete,
+        outstanding_ids=outstanding,
+        winner_shortfall=winner_shortfall,
+        game=game,
+    )
 
 
 def test_game_action_view_is_persistent_and_has_stable_ids() -> None:
@@ -222,6 +235,72 @@ async def test_confirm_button_shows_dialog_and_does_not_confirm_when_collection_
     kwargs = interaction.response.send_message.await_args.kwargs
     assert kwargs["ephemeral"] is True
     assert isinstance(kwargs["view"], game_confirm._ConfirmAnywayView)
+
+
+@pytest.mark.asyncio
+async def test_confirm_button_shows_dialog_when_collection_complete_but_winner_below_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bug 1's other half: even though every participant has submitted a
+    row (`complete=True`), a winner whose recorded row never reached target
+    must still be paused on -- reusing the same "confirm anyway" dialog,
+    not a second one -- and the warning must name the shortfall."""
+    interaction = _interaction()
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_confirm.game_service,
+        "confirm_preflight",
+        AsyncMock(
+            return_value=_preflight_status(
+                complete=True, winner_shortfall=2, winner_id=1, target_points=10
+            )
+        ),
+    )
+    confirm = AsyncMock()
+    monkeypatch.setattr(game_confirm.game_service, "confirm_game", confirm)
+
+    await game_confirm.GameActionButton(42, "confirm").callback(interaction)
+
+    confirm.assert_not_awaited()
+    interaction.response.defer.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+    content = interaction.response.send_message.await_args.args[0]
+    assert "<@1>" in content
+    assert "8 point" in content
+    assert "10-point target" in content
+    assert "haven't entered their points" not in content
+
+
+@pytest.mark.asyncio
+async def test_confirm_button_names_both_reasons_when_both_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Outstanding players *and* a below-target winner can both be true at
+    once; the dialog must name both, not just whichever was checked first."""
+    interaction = _interaction()
+    actor = Actor(user_id=456, has_manage_guild=False, role_ids=frozenset())
+    monkeypatch.setattr(game_confirm, "actor_from_interaction", lambda _: actor)
+    monkeypatch.setattr(
+        game_confirm.game_service,
+        "confirm_preflight",
+        AsyncMock(
+            return_value=_preflight_status(
+                complete=False, outstanding=(3,), winner_shortfall=2, winner_id=1, target_points=10
+            )
+        ),
+    )
+    confirm = AsyncMock()
+    monkeypatch.setattr(game_confirm.game_service, "confirm_game", confirm)
+
+    await game_confirm.GameActionButton(42, "confirm").callback(interaction)
+
+    confirm.assert_not_awaited()
+    content = interaction.response.send_message.await_args.args[0]
+    assert "<@3>" in content
+    assert "hasn't entered their points" in content
+    assert "<@1>" in content
+    assert "8 point" in content
 
 
 @pytest.mark.asyncio
