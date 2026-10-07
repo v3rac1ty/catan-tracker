@@ -130,6 +130,14 @@ def test_wins_and_games_add_up(records: list[ParticipationRecord]) -> None:
 @PROPERTY_SETTINGS
 @given(record_sets())
 def test_player_summary_rates_and_sample_bounds(records: list[ParticipationRecord]) -> None:
+    rows_by_game: dict[int, list[ParticipationRecord]] = defaultdict(list)
+    for row in records:
+        rows_by_game[row.game_id].append(row)
+    fully_scored_games = {
+        game_id
+        for game_id, game_rows in rows_by_game.items()
+        if all(row.total_points is not None for row in game_rows)
+    }
     for s in player_summaries(records):
         assert s.wins <= s.games
         assert s.scored_games <= s.games
@@ -141,7 +149,12 @@ def test_player_summary_rates_and_sample_bounds(records: list[ParticipationRecor
         assert set(s.source_samples) == set(s.source_averages)
         assert all(0 < n <= s.scored_games for n in s.source_samples.values())
         assert s.target_share_samples <= s.scored_games
-        assert s.win_margin_samples <= s.wins
+        fully_scored_wins = sum(
+            row.is_winner
+            for row in records
+            if row.user_id == s.user_id and row.game_id in fully_scored_games
+        )
+        assert s.win_margin_samples <= fully_scored_wins
         assert s.loss_deficit_samples <= s.games - s.wins
         assert s.close_losses <= s.loss_deficit_samples
         assert (s.avg_win_margin is None) == (s.win_margin_samples == 0)
@@ -259,6 +272,9 @@ def test_timeline_matches_summary(records: list[ParticipationRecord]) -> None:
 @given(record_sets())
 def test_meta_sample_bounds_and_totals(records: list[ParticipationRecord]) -> None:
     meta = meta_summary(records)
+    rows_by_game: dict[int, list[ParticipationRecord]] = defaultdict(list)
+    for row in records:
+        rows_by_game[row.game_id].append(row)
     with_breakdown = [r for r in records if r.breakdown is not None]
     winners_scored = [r for r in records if r.is_winner and r.total_points is not None]
 
@@ -273,7 +289,11 @@ def test_meta_sample_bounds_and_totals(records: list[ParticipationRecord]) -> No
     for split in meta.play_styles.values():
         assert _in_unit_interval(split.win_rate)
 
-    assert meta.margin_samples <= meta.scored_games
+    fully_scored_game_count = sum(
+        all(row.total_points is not None for row in game_rows)
+        for game_rows in rows_by_game.values()
+    )
+    assert meta.margin_samples <= fully_scored_game_count
     assert sum(meta.margin_distribution.values()) == meta.margin_samples
     assert (meta.avg_margin is None) == (meta.margin_samples == 0)
     assert meta.winners_with_vp_cards.games <= meta.scored_games

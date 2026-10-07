@@ -13,6 +13,7 @@ from catan_bot.cogs.config_cog import ConfigCog
 from catan_bot.cogs.event_cog import EventCog
 from catan_bot.cogs.game_cog import GameCog
 from catan_bot.cogs.help_cog import HelpCog
+from catan_bot.cogs.insights_cog import InsightsCog
 from catan_bot.cogs.season_cog import SeasonCog
 from catan_bot.cogs.stats_cog import StatsCog
 from catan_bot.config import BotSettings
@@ -35,7 +36,7 @@ def _settings(*, sync: bool, guild_id: int | None = None) -> BotSettings:
 async def test_all_commands_register_in_an_offline_tree() -> None:
     bot = CatanBot(_settings(sync=False))
     try:
-        for cog_type in (ConfigCog, SeasonCog, GameCog, StatsCog, EventCog, HelpCog):
+        for cog_type in (ConfigCog, SeasonCog, GameCog, StatsCog, InsightsCog, EventCog, HelpCog):
             await bot.add_cog(cog_type(bot))
 
         top_level = {command.name: command for command in bot.tree.get_commands()}
@@ -45,6 +46,7 @@ async def test_all_commands_register_in_an_offline_tree() -> None:
             "game",
             "leaderboard",
             "stats",
+            "insights",
             "event",
             "help",
         }
@@ -72,6 +74,11 @@ async def test_all_commands_register_in_an_offline_tree() -> None:
             "void",
             "history",
             "show",
+        }
+        assert {command.name for command in top_level["insights"].commands} == {
+            "player",
+            "meta",
+            "head-to-head",
         }
         assert {command.name for command in top_level["event"].commands} == {
             "create",

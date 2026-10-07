@@ -491,7 +491,7 @@ async def test_player_one_summary(seed: Seed) -> None:
         avg_cities=F(22, 14),  # city POINTS 4 2 2 6 2 2 4 -> count = points / 2
         avg_vp_cards=F(2, 5),  # only normal/seafarers games: 0 0 0 1 1
         avg_metropolises=F(2, 4),  # C&K games only: 2 and 0 points -> count = points / 2
-        avg_win_margin=F(2),  # (10-8) (13-10) (10-9)
+        avg_win_margin=F(2),  # G1: 10-8, G4: 13-10, G6: 10-9
         win_margin_samples=3,
         avg_loss_deficit=F(2),  # (10-8) (12-9) (10-8) (13-12)
         loss_deficit_samples=4,
@@ -588,8 +588,8 @@ async def test_player_two_summary_orders_same_day_games_by_known_time(seed: Seed
         avg_cities=F(20, 12),
         avg_vp_cards=F(3, 5),
         avg_metropolises=F(0),  # one C&K game with 0 metropolis points: 0, not None
-        avg_win_margin=F(3, 2),  # G2: 10-8, G9: 10-9; G7 has no score so no margin
-        win_margin_samples=2,
+        avg_win_margin=F(1),  # G9: 10-9; G2 is partially scored and G7 unscored
+        win_margin_samples=1,
         avg_loss_deficit=F(5, 2),  # (10-8) (13-10) (10-6) (10-9)
         loss_deficit_samples=4,
         close_losses=2,  # deficits 2 and 1
@@ -734,8 +734,8 @@ async def test_players_with_unscored_games_four_and_five(seed: Seed) -> None:
         avg_cities=F(8, 4),
         avg_vp_cards=F(0),  # G5 is a normal game with vp_cards recorded as 0
         avg_metropolises=F(0),
-        avg_win_margin=F(2),  # G5: 10 - 8
-        win_margin_samples=1,
+        avg_win_margin=None,  # G5 is partially scored, so the runner-up is unknown
+        win_margin_samples=0,
         avg_loss_deficit=F(5),  # G4 only: 13 - 8; G2 own score missing
         loss_deficit_samples=1,
         close_losses=0,
@@ -795,9 +795,9 @@ async def test_meta_summary_hand_computed(seed: Seed) -> None:
         scored_games=8,  # G7's winner has no score
         avg_winning_score=F(88, 8),  # 10 10 12 13 10 10 13 10
         winning_score_distribution={10: 5, 12: 1, 13: 2},
-        avg_margin=F(14, 8),  # 2 2 2 3 2 1 1 1
-        margin_distribution={1: 3, 2: 4, 3: 1},
-        margin_samples=8,
+        avg_margin=F(5, 3),  # G1 G3 G4 G6 G8 G9; partially scored G2/G5 excluded
+        margin_distribution={1: 3, 2: 2, 3: 1},
+        margin_samples=6,
         vp_share_samples=6,
         avg_vp_card_share_of_winning_score=F(3, 60),  # 0 .2 0 0 .1 0 over 6 wins
         winners_with_vp_cards=_rs(6, 2),
@@ -991,8 +991,8 @@ async def test_season_one_filter_flows_through_every_stat(
         avg_winning_score=F(32, 3),
         winning_score_distribution={10: 2, 12: 1},
         avg_margin=F(2),
-        margin_distribution={2: 3},
-        margin_samples=3,
+        margin_distribution={2: 2},
+        margin_samples=2,
         by_game_type={"normal": 2, "seafarers": 1},
         by_player_count={3: 2, 4: 1},
         avg_winning_score_by_month={"2026-03": F(32, 3)},
@@ -1038,8 +1038,9 @@ async def test_season_two_filter_excludes_season_one_voided_and_inactive(
         scored_games=5,
         avg_winning_score=F(56, 5),  # 13 10 10 13 10
         winning_score_distribution={10: 3, 13: 2},
-        avg_margin=F(8, 5),  # 3 2 1 1 1
-        margin_distribution={1: 3, 2: 1, 3: 1},
+        avg_margin=F(3, 2),  # G4 G6 G8 G9: 3 1 1 1; G5 is partially scored
+        margin_distribution={1: 3, 3: 1},
+        margin_samples=4,
         by_game_type={"cities_knights": 2, "normal": 3, "seafarers": 1},
         by_player_count={2: 2, 3: 3, 5: 1},
     )
@@ -1132,7 +1133,7 @@ async def test_season_and_game_type_filters_combine(
     )
     assert _labels(seed, both) == ["G5", "G6", "G9"]
     m = meta_summary(both)
-    _check(m, games=3, scored_games=3, avg_winning_score=F(10), avg_margin=F(4, 3))  # 2 1 1
+    _check(m, games=3, scored_games=3, avg_winning_score=F(10), avg_margin=F(1))  # 1 1
     # G5 (1 2 3 4 5), G6 (1 2), G9 (2 3).
     assert [(s.user_id, s.games) for s in player_summaries(both)] == [
         (2, 3),

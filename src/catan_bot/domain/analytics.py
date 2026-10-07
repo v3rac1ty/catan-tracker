@@ -228,13 +228,14 @@ def _player_summary(
         if own.total_points is None:
             continue
         if own.is_winner:
-            others = [
-                r.total_points
-                for r in game
-                if r.user_id != own.user_id and r.total_points is not None
-            ]
-            if others:
-                win_margins.append(own.total_points - max(others))
+            if all(r.total_points is not None for r in game):
+                others = [
+                    r.total_points
+                    for r in game
+                    if r.user_id != own.user_id and r.total_points is not None
+                ]
+                if others:
+                    win_margins.append(own.total_points - max(others))
         else:
             winners = [r.total_points for r in game if r.is_winner and r.total_points is not None]
             if winners:
@@ -397,13 +398,14 @@ def meta_summary(records: Sequence[ParticipationRecord]) -> MetaSummary:
             vp_winners += vp_cards > 0
             if winner.total_points > 0:
                 vp_shares.append(Fraction(vp_cards, winner.total_points))
-        other_scores = [
-            r.total_points
-            for r in game
-            if r.user_id != winner.user_id and r.total_points is not None
-        ]
-        if other_scores:
-            margins.append(winner.total_points - max(other_scores))
+        if all(r.total_points is not None for r in game):
+            other_scores = [
+                r.total_points
+                for r in game
+                if r.user_id != winner.user_id and r.total_points is not None
+            ]
+            if other_scores:
+                margins.append(winner.total_points - max(other_scores))
         road = _ROAD_KEY.get(winner.game_type)
         if (
             road

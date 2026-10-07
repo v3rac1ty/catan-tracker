@@ -311,6 +311,32 @@ def test_missing_other_scores_skip_margins_and_missing_targets_skip_share() -> N
     assert summary.win_margin_samples == summary.loss_deficit_samples == 0
 
 
+def test_win_margin_requires_every_participant_score() -> None:
+    records = [
+        # The unscored third player makes the runner-up unknown.
+        row(1, date(2025, 1, 1), 1, winner=True, points=10, players=3),
+        row(1, date(2025, 1, 1), 2, points=3, players=3),
+        row(1, date(2025, 1, 1), 3, points=None, players=3),
+        # Fully scored control: margin is 10 - 7 = 3.
+        row(2, date(2025, 1, 2), 1, winner=True, points=10, players=3),
+        row(2, date(2025, 1, 2), 2, points=7, players=3),
+        row(2, date(2025, 1, 2), 3, points=5, players=3),
+    ]
+
+    winner = player_summary(records, 1)
+    assert winner.avg_win_margin == 3
+    assert winner.win_margin_samples == 1
+    # Loss deficits still need only the winner's and player's scores.
+    loser = player_summary(records, 2)
+    assert loser.avg_loss_deficit == 5  # partial game: 10-3; control game: 10-7
+    assert loser.loss_deficit_samples == 2
+
+    meta = meta_summary(records)
+    assert meta.avg_margin == 3
+    assert meta.margin_distribution == {3: 1}
+    assert meta.margin_samples == 1
+
+
 def test_summaries_order_award_rates_and_tied_best_other_score() -> None:
     records = sample()
     summaries = player_summaries(records)
@@ -345,8 +371,8 @@ def test_meta_summary_hand_computed_aggregates() -> None:
     assert summary.games == 5 and summary.scored_games == 5
     assert summary.avg_winning_score == Fraction(58, 5)
     assert summary.winning_score_distribution == {10: 1, 9: 1, 15: 1, 12: 2}
-    assert summary.avg_margin == Fraction(9, 5)
-    assert summary.margin_distribution == {2: 4, 1: 1}
+    assert summary.avg_margin == Fraction(7, 4)
+    assert summary.margin_distribution == {2: 3, 1: 1}
     assert summary.winner_composition["settlements"] == 4
     assert summary.loser_composition["settlements"] == Fraction(23, 6)
     assert summary.by_game_type == {"normal": 3, "seafarers": 1, "cities_knights": 1}
@@ -370,7 +396,7 @@ def test_meta_summary_hand_computed_aggregates() -> None:
     assert summary.winners_with_vp_cards == RecordSplit(4, 2, Fraction(1, 2))
     assert summary.avg_vp_card_share_of_winning_score == Fraction(1, 6)
     assert summary.vp_share_samples == 4
-    assert summary.margin_samples == 5
+    assert summary.margin_samples == 4
     assert summary.winner_composition_samples["settlements"] == 5
     assert summary.loser_composition_samples["settlements"] == 6
     assert summary.win_award_combos == {

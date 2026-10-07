@@ -19,11 +19,13 @@ from catan_bot.db.models import (
     Season,
     SeasonResultRow,
 )
+from catan_bot.domain.analytics import MetaSummary, PlayerSummary
 from catan_bot.domain.bet import BetOutcome
 from catan_bot.domain.ranking import PlayerMovement, PlayerStats, RankedPlayer
 from catan_bot.domain.scoring import GameRules, PlayerScore
 
 LeaderboardScope = Literal["season", "all_time"]
+InsightsScope = Literal["season", "all_time"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,3 +268,40 @@ class PreparedGameUpdate:
     initial_scores: tuple[PlayerScore, ...]
     update_reason: str | None
     season_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class InsightsFilter:
+    """The scope/game-type filter an insights view was computed under."""
+
+    scope: InsightsScope
+    season: Season | None  # the active season when scope == "season", else None
+    game_type: str | None  # None = all game types
+
+
+@dataclass(frozen=True, slots=True)
+class PlayerInsightsView:
+    filter: InsightsFilter
+    summary: PlayerSummary
+
+
+@dataclass(frozen=True, slots=True)
+class MetaInsightsView:
+    filter: InsightsFilter
+    meta: MetaSummary
+    players: list[PlayerSummary]  # player_summaries(records), for "who holds X most" lines
+
+
+@dataclass(frozen=True, slots=True)
+class OpponentRecord:
+    opponent_id: int
+    games_together: int
+    wins: int  # shared games the subject won
+    opponent_wins: int  # shared games the opponent won
+
+
+@dataclass(frozen=True, slots=True)
+class HeadToHeadView:
+    filter: InsightsFilter
+    user_id: int
+    opponents: list[OpponentRecord]  # sorted games_together desc, then opponent_id asc

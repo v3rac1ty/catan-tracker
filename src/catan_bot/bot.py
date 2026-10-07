@@ -24,6 +24,7 @@ INITIAL_COGS: tuple[str, ...] = (
     "catan_bot.cogs.season_cog",
     "catan_bot.cogs.game_cog",
     "catan_bot.cogs.stats_cog",
+    "catan_bot.cogs.insights_cog",
     "catan_bot.cogs.event_cog",
     "catan_bot.cogs.help_cog",
 )

@@ -62,6 +62,10 @@ _COMMANDS: tuple[tuple[str, str], ...] = (
     ("/leaderboard [channel]", "Show rankings here or post them to a chosen channel."),
     ("/stats", "Show a player's win/loss record."),
     (
+        "/insights player|meta|head-to-head",
+        "Explore player and group trends or compare one player's record against each opponent.",
+    ),
+    (
         "/event create [channel]|list|cancel",
         "Schedule and manage game nights with RSVPs; event posts show Going/Maybe/Not Going.",
     ),

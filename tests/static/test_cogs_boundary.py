@@ -24,6 +24,7 @@ _EXPECTED_FILES = frozenset(
         "cogs/event_cog.py",
         "cogs/game_cog.py",
         "cogs/help_cog.py",
+        "cogs/insights_cog.py",
         "cogs/season_cog.py",
         "cogs/stats_cog.py",
         "views/__init__.py",
