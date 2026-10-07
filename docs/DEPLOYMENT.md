@@ -260,6 +260,118 @@ sensitive.
 
 ## 7. Safe updates
 
+### Recommended: `scripts/deploy.sh`
+
+Run the whole update with one command, as the normal user, from any directory.
+Run it inside `tmux` or `screen` so a dropped SSH session cannot kill it
+mid-deploy:
+
+```bash
+tmux new -A -s deploy
+bash /opt/catan-tracker/scripts/deploy.sh
+```
+
+The script, in order:
+
+1. Aborts if `git status --porcelain` is not empty, validates the Compose file,
+   and switches back to `master` if a previous rollback left the checkout
+   detached.
+2. Fetches `origin`. It compares `origin/master` with the revision the bot is
+   known to be running (recorded in `backups/.deployed-sha`, written only after
+   a deploy or rollback was verified healthy; if the file is missing it says so
+   and falls back to the checkout's HEAD). If they match and the bot container
+   is running, it prints `Already up to date at <sha>` and exits. A local
+   checkout that moved ahead of what runs, for example after a failed deploy,
+   does not count as up to date.
+3. Requires these GitHub check runs on the new commit to be completed with
+   conclusion `success`: `Python 3.12 / PostgreSQL 16` and `Production
+   container smoke test` (the job names in `.github/workflows/ci.yml`; a test
+   keeps the script's `REQUIRED_CHECKS` list in sync). Any other check run that
+   failed also aborts the deploy; other runs still in progress are ignored. It
+   reads every page of results and polls for up to 15 minutes while required
+   checks are missing or running.
+4. Backs up the database exactly as in section 8 into `backups/` (mode 700
+   directory, mode 600 file, `pg_restore -l` verified). Backups are never
+   deleted.
+5. Fast-forwards to the exact commit CI validated, then rebuilds and starts the
+   services one at a time: build the image once, `up -d --no-recreate db` (the
+   database container is never recreated), wait for it to be healthy, run
+   `migrate` and require exit code 0, then recreate only the bot. The bot is
+   started with `SYNC_COMMANDS=true` for that one run, so slash commands sync
+   without editing `.env`; `.env` is not touched. Each recreate is scoped with
+   `--no-deps` to `migrate` or `bot`.
+6. Waits (default 120 s) for that new bot container to log `has connected to
+   Gateway`, reading only that container's logs and failing fast on a
+   `Traceback`, `ExtensionFailed`, or a restarting container. After the
+   connection it verifies the same container is still running with an unchanged
+   restart count, and requires it to stay that way for 10 more seconds.
+7. Records the new running revision, appends a line to
+   `backups/deploy-history.log`, and prints a summary: deployed commit, backup
+   file, whether commands were synced, and whether a migration was applied.
+
+Keep `SYNC_COMMANDS=false` in `.env`; the script warns if it is true. Set
+`DEV_GUILD_ID` in `.env` as before to sync to a development server instead of
+globally.
+
+Options:
+
+| Flag | Effect |
+| --- | --- |
+| `--no-sync` | Do not sync slash commands this run. |
+| `--skip-ci-check` | Skip the GitHub check gate (use when the API is unreachable or rate limited). |
+| `--force` | Redeploy even if the running revision is already current. |
+| `--timeout SECONDS` | How long to wait for the database, migrations and the bot (default 120). |
+| `--rollback [REV]` | Back up, then return to `REV` and rebuild. Without `REV`, uses the commit that ran before the last successful deploy. |
+| `--help` | Print usage. |
+
+#### Automatic rollback
+
+From the moment the script fast-forwards the checkout, any failure restores the
+revision that was running before this run (from `backups/.deployed-sha`, not
+merely the previous local commit): `git switch --detach` to it, rebuild with
+the same scoped sequence, wait for the bot to connect and stay up, print the
+last 40 bot log lines, record the result in `deploy-history.log`, report the
+final checkout and container state, and exit 1. This covers:
+
+- a failing build, migration, or bot start, or a bot that does not connect or
+  keeps restarting;
+- Ctrl-C (SIGINT) and SIGTERM while the deploy is running;
+- an unexpected command failure inside the script after the fast-forward.
+
+It does not cover `kill -9` (SIGKILL), power loss or a VM crash, or a lost SSH
+session when the script is not running under `tmux` or `screen` (the hangup
+kills it). After any of those, check `git status`, `sudo docker compose ps
+--all` and the bot logs, then rerun `bash scripts/deploy.sh --rollback` or the
+manual steps below. A failure before the fast-forward (dirty tree, CI gate,
+backup) changes nothing, so there is nothing to roll back.
+
+The script never restores the database. If a migration was applied during the
+failed deploy, it prints a prominent warning: a code rollback does not undo
+migrations, so the old code may not work with the new schema. In that case
+restore the backup it names by following "Restore production" in section 8.
+After a rollback the checkout is detached; the next `bash scripts/deploy.sh`
+switches back to `master` first and, because `master` is ahead of what runs,
+deploys it again instead of reporting up to date.
+
+#### Manual rollback
+
+`bash scripts/deploy.sh --rollback [REV]` takes a backup first, then returns to
+`REV`. If bringing `REV` up fails, the script tries to bring the revision that
+was running before the command back up, and prints the actual checkout and bot
+container state. When `REV` is the revision already running (and likewise for
+a `--force` redeploy of the running revision), the recovery is a restart in
+place: the same build, migrate and bot sequence is run again for that revision
+and logged as such. Recovery is best effort: if that start fails too, the
+script says so, reports the container state, and exits 1, so a bot that stays
+down is always reported and never silent. A code rollback does
+not undo migrations (see section 8).
+
+The script needs `git`, `curl`, `python3` and `sudo` access to Docker (all
+present on a stock Ubuntu VM), and the repository's `origin` must be on GitHub
+for the check gate.
+
+### Manual fallback
+
 Back up the database before any update that may apply a migration. Then update
 with a fast-forward-only pull:
 

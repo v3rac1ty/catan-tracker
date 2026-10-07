@@ -266,4 +266,6 @@ catan-tracker/
 The bot is designed to run 24/7 on a small always-on machine, such as an Oracle
 Cloud Always Free ARM VM. Follow the [deployment guide](docs/DEPLOYMENT.md) for
 Discord setup, host hardening, Docker installation, command sync, updates,
-backups, and restore-rehearsal procedures.
+backups, and restore-rehearsal procedures. Updates on the VM are one command,
+`bash scripts/deploy.sh` (CI gate, backup, migrate, command sync, health check,
+automatic rollback; see section 7 of the guide).
