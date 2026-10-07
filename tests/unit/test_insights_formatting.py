@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from fractions import Fraction
 
@@ -10,6 +11,7 @@ import discord
 from catan_bot.db.models import Season
 from catan_bot.domain.analytics import (
     AwardStat,
+    MatchupHighlights,
     MetaSummary,
     PlayerSummary,
     RecordSplit,
@@ -733,3 +735,164 @@ def test_hostile_user_text_never_produces_a_ping() -> None:
         assert "<#1" not in text
         # The only mentions left are plain user mentions built from int ids.
         assert "<@101>" in text or embed.title == "Meta Insights"
+
+
+# ---------------------------------------------------------------------------
+# M5: when you win, rivalries, time-of-day calendar
+# ---------------------------------------------------------------------------
+
+
+def _split(games: int, wins: int) -> RecordSplit:
+    return RecordSplit(games, wins, Fraction(wins, games) if games else None)
+
+
+def _timed_player_view(**changes: object) -> PlayerInsightsView:
+    fields: dict[str, object] = {
+        "by_time_of_day": {
+            "daytime": _split(2, 1),
+            "evening": _split(8, 5),
+            "late_night": _split(1, 0),
+        },
+        "timed_games": 11,
+        "by_weekday": {0: _split(4, 1), 2: _split(1, 1), 5: _split(6, 5)},
+    } | changes
+    summary = replace(player_summary(_records(), 101), **fields)
+    return PlayerInsightsView(ALL_TIME, summary)
+
+
+def test_when_you_win_shows_buckets_sample_and_weekday_extremes() -> None:
+    embed = build_player_insights_embed(_timed_player_view())
+    value = _fields(embed)["When you win"]
+
+    assert value.splitlines() == [
+        "Daytime: 1-1 (50.0%)",
+        "Evening: 5-3 (62.5%)",
+        "Late night: 0-1 (0.0%)",
+        "(11 games with a recorded time)",
+        # Wednesday has one game, below the two-game minimum.
+        "Best day: Saturday 5-1 (83.3%)",
+        "Worst day: Monday 1-3 (25.0%)",
+        "(weekdays with 2+ games)",
+    ]
+    _assert_clean(embed)
+    _assert_within_limits(embed)
+
+
+def test_when_you_win_skips_empty_buckets_and_missing_data() -> None:
+    plain = _fields(build_player_insights_embed(_player_view()))
+    assert "When you win" not in plain  # no time-of-day or weekday data at all
+
+    only_weekdays = replace(
+        player_summary(_records(), 101), by_weekday={0: _split(3, 2), 4: _split(2, 0)}
+    )
+    value = _fields(build_player_insights_embed(PlayerInsightsView(ALL_TIME, only_weekdays)))[
+        "When you win"
+    ]
+    assert "recorded time" not in value
+    assert value.startswith("Best day: Monday 2-1 (66.7%)")
+
+
+def test_when_you_win_omits_weekday_line_without_a_real_comparison() -> None:
+    one_day = _timed_player_view(by_weekday={5: _split(6, 5)})
+    equal = _timed_player_view(by_weekday={0: _split(2, 1), 5: _split(4, 2)})
+    tiny = _timed_player_view(by_weekday={0: _split(1, 1), 5: _split(1, 0)})
+
+    for view in (one_day, equal, tiny):
+        value = _fields(build_player_insights_embed(view))["When you win"]
+        assert "day:" not in value
+        assert value.splitlines()[0] == "Daytime: 1-1 (50.0%)"
+
+
+def test_when_you_win_singular_sample_wording() -> None:
+    view = _timed_player_view(by_time_of_day={"evening": _split(1, 1)}, timed_games=1)
+
+    assert (
+        "(1 game with a recorded time)"
+        in _fields(build_player_insights_embed(view))["When you win"]
+    )
+
+
+def _h2h_view(highlights: MatchupHighlights | None) -> HeadToHeadView:
+    return HeadToHeadView(
+        ALL_TIME,
+        101,
+        [
+            OpponentRecord(7, 8, 2, 5),
+            OpponentRecord(8, 6, 4, 1),
+            OpponentRecord(9, 9, 4, 4),
+        ],
+        highlights,
+    )
+
+
+def test_rivalries_field_lists_each_present_highlight() -> None:
+    embed = build_head_to_head_embed(_h2h_view(MatchupHighlights(7, 8, 9, 3)))
+    fields = _fields(embed)
+
+    assert fields["Rivalries"].splitlines() == [
+        "Nemesis: <@7> won 5 of 8 shared games",
+        "Best matchup: <@8> \u2014 won 4 of 6 shared games",
+        "Closest rival: <@9> \u2014 won 4, they won 4 (9 shared games)",
+        "(min 3 shared games)",
+    ]
+    assert list(fields)[0] == "Rivalries"
+    assert "Opponents" in fields
+    _assert_clean(embed)
+    _assert_within_limits(embed)
+
+
+def test_rivalries_omit_none_lines_and_skip_when_all_none() -> None:
+    partial = _fields(build_head_to_head_embed(_h2h_view(MatchupHighlights(None, 8, None, 3))))
+    assert partial["Rivalries"].splitlines() == [
+        "Best matchup: <@8> \u2014 won 4 of 6 shared games",
+        "(min 3 shared games)",
+    ]
+
+    for highlights in (None, MatchupHighlights(None, None, None, 3)):
+        embed = build_head_to_head_embed(_h2h_view(highlights))
+        assert "Rivalries" not in _fields(embed)
+        assert "Opponents" in _fields(embed)
+        _assert_clean(embed)
+
+
+def test_rivalries_tolerate_a_highlight_missing_from_opponents() -> None:
+    embed = build_head_to_head_embed(
+        HeadToHeadView(
+            ALL_TIME, 101, [OpponentRecord(7, 8, 2, 5)], MatchupHighlights(99, None, None, 3)
+        )
+    )
+
+    assert _fields(embed)["Rivalries"].splitlines()[0] == "Nemesis: <@99>"
+    _assert_clean(embed)
+
+
+def test_rivalries_with_many_opponents_still_stay_within_limits() -> None:
+    opponents = [OpponentRecord(1_000_000_000_000_000_000 + i, 9, 5, 3) for i in range(400)]
+    first = opponents[0].opponent_id
+    view = HeadToHeadView(ALL_TIME, 101, opponents, MatchupHighlights(first, first, first, 3))
+    embed = build_head_to_head_embed(view)
+
+    _assert_within_limits(embed)
+    _assert_clean(embed)
+    assert "Rivalries" in _fields(embed)
+    assert embed.footer.text is not None and "of 400 opponents" in embed.footer.text
+
+
+def test_meta_calendar_gains_time_of_day_counts() -> None:
+    view = _meta_view()
+    meta = replace(view.meta, games_by_time_of_day={"daytime": 2, "evening": 7, "late_night": 0})
+    embed = build_meta_insights_embed(replace(view, meta=meta))
+    value = _fields(embed)["Calendar"]
+
+    assert "Busiest day: Saturday" in value
+    assert (
+        "Time of day: Daytime 2 \u2022 Evening 7 \u2022 Late night 0 (9 games with a recorded time)"
+        in value
+    )
+    _assert_clean(embed)
+
+
+def test_meta_calendar_without_time_data_is_unchanged() -> None:
+    assert _fields(build_meta_insights_embed(_meta_view()))["Calendar"] == (
+        "Busiest day: Saturday (6 games of 6)"
+    )

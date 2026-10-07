@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from fractions import Fraction
 
 from hypothesis import given, settings
@@ -15,6 +15,7 @@ from catan_bot.domain.analytics import (
     meta_summary,
     player_summaries,
     player_summary,
+    win_rate_by_season,
     win_rate_timeline,
 )
 from catan_bot.domain.participation import ParticipationRecord
@@ -46,6 +47,7 @@ def _game_rows(
             holders[source.key] = draw(st.sampled_from([None, *scored_ids]))
 
     rows: list[ParticipationRecord] = []
+    played_at = datetime.combine(played_on, time(12), tzinfo=UTC)
     for uid in user_ids:
         breakdown: dict[str, int] | None = None
         total: int | None = None
@@ -64,7 +66,7 @@ def _game_rows(
             ParticipationRecord(
                 game_id,
                 played_on,
-                None,
+                played_at,
                 game_type,
                 player_count >= 5,
                 target,
@@ -73,6 +75,8 @@ def _game_rows(
                 uid == winner,
                 total,
                 breakdown,
+                game_id % 3,
+                "UTC",
             )
         )
     return rows
@@ -125,6 +129,7 @@ def test_wins_and_games_add_up(records: list[ParticipationRecord]) -> None:
     assert sum(meta.by_game_type.values()) == games
     assert sum(meta.by_player_count.values()) == games
     assert sum(meta.games_by_weekday.values()) == games
+    assert sum(meta.games_by_time_of_day.values()) == games
 
 
 @PROPERTY_SETTINGS
@@ -171,7 +176,17 @@ def test_player_summary_rates_and_sample_bounds(records: list[ParticipationRecor
         assert sum(split.games for split in s.by_game_type.values()) == s.games
         assert sum(split.wins for split in s.by_player_count.values()) == s.wins
         assert sum(split.wins for split in s.by_game_type.values()) == s.wins
-        for split in (*s.by_player_count.values(), *s.by_game_type.values()):
+        assert sum(split.games for split in s.by_weekday.values()) == s.games
+        assert sum(split.games for split in s.by_time_of_day.values()) == s.timed_games
+        assert s.timed_games == s.games
+        assert sum(split.wins for split in s.by_weekday.values()) == s.wins
+        assert sum(split.wins for split in s.by_time_of_day.values()) <= s.wins
+        for split in (
+            *s.by_player_count.values(),
+            *s.by_game_type.values(),
+            *s.by_time_of_day.values(),
+            *s.by_weekday.values(),
+        ):
             assert _in_unit_interval(split.win_rate)
 
 
@@ -319,6 +334,16 @@ def test_meta_sample_bounds_and_totals(records: list[ParticipationRecord]) -> No
     else:
         assert meta.avg_winning_score is None
     assert all(len(month) == 7 for month in meta.avg_winning_score_by_month)
+
+    seasons = win_rate_by_season(records)
+    expected_season_games: dict[int, int] = defaultdict(int)
+    for row in records:
+        if row.season_id is not None:
+            expected_season_games[row.season_id] += 1
+    assert {
+        season_id: sum(split.games for split in players.values())
+        for season_id, players in seasons.items()
+    } == dict(expected_season_games)
 
 
 @PROPERTY_SETTINGS

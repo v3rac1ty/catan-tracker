@@ -121,7 +121,8 @@ async def head_to_head_insights(
     async with pool.acquire() as conn:
         flt, records = await _load(conn, guild_id, scope, game_type)
     opponents: list[OpponentRecord] = []
-    for pair in domain_analytics.head_to_head(records):
+    pairs = domain_analytics.head_to_head(records)
+    for pair in pairs:
         # Pairs are stored with player_a < player_b; normalize to the
         # subject's point of view.
         if pair.player_a == user_id:
@@ -133,7 +134,12 @@ async def head_to_head_insights(
                 OpponentRecord(pair.player_a, pair.games_together, pair.b_wins, pair.a_wins)
             )
     opponents.sort(key=lambda item: (-item.games_together, item.opponent_id))
-    return HeadToHeadView(filter=flt, user_id=user_id, opponents=opponents)
+    return HeadToHeadView(
+        filter=flt,
+        user_id=user_id,
+        opponents=opponents,
+        highlights=domain_analytics.matchup_highlights(pairs, user_id),
+    )
 
 
 async def chart_insights(
@@ -146,10 +152,20 @@ async def chart_insights(
     _require_valid(scope, game_type)
     async with pool.acquire() as conn:
         flt, records = await _load(conn, guild_id, scope, game_type)
+        present = {record.season_id for record in records if record.season_id is not None}
+        # Fetch exactly the seasons the records mention: a newest-first `list_seasons`
+        # page could cut off older seasons that still have games.
+        found = [await seasons.get_season(conn, guild_id, sid) for sid in sorted(present)]
+    chronological = sorted(
+        (season for season in found if season is not None),
+        key=lambda season: (season.starts_on, season.season_id),
+    )
     return ChartInsightsView(
         filter=flt,
         meta=domain_analytics.meta_summary(records),
         players=domain_analytics.player_summaries(records),
         head_to_head=domain_analytics.head_to_head(records),
         timeline=domain_analytics.win_rate_timeline(records),
+        seasons=chronological,
+        season_records=domain_analytics.win_rate_by_season(records),
     )

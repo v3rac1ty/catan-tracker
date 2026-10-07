@@ -34,7 +34,7 @@ _GAME_TYPES = frozenset(get_args(GameType))
 # a date, then game_id and user_id break remaining ties deterministically.
 _LIST_PARTICIPATIONS_SQL = """
 SELECT g.game_id, g.played_on, g.played_at, g.game_type, g.extension_5_6,
-       g.target_points, p.user_id, p.is_winner, p.total_points,
+       g.target_points, g.season_id, g.played_timezone, p.user_id, p.is_winner, p.total_points,
        p.score_breakdown::text AS score_breakdown,
        count(*) OVER (PARTITION BY g.game_id) AS player_count
 FROM games AS g
@@ -88,6 +88,8 @@ def _row_to_participation(row: asyncpg.Record) -> ParticipationRecord:
         is_winner=row["is_winner"],
         total_points=row["total_points"],
         breakdown=_decode_breakdown(row["total_points"], row["score_breakdown"]),
+        season_id=row["season_id"],
+        played_timezone=row["played_timezone"],
     )
 
 

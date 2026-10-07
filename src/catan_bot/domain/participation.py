@@ -20,3 +20,5 @@ class ParticipationRecord:
     is_winner: bool
     total_points: int | None  # None = score not recorded
     breakdown: Mapping[str, int] | None  # source key -> points; None iff total_points is None
+    season_id: int | None = None
+    played_timezone: str | None = None  # IANA name `played_at` was entered in

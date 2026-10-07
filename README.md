@@ -53,10 +53,18 @@ flowchart LR
 
 `/insights player` shows one player's record, scoring, board stats, and awards;
 `/insights meta` summarizes how the group wins; `/insights head-to-head` compares
-one player's record with each opponent. `/insights chart` offers six charts:
+one player's record with each opponent. `/insights chart` offers seven charts:
 How winners score, Points by source, Award impact, Win rate over time, Winning
-scores & margins, and Head-to-head. Charts use P1–P8 labels with a legend mapping
-each label to its Discord member. The scope defaults to all-time and can be
+scores & margins, Head-to-head, and Win rate by season. Charts use P1–P8 labels
+with a legend mapping each label to its Discord member; the season chart labels
+its x axis S1, S2, ... and the message lists which season each label is.
+
+`/insights player` also has a "When you win" section (record by time of day and
+best and worst weekday, using each game's recorded local time; games without a
+recorded time are left out and the count is shown). `/insights head-to-head`
+adds a "Rivalries" section naming a nemesis, a best matchup, and a closest rival
+among opponents with at least three shared games. `/insights meta` adds
+time-of-day game counts to its Calendar section. The scope defaults to all-time and can be
 set to the active season. Results always cover exactly one game type and never
 mix types; when `game_type` is omitted, insights use the most-played type in the
 scope. Set `game_type` to switch to another type. Every score-based stat shows

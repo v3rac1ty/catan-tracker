@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from fractions import Fraction
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from catan_bot.domain.participation import ParticipationRecord
 
@@ -35,6 +36,25 @@ _AWARDS_BY_TYPE = {
         "printer",
     ),
 }
+
+TIME_OF_DAY_BUCKETS = ("daytime", "evening", "late_night")
+
+
+def _time_of_day_bucket(record: ParticipationRecord) -> str | None:
+    """Return the local-time bucket, skipping missing or invalid time metadata."""
+    if record.played_at is None or record.played_timezone is None:
+        return None
+    if record.played_at.tzinfo is None or record.played_at.utcoffset() is None:
+        return None
+    try:
+        hour = record.played_at.astimezone(ZoneInfo(record.played_timezone)).hour
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    if 5 <= hour < 17:
+        return "daytime"
+    if 17 <= hour < 21:
+        return "evening"
+    return "late_night"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +110,9 @@ class PlayerSummary:
     recent_form: RecordSplit
     by_player_count: dict[int, RecordSplit]
     by_game_type: dict[str, RecordSplit]
+    by_time_of_day: dict[str, RecordSplit] = field(default_factory=dict)
+    timed_games: int = 0
+    by_weekday: dict[int, RecordSplit] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +122,14 @@ class HeadToHead:
     games_together: int
     a_wins: int
     b_wins: int
+
+
+@dataclass(frozen=True, slots=True)
+class MatchupHighlights:
+    nemesis: int | None
+    best_matchup: int | None
+    closest_rival: int | None
+    min_games: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +156,62 @@ class MetaSummary:
     games_by_weekday: dict[int, int]
     avg_winning_score_by_month: dict[str, Fraction]
     winning_score_samples_by_month: dict[str, int]
+    games_by_time_of_day: dict[str, int] = field(default_factory=dict)
+
+
+def matchup_highlights(
+    pairs: Sequence[HeadToHead], user_id: int, *, min_games: int = 3
+) -> MatchupHighlights:
+    """Select the strongest opponent records for a player."""
+    candidates: list[tuple[int, int, int, int, int]] = []
+    for pair in pairs:
+        if pair.player_a == user_id:
+            opponent, wins, opponent_wins = pair.player_b, pair.a_wins, pair.b_wins
+        elif pair.player_b == user_id:
+            opponent, wins, opponent_wins = pair.player_a, pair.b_wins, pair.a_wins
+        else:
+            continue
+        if pair.games_together >= min_games:
+            candidates.append(
+                (opponent, pair.games_together, wins, opponent_wins, pair.games_together)
+            )
+
+    def tied_order(item: tuple[int, int, int, int, int]) -> tuple[int, int]:
+        return (-item[1], item[0])
+
+    nemesis = min(
+        (item for item in candidates if item[3] > 0),
+        key=lambda item: (-Fraction(item[3], item[4]), *tied_order(item)),
+        default=None,
+    )
+    best = min(
+        (item for item in candidates if item[2] > 0),
+        key=lambda item: (-Fraction(item[2], item[4]), *tied_order(item)),
+        default=None,
+    )
+    closest = min(
+        candidates,
+        key=lambda item: (abs(item[2] - item[3]), -item[1], item[0]),
+        default=None,
+    )
+    return MatchupHighlights(
+        nemesis[0] if nemesis else None,
+        best[0] if best else None,
+        closest[0] if closest else None,
+        min_games,
+    )
+
+
+def win_rate_by_season(records: Sequence[ParticipationRecord]) -> dict[int, dict[int, RecordSplit]]:
+    """Return each player's record within every season represented by a game."""
+    seasons: dict[int, dict[int, list[ParticipationRecord]]] = {}
+    for record in records:
+        if record.season_id is not None:
+            seasons.setdefault(record.season_id, {}).setdefault(record.user_id, []).append(record)
+    return {
+        season_id: {user_id: _split(rows) for user_id, rows in sorted(players.items())}
+        for season_id, players in sorted(seasons.items())
+    }
 
 
 def games_by_type(records: Sequence[ParticipationRecord]) -> dict[str, int]:
@@ -290,9 +377,15 @@ def _player_summary(
 
     counts: dict[int, list[ParticipationRecord]] = {}
     types: dict[str, list[ParticipationRecord]] = {}
+    times: dict[str, list[ParticipationRecord]] = {}
+    weekdays: dict[int, list[ParticipationRecord]] = {}
     for row in rows:
         counts.setdefault(row.player_count, []).append(row)
         types.setdefault(row.game_type, []).append(row)
+        bucket = _time_of_day_bucket(row)
+        if bucket is not None:
+            times.setdefault(bucket, []).append(row)
+        weekdays.setdefault(row.played_on.weekday(), []).append(row)
     sorted_points = sorted(numeric_points)
     median = (
         Fraction(
@@ -344,6 +437,9 @@ def _player_summary(
         _split(rows[-10:]),
         {count: _split(group) for count, group in sorted(counts.items())},
         {game_type: _split(group) for game_type, group in sorted(types.items())},
+        {bucket: _split(times[bucket]) for bucket in TIME_OF_DAY_BUCKETS if bucket in times},
+        sum(len(group) for group in times.values()),
+        {weekday: _split(group) for weekday, group in sorted(weekdays.items())},
     )
 
 
@@ -395,6 +491,7 @@ def meta_summary(records: Sequence[ParticipationRecord]) -> MetaSummary:
     by_type: dict[str, int] = {}
     by_count: dict[int, int] = {}
     weekdays: dict[int, int] = {}
+    time_buckets: dict[str, int] = {}
     month_scores: dict[str, list[int]] = {}
     scored_games = 0
 
@@ -404,6 +501,9 @@ def meta_summary(records: Sequence[ParticipationRecord]) -> MetaSummary:
         by_type[first.game_type] = by_type.get(first.game_type, 0) + 1
         by_count[first.player_count] = by_count.get(first.player_count, 0) + 1
         weekdays[first.played_on.weekday()] = weekdays.get(first.played_on.weekday(), 0) + 1
+        bucket = _time_of_day_bucket(first)
+        if bucket is not None:
+            time_buckets[bucket] = time_buckets.get(bucket, 0) + 1
         winner = next((r for r in game if r.is_winner), None)
         for row in game:
             if row.breakdown is None:
@@ -493,6 +593,7 @@ def meta_summary(records: Sequence[ParticipationRecord]) -> MetaSummary:
             for month, values in sorted(month_scores.items())
         },
         {month: len(values) for month, values in sorted(month_scores.items())},
+        {bucket: time_buckets[bucket] for bucket in TIME_OF_DAY_BUCKETS if bucket in time_buckets},
     )
 
 

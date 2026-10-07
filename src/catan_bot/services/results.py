@@ -20,7 +20,13 @@ from catan_bot.db.models import (
     Season,
     SeasonResultRow,
 )
-from catan_bot.domain.analytics import HeadToHead, MetaSummary, PlayerSummary
+from catan_bot.domain.analytics import (
+    HeadToHead,
+    MatchupHighlights,
+    MetaSummary,
+    PlayerSummary,
+    RecordSplit,
+)
 from catan_bot.domain.bet import BetOutcome
 from catan_bot.domain.ranking import PlayerMovement, PlayerStats, RankedPlayer
 from catan_bot.domain.scoring import GameRules, PlayerScore
@@ -308,6 +314,7 @@ class HeadToHeadView:
     filter: InsightsFilter
     user_id: int
     opponents: list[OpponentRecord]  # sorted games_together desc, then opponent_id asc
+    highlights: MatchupHighlights | None = None  # nemesis / best matchup / closest rival
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,3 +326,7 @@ class ChartInsightsView:
     players: list[PlayerSummary]  # domain player_summaries order
     head_to_head: list[HeadToHead]  # domain head_to_head
     timeline: dict[int, list[tuple[date, Fraction]]]  # domain win_rate_timeline
+    # Seasons that have games in this view, chronological by starts_on then season_id.
+    seasons: list[Season] = field(default_factory=list)
+    # season_id -> user_id -> record in that season (domain win_rate_by_season).
+    season_records: dict[int, dict[int, RecordSplit]] = field(default_factory=dict)

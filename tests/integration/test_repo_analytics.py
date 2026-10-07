@@ -161,6 +161,8 @@ async def test_record_fields_scores_and_breakdown_are_decoded(
         is_winner=True,
         total_points=12,
         breakdown={"settlements": 4, "cities": 6, "longest_road": 2},
+        season_id=None,
+        played_timezone="America/Chicago",
     )
     assert isinstance(records[0].breakdown, dict)
     assert records[1].user_id == 2
@@ -174,6 +176,7 @@ async def test_record_fields_scores_and_breakdown_are_decoded(
         assert (row.total_points, row.breakdown) == (None, None)
         assert (row.game_type, row.extension_5_6, row.target_points) == ("normal", False, None)
         assert row.played_at is None
+        assert (row.season_id, row.played_timezone) == (None, None)
     assert by_key[(partial.game_id, 1)].breakdown == {
         "settlements": 5,
         "cities": 5,
@@ -181,6 +184,33 @@ async def test_record_fields_scores_and_breakdown_are_decoded(
     }
     assert by_key[(partial.game_id, 2)].breakdown is None
     assert by_key[(partial.game_id, 2)].total_points is None
+
+
+async def test_season_id_and_played_timezone_are_mapped_per_game(
+    app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    await players.ensure_players(app_conn, guild_id, [1, 2])
+    season_id = await _new_season(app_conn, guild_id, "One")
+    timed = await _confirmed(
+        app_conn,
+        guild_id,
+        date(2026, 3, 1),
+        1,
+        [2],
+        season_id=season_id,
+        played_at=datetime(2026, 3, 1, 2, 0, tzinfo=UTC),
+        played_timezone="Asia/Tokyo",
+    )
+    plain = await _confirmed(app_conn, guild_id, date(2026, 3, 2), 2, [1])
+
+    records = await analytics.list_participations(app_conn, guild_id)
+
+    by_game = {r.game_id: (r.season_id, r.played_timezone) for r in records}
+    assert by_game == {timed.game_id: (season_id, "Asia/Tokyo"), plain.game_id: (None, None)}
+    # Both participants of a game carry the game's values.
+    assert {(r.season_id, r.played_timezone) for r in records if r.game_id == timed.game_id} == {
+        (season_id, "Asia/Tokyo")
+    }
 
 
 async def test_ordering_is_chronological_with_null_played_at_first_then_game_id(

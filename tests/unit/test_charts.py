@@ -9,7 +9,8 @@ import subprocess  # noqa: S404 - runs this interpreter on a fixed snippet, no u
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 
@@ -26,13 +27,14 @@ from catan_bot.charts import (
     render_chart,
     source_label,
 )
+from catan_bot.db.models import Season
 from catan_bot.domain import analytics
 from catan_bot.domain.participation import ParticipationRecord
 from catan_bot.domain.scoring import score_sources
 from catan_bot.services.results import ChartInsightsView, InsightsFilter
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-PLAYER_KINDS = ("points-by-source", "win-rate-trend", "head-to-head")
+PLAYER_KINDS = ("points-by-source", "win-rate-trend", "head-to-head", "season-trend")
 PLAYER_FREE_KINDS = ("winning-formula", "award-impact", "winning-scores")
 ALL_FILTER = InsightsFilter(scope="all_time", season=None, game_type=None)
 
@@ -66,6 +68,7 @@ def make_records(
     unscored_every: int = 6,
     start: date = date(2026, 8, 1),
     spread_days: int = 1,
+    seasons: int = 4,
 ) -> list[ParticipationRecord]:
     """Chronological participation rows mixing normal / C&K games, some unscored."""
     rng = random.Random(seed)  # noqa: S311 - deterministic test data
@@ -105,13 +108,52 @@ def make_records(
                     is_winner=uid == winner_id,
                     total_points=total if scored else None,
                     breakdown=raw[uid] if scored else None,
+                    season_id=1 + (game_id - 1) * seasons // games,
                 )
             )
     return records
 
 
+def make_season(season_id: int) -> Season:
+    start = date(2026, 1, 1) + timedelta(days=30 * season_id)
+    return Season(
+        season_id=season_id,
+        guild_id=1,
+        name=f"Secret Season Name {season_id}",
+        starts_on=start,
+        ends_on=start + timedelta(days=29),
+        ends_at=datetime(2026, 1, 1, 12, 0),
+        min_games=3,
+        status="completed",
+        resolved_at=None,
+        announced_at=None,
+        created_by=1,
+        created_at=datetime(2026, 1, 1, 12, 0),
+    )
+
+
+def _season_records(
+    records: list[ParticipationRecord],
+) -> dict[int, dict[int, analytics.RecordSplit]]:
+    """season_id -> user_id -> RecordSplit (independent of the domain helper)."""
+    tally: dict[int, dict[int, list[int]]] = {}
+    for r in records:
+        if r.season_id is None:
+            continue
+        wins_games = tally.setdefault(r.season_id, {}).setdefault(r.user_id, [0, 0])
+        wins_games[0] += r.is_winner
+        wins_games[1] += 1
+    return {
+        sid: {uid: analytics.RecordSplit(g, w, Fraction(w, g)) for uid, (w, g) in by_user.items()}
+        for sid, by_user in tally.items()
+    }
+
+
 def make_view(records: list[ParticipationRecord]) -> ChartInsightsView:
+    season_ids = sorted({r.season_id for r in records if r.season_id is not None})
     return ChartInsightsView(
+        seasons=[make_season(sid) for sid in season_ids],
+        season_records=_season_records(records),
         filter=ALL_FILTER,
         meta=analytics.meta_summary(records),
         players=analytics.player_summaries(records),
@@ -144,6 +186,7 @@ def test_chart_kinds_and_titles_match_contract() -> None:
         "win-rate-trend",
         "winning-scores",
         "head-to-head",
+        "season-trend",
     )
     assert set(CHART_TITLES) == set(CHART_KINDS)
     assert CHART_TITLES["winning-scores"] == "Winning scores & margins"
@@ -235,7 +278,8 @@ def test_more_than_max_players_is_capped_with_a_note(
     assert chart is not None
     assert [label for label, _ in chart.legend] == [f"P{i}" for i in range(1, MAX_PLAYERS + 1)]
     assert [uid for _, uid in chart.legend] == [p.user_id for p in crowded_view.players[:8]]
-    assert chart.note == "Showing the 8 most active of 11 players."
+    noun = "players with season games" if kind == "season-trend" else "players"
+    assert chart.note == f"Showing the 8 most active of 11 {noun}."
     assert chart.png.startswith(PNG_MAGIC)
 
 
@@ -637,3 +681,186 @@ def test_unknown_game_type_gets_a_safe_ascii_title(view: ChartInsightsView) -> N
     title = _image_title(built.figure)
     assert title.isascii() or title.count("\u00b7") == 1
     assert "\n" not in title
+
+
+# --- M5: season-trend -------------------------------------------------------
+def _season_view(*, games: int = 40, seasons: int = 4, skip: tuple[int, int] | None = None):
+    """A view over `seasons` seasons; `skip=(player_index, season_id)` drops that cell."""
+    records = make_records(games=games, players=6, seasons=seasons, unscored_every=0)
+    if skip is not None:
+        ids = sorted({r.user_id for r in records})
+        records = [r for r in records if not (r.user_id == ids[skip[0]] and r.season_id == skip[1])]
+    return make_view(records)
+
+
+def test_season_trend_axis_uses_s_labels_never_season_names() -> None:
+    view = _season_view()
+    fig = _fig(charts._build_season_trend, view)
+    assert fig is not None
+    ax = fig.axes[0]
+    assert [t.get_text() for t in ax.get_xticklabels()] == ["S1", "S2", "S3", "S4"]
+    everything = [t.get_text() for t in fig.findobj(lambda a: hasattr(a, "get_text"))]
+    assert not [text for text in everything if "Secret" in text]
+    assert ax.get_ylim() == (0, 100)
+
+
+def test_season_trend_season_legend_follows_view_order() -> None:
+    view = _season_view()
+    chart = render_chart("season-trend", view)
+    assert chart is not None
+    assert chart.season_legend == tuple(
+        (f"S{i}", season.season_id) for i, season in enumerate(view.seasons, 1)
+    )
+    assert chart.legend == tuple((f"P{i}", p.user_id) for i, p in enumerate(view.players, 1))
+    assert chart.note is None
+
+
+def test_other_kinds_have_no_season_legend(view: ChartInsightsView) -> None:
+    for kind in CHART_KINDS:
+        if kind != "season-trend":
+            chart = render_chart(kind, view)
+            assert chart is not None
+            assert chart.season_legend == ()
+
+
+def test_season_trend_draws_marked_two_pixel_lines_with_gaps() -> None:
+    view = _season_view(skip=(0, 2))
+    fig = _fig(charts._build_season_trend, view)
+    assert fig is not None
+    ax = fig.axes[0]
+    lines = ax.get_lines()
+    assert [line.get_color() for line in lines] == list(CATEGORICAL[: len(lines)])
+    for line in lines:
+        assert line.get_linewidth() == 2
+        assert line.get_marker() == "o"
+        assert line.get_markersize() >= 8
+        assert line.get_markevery() is None  # a marker on every point
+    # The player whose S2 games were dropped has a gap there, not a zero.
+    dropped = min(p.user_id for p in view.players)
+    index = [p.user_id for p in view.players].index(dropped)
+    ydata = list(lines[index].get_ydata())
+    assert ydata[1] != ydata[1]  # NaN
+    assert all(v == v for i, v in enumerate(ydata) if i != 1)
+    assert all(0 <= v <= 100 for v in ydata if v == v)
+    assert _legend_texts(fig) == [f"P{i}" for i in range(1, len(lines) + 1)]
+
+
+def test_season_trend_win_rates_match_records() -> None:
+    view = _season_view()
+    fig = _fig(charts._build_season_trend, view)
+    assert fig is not None
+    first_player = view.players[0].user_id
+    expected = [
+        float(view.season_records[season.season_id][first_player].win_rate) * 100
+        for season in view.seasons
+    ]
+    assert list(fig.axes[0].get_lines()[0].get_ydata()) == pytest.approx(expected)
+
+
+def test_season_trend_needs_two_seasons_with_games() -> None:
+    assert render_chart("season-trend", _season_view(games=12, seasons=1)) is None
+    one_played = _season_view(seasons=2)
+    only_first = replace(
+        one_played,
+        season_records={one_played.seasons[0].season_id: one_played.season_records[1]},
+    )
+    assert render_chart("season-trend", only_first) is None
+    assert render_chart("season-trend", replace(one_played, seasons=[])) is None
+
+
+def test_season_trend_legend_skips_players_with_no_season_games() -> None:
+    view = _season_view()
+    gone = view.players[0].user_id
+    trimmed = replace(
+        view,
+        season_records={
+            sid: {uid: split for uid, split in by_user.items() if uid != gone}
+            for sid, by_user in view.season_records.items()
+        },
+    )
+    chart = render_chart("season-trend", trimmed)
+    assert chart is not None
+    assert [label for label, _ in chart.legend] == ["P2", "P3", "P4", "P5", "P6"]
+
+
+def test_season_trend_caps_to_the_latest_seasons_with_a_note() -> None:
+    view = _season_view(games=60, seasons=15)
+    chart = render_chart("season-trend", view)
+    assert chart is not None
+    assert len(chart.season_legend) == charts.MAX_SEASONS
+    assert chart.season_legend[-1] == ("S12", view.seasons[-1].season_id)
+    assert chart.season_legend[0] == ("S1", view.seasons[-charts.MAX_SEASONS].season_id)
+    assert chart.note == "Showing the latest 12 of 15 seasons."
+
+
+def test_season_trend_single_season_line_is_just_a_marker() -> None:
+    view = _season_view()
+    only = view.players[0].user_id
+    sparse = replace(
+        view,
+        season_records={
+            sid: {uid: split for uid, split in by_user.items() if uid != only or sid == 1}
+            for sid, by_user in view.season_records.items()
+        },
+    )
+    chart = render_chart("season-trend", sparse)
+    assert chart is not None and chart.png.startswith(PNG_MAGIC)
+
+
+def _unseasoned_top_view(*, seasoned_top: bool = False) -> ChartInsightsView:
+    """8 busy players with only unseasoned games; 2 lower-ranked ones play two seasons."""
+    records = []
+    game_id = 0
+    for _ in range(12):  # P1..P8 play each other a lot, never in a season
+        game_id += 1
+        for uid in range(1, 9):
+            records.append(_record(game_id, "normal", uid, winner=uid == 1 + game_id % 8))
+    extra = [9, 10] + ([1, 2] if seasoned_top else [])
+    for season_id in (1, 2):
+        for round_ in range(2):
+            game_id += 1
+            for uid in extra:
+                records.append(
+                    replace(
+                        _record(game_id, "normal", uid, winner=uid == extra[round_ % len(extra)]),
+                        season_id=season_id,
+                    )
+                )
+    return make_view(records)
+
+
+def test_season_trend_uses_players_with_season_games_not_just_the_top_eight() -> None:
+    view = _unseasoned_top_view()
+    assert [p.user_id for p in view.players[:8]] == list(range(1, 9))  # busiest are unseasoned
+    chart = render_chart("season-trend", view)
+    assert chart is not None
+    assert chart.legend == (("P9", 9), ("P10", 10))
+    assert chart.note is None
+    assert [season_id for _, season_id in chart.season_legend] == [1, 2]
+    fig = _fig(charts._build_season_trend, view)
+    assert fig is not None
+    assert _legend_texts(fig) == ["P9", "P10"]
+    # P9+ have no slot of their own, so they take the first free slots in order.
+    assert [line.get_color() for line in fig.axes[0].get_lines()] == list(CATEGORICAL[:2])
+
+
+def test_season_trend_keeps_stable_slots_for_top_players_alongside_p9_plus() -> None:
+    view = _unseasoned_top_view(seasoned_top=True)
+    chart = render_chart("season-trend", view)
+    assert chart is not None
+    assert chart.legend == (("P1", 1), ("P2", 2), ("P9", 9), ("P10", 10))
+    fig = _fig(charts._build_season_trend, view)
+    assert fig is not None
+    assert [line.get_color() for line in fig.axes[0].get_lines()] == [
+        CATEGORICAL[0],  # P1
+        CATEGORICAL[1],  # P2
+        CATEGORICAL[2],  # P9 takes the first free slot
+        CATEGORICAL[3],  # P10
+    ]
+
+
+def test_other_player_charts_are_unaffected_by_unseasoned_top_players() -> None:
+    chart = render_chart("win-rate-trend", _unseasoned_top_view())
+    assert chart is not None
+    assert [label for label, _ in chart.legend] == [f"P{i}" for i in range(1, 9)]
+    assert chart.note == "Showing the 8 most active of 10 players."

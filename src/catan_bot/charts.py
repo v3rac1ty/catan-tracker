@@ -51,6 +51,7 @@ CHART_KINDS: tuple[str, ...] = (
     "win-rate-trend",
     "winning-scores",
     "head-to-head",
+    "season-trend",
 )
 CHART_TITLES: dict[str, str] = {
     "winning-formula": "How winners score",
@@ -59,8 +60,10 @@ CHART_TITLES: dict[str, str] = {
     "win-rate-trend": "Win rate over time",
     "winning-scores": "Winning scores & margins",
     "head-to-head": "Head-to-head",
+    "season-trend": "Win rate by season",
 }
 MAX_PLAYERS = 8
+MAX_SEASONS = 12  # season-trend shows at most the most recent seasons
 
 # --- design tokens (dark surface) -----------------------------------------
 SURFACE = "#1a1a19"
@@ -149,6 +152,7 @@ class RenderedChart:
     title: str
     legend: tuple[tuple[str, int], ...]  # ("P1", user_id), ... in label order
     note: str | None
+    season_legend: tuple[tuple[str, int], ...] = ()  # ("S1", season_id), ... in order
 
 
 def render_chart(kind: str, view: ChartInsightsView) -> RenderedChart | None:
@@ -163,15 +167,23 @@ def render_chart(kind: str, view: ChartInsightsView) -> RenderedChart | None:
     built = builder(view)
     if built is None:
         return None
-    note: str | None = None
-    if built.players and len(view.players) > MAX_PLAYERS:
+    notes: list[str] = []
+    pool = len(view.players) if built.pool_size is None else built.pool_size
+    if built.players and pool > MAX_PLAYERS:
         shown = len(built.players)
-        note = (
-            f"Showing the {MAX_PLAYERS} most active of {len(view.players)} players."
+        notes.append(
+            f"Showing the {MAX_PLAYERS} most active of {pool} {built.pool_noun}."
             if shown == MAX_PLAYERS
-            else f"Showing {shown} of the {MAX_PLAYERS} most active of {len(view.players)} players."
+            else f"Showing {shown} of the {MAX_PLAYERS} most active of {pool} {built.pool_noun}."
         )
-    return RenderedChart(_export_png(built.figure), CHART_TITLES[kind], built.players, note)
+    notes.extend(built.notes)
+    return RenderedChart(
+        _export_png(built.figure),
+        CHART_TITLES[kind],
+        built.players,
+        " ".join(notes) or None,
+        built.seasons,
+    )
 
 
 # --- shared helpers -------------------------------------------------------
@@ -185,6 +197,11 @@ class _Built:
 
     figure: Figure
     players: tuple[tuple[str, int], ...] = ()
+    seasons: tuple[tuple[str, int], ...] = ()
+    notes: tuple[str, ...] = ()  # chart-specific notes, e.g. a season cap
+    # Pool the plotted players were picked from, when it is not all of view.players.
+    pool_size: int | None = None
+    pool_noun: str = "players"
 
 
 def _labelled_players(view: ChartInsightsView) -> list[tuple[str, PlayerSummary]]:
@@ -682,6 +699,98 @@ def _build_head_to_head(view: ChartInsightsView) -> _Built | None:
     return _Built(fig, tuple((label, p.user_id) for label, p in players))
 
 
+# --- 7. season-trend ------------------------------------------------------
+def _assign_slots(
+    chosen: list[tuple[str, PlayerSummary]],
+) -> list[tuple[int, str, PlayerSummary]]:
+    """``(color slot, label, player)``: Pk keeps slot k; a P9+ takes a free slot."""
+    taken = {int(label[1:]) - 1 for label, _ in chosen if int(label[1:]) <= len(CATEGORICAL)}
+    free = iter(slot for slot in range(len(CATEGORICAL)) if slot not in taken)
+    return [
+        (
+            int(label[1:]) - 1 if int(label[1:]) <= len(CATEGORICAL) else next(free),
+            label,
+            player,
+        )
+        for label, player in chosen
+    ]
+
+
+def _build_season_trend(view: ChartInsightsView) -> _Built | None:
+    seasons = view.seasons[-MAX_SEASONS:]
+    records = {sid: view.season_records.get(sid, {}) for sid in (s.season_id for s in seasons)}
+    played = [sid for sid, splits in records.items() if any(r.games for r in splits.values())]
+    if len(played) < 2:
+        return None
+    # Candidates are the players with games in the shown seasons (not merely the
+    # most active overall), ranked by view order.  Labels stay stable: Pk is the
+    # player's 1-based position in view.players, so this chart may show P2, P9...
+    candidates = [
+        (f"P{position}", player)
+        for position, player in enumerate(view.players, start=1)
+        if any(
+            (split := records[sid].get(player.user_id)) is not None and split.games
+            for sid in records
+        )
+    ]
+    if not candidates:
+        return None
+    plotted = _assign_slots(candidates[:MAX_PLAYERS])
+
+    fig = _new_figure(
+        _image_title("season-trend", view),
+        "Each player's win rate within every season they played; a gap means no games",
+    )
+    ax = fig.add_subplot()
+    _style_axes(ax, grid="y")
+    xs = list(range(len(seasons)))
+    for index, label, player in plotted:
+        ys: list[float] = []
+        for sid in records:
+            split = records[sid].get(player.user_id)
+            ys.append(
+                float(split.win_rate) * 100
+                if split is not None and split.games and split.win_rate is not None
+                else float("nan")  # no games that season: the line breaks here
+            )
+        ax.plot(
+            xs,
+            ys,
+            color=CATEGORICAL[index],
+            linewidth=2,
+            marker="o",
+            markersize=9,
+            markeredgecolor=SURFACE,
+            markeredgewidth=_GAP,
+            clip_on=False,
+            label=label,
+        )
+    ax.set_xticks(xs, labels=[f"S{i}" for i in range(1, len(seasons) + 1)])
+    ax.set_xlim(-0.4, len(seasons) - 0.6)
+    ax.set_ylim(0, 100)
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=5, steps=[1, 2, 5, 10]))
+    ax.yaxis.set_major_formatter(PercentFormatter(100))
+    ax.set_xlabel("Season (oldest to newest)")
+    ax.set_ylabel("Win rate in the season")
+    _legend(
+        fig,
+        [Line2D([], [], color=CATEGORICAL[i], linewidth=2, label=label) for i, label, _ in plotted],
+    )
+    notes = (
+        (f"Showing the latest {MAX_SEASONS} of {len(view.seasons)} seasons.",)
+        if len(view.seasons) > MAX_SEASONS
+        else ()
+    )
+    return _Built(
+        fig,
+        tuple((label, p.user_id) for _, label, p in plotted),
+        tuple((f"S{i}", season.season_id) for i, season in enumerate(seasons, start=1)),
+        notes,
+        pool_size=len(candidates),
+        pool_noun="players with season games",
+    )
+
+
 _BUILDERS: dict[str, Callable[[ChartInsightsView], _Built | None]] = {
     "winning-formula": _build_winning_formula,
     "points-by-source": _build_points_by_source,
@@ -689,4 +798,5 @@ _BUILDERS: dict[str, Callable[[ChartInsightsView], _Built | None]] = {
     "win-rate-trend": _build_win_rate_trend,
     "winning-scores": _build_winning_scores,
     "head-to-head": _build_head_to_head,
+    "season-trend": _build_season_trend,
 }

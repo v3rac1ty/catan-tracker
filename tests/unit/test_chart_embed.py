@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 
 from catan_bot.charts import RenderedChart
+from catan_bot.db.models import Season
 from catan_bot.formatting import (
     EMBED_DESCRIPTION_MAX,
     EMBED_TITLE_MAX,
@@ -147,3 +149,120 @@ def test_unavailable_embed_respects_title_and_description_limits() -> None:
     assert len(embed.title or "") == EMBED_TITLE_MAX
     assert len(embed.description or "") <= EMBED_DESCRIPTION_MAX
     assert len(embed) <= EMBED_TOTAL_MAX
+
+
+# ---------------------------------------------------------------------------
+# M5: season legend
+# ---------------------------------------------------------------------------
+
+
+def _season_row(season_id: int, name: str) -> Season:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    return Season(
+        season_id=season_id,
+        guild_id=1,
+        name=name,
+        starts_on=date(2026, 1, 1) + timedelta(days=season_id),
+        ends_on=date(2026, 12, 31),
+        ends_at=now,
+        min_games=2,
+        status="completed",
+        resolved_at=None,
+        announced_at=None,
+        created_by=10,
+        created_at=now,
+    )
+
+
+def _trend_chart(season_legend: tuple[tuple[str, int], ...], note: str | None = None):
+    return RenderedChart(
+        png=b"png",
+        title="Win rate by season",
+        legend=(("P1", 123),),
+        note=note,
+        season_legend=season_legend,
+    )
+
+
+def test_season_legend_lists_escaped_season_names_after_players() -> None:
+    view = _view()
+    view.seasons = [_season_row(4, "Winter"), _season_row(9, "**Spring** @everyone")]
+    chart = _trend_chart((("S1", 4), ("S2", 9)), note="Showing the 1 most active of 1 players.")
+
+    description = build_chart_embed(view, chart, "c.png").description or ""
+    lines = description.splitlines()
+
+    assert lines[:3] == ["All-time", "P1 — <@123>", "S1 — Winter"]
+    assert lines[3].startswith(r"S2 — \*\*Spring\*\* @")
+    assert "@everyone" not in description
+    assert lines[-1] == "Showing the 1 most active of 1 players."
+
+
+def test_season_legend_absent_adds_nothing() -> None:
+    view = _view()  # no `seasons` attribute is even consulted
+    chart = RenderedChart(b"png", "How winners score", (("P1", 1),), None)
+
+    assert build_chart_embed(view, chart, "c.png").description == "All-time\nP1 — <@1>"
+
+
+def test_season_legend_unknown_season_id_falls_back_to_a_neutral_label() -> None:
+    view = _view()
+    view.seasons = []
+    description = build_chart_embed(view, _trend_chart((("S1", 42),)), "c.png").description or ""
+
+    assert "S1 — Season #42" in description
+    assert "None" not in description
+
+
+def test_season_legend_hostile_names_never_ping_or_mention() -> None:
+    hostile = "@everyone @here <@&123456789012345678> <#123456789012345678> " + "x" * 300
+    view = _view()
+    view.seasons = [_season_row(1, hostile)]
+
+    description = build_chart_embed(view, _trend_chart((("S1", 1),)), "c.png").description or ""
+
+    assert "@everyone" not in description
+    assert "@here" not in description
+    assert "<@&" not in description
+    assert "<#1" not in description
+    assert len(description.splitlines()[2]) <= len("S1 — ") + 100 + 20  # name is capped
+
+
+def test_season_legend_with_many_seasons_stays_within_limits_and_says_what_was_dropped() -> None:
+    names = ["N" * 100 for _ in range(100)]
+    view = _view()
+    view.seasons = [_season_row(index, name) for index, name in enumerate(names, start=1)]
+    legend = tuple((f"S{index}", index) for index in range(1, 101))
+    note = "Showing the 8 most active of 20 players."
+
+    embed = build_chart_embed(view, _trend_chart(legend, note=note), "c.png")
+    description = embed.description or ""
+    lines = description.splitlines()
+
+    assert len(description) <= EMBED_DESCRIPTION_MAX
+    assert len(embed) <= EMBED_TOTAL_MAX
+    assert lines[-1] == note  # the note survives
+    assert lines[-2].startswith("\u2026and ") and lines[-2].endswith(" more seasons")
+    shown = sum(1 for line in lines if line.startswith("S") and " — N" in line)
+    dropped = int(lines[-2].split()[1])
+    assert shown + dropped == 100
+    assert "None" not in description
+
+
+def test_season_legend_that_fits_has_no_dropped_marker() -> None:
+    view = _view()
+    view.seasons = [_season_row(index, f"Season {index}") for index in range(1, 6)]
+    legend = tuple((f"S{index}", index) for index in range(1, 6))
+
+    description = build_chart_embed(view, _trend_chart(legend), "c.png").description or ""
+
+    assert "more season" not in description
+    assert description.splitlines()[-1] == "S5 — Season 5"
+
+
+def test_season_legend_is_skipped_when_there_is_no_active_season() -> None:
+    view = _view("season", None)
+    embed = build_chart_embed(view, _trend_chart((("S1", 1),)), "c.png")
+
+    assert embed.description == "There's no active season."
+    assert embed.image.url is None

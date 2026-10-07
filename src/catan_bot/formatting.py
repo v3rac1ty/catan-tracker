@@ -810,6 +810,12 @@ _PLAY_STYLE_LABELS = {
     "settlement_heavy": "Settlement-heavy",
     "balanced": "Balanced",
 }
+_TIME_OF_DAY_LABELS = {
+    "daytime": "Daytime",
+    "evening": "Evening",
+    "late_night": "Late night",
+}
+_MIN_WEEKDAY_GAMES = 2
 _COMBO_LABELS = {
     "road_and_army": "Road + Army",
     "road_only": "Road only",
@@ -933,11 +939,59 @@ def build_chart_embed(
 
     lines = _insights_description_lines(view.filter)
     lines.extend(f"{label} — {mention(user_id)}" for label, user_id in chart.legend)
-    if chart.note:
-        lines.append(escape_user_text(chart.note))
+    note = [escape_user_text(chart.note)] if chart.note else []
+    season_lines = _season_legend_lines(view, chart)
+    limit = min(EMBED_DESCRIPTION_MAX, max(EMBED_TOTAL_MAX - len(embed), 0))
+    lines.extend(_fit_lines(season_lines, lines, note, limit, "season"))
+    lines.extend(note)
     _set_description(embed, "\n".join(lines))
     embed.set_image(url=f"attachment://{filename}")
     return embed
+
+
+def _season_legend_lines(view: ChartInsightsView, chart: RenderedChart) -> list[str]:
+    """`S1 — <season name>` lines; names are stored text, so always escaped."""
+    if not chart.season_legend:
+        return []
+    names = {season.season_id: season.name for season in view.seasons}
+    lines = []
+    for label, season_id in chart.season_legend:
+        name = names.get(season_id)
+        shown = (
+            escape_user_text(truncate(name, _SEASON_NAME_DISPLAY_MAX))
+            if name is not None
+            else f"Season #{season_id}"
+        )
+        lines.append(f"{label} — {shown}")
+    return lines
+
+
+def _fit_lines(
+    candidates: Sequence[str],
+    before: Sequence[str],
+    after: Sequence[str],
+    limit: int,
+    noun: str,
+) -> list[str]:
+    """Keep as many whole candidate lines as fit between `before` and `after`.
+
+    When some are dropped, one "...and N more" line replaces them so nothing
+    disappears silently and no line is cut mid-name.
+    """
+
+    def total(extra: Sequence[str]) -> int:
+        return len("\n".join([*before, *extra, *after]))
+
+    kept = list(candidates)
+    while kept and total(kept) > limit:
+        kept.pop()
+    dropped = len(candidates) - len(kept)
+    while dropped and kept and total([*kept, f"…and {dropped} more {noun}s"]) > limit:
+        kept.pop()
+        dropped += 1
+    if dropped:
+        kept.append(f"…and {dropped} more {noun}s")
+    return kept
 
 
 def build_chart_unavailable_embed(view: ChartInsightsView, kind_title: str) -> discord.Embed:
@@ -1073,6 +1127,43 @@ def _player_margin_lines(summary: PlayerSummary) -> list[str]:
     return lines
 
 
+def _weekday_extreme_lines(summary: PlayerSummary) -> list[str]:
+    """Best and worst weekday by win rate, among days with enough games to compare."""
+    eligible = [
+        (day, split)
+        for day, split in summary.by_weekday.items()
+        if 0 <= day < len(_WEEKDAY_NAMES)
+        and split.games >= _MIN_WEEKDAY_GAMES
+        and split.win_rate is not None
+    ]
+    if len(eligible) < 2:
+        return []
+
+    def rate(item: tuple[int, RecordSplit]) -> Fraction:
+        return item[1].win_rate or Fraction(0)
+
+    # Ties go to the day with more games, then the earlier weekday.
+    best = min(eligible, key=lambda item: (-rate(item), -item[1].games, item[0]))
+    worst = min(eligible, key=lambda item: (rate(item), -item[1].games, item[0]))
+    if rate(best) == rate(worst):
+        return []
+    return [
+        f"Best day: {_WEEKDAY_NAMES[best[0]]} {_split_text(best[1])}",
+        f"Worst day: {_WEEKDAY_NAMES[worst[0]]} {_split_text(worst[1])}",
+        f"(weekdays with {_MIN_WEEKDAY_GAMES}+ games)",
+    ]
+
+
+def _player_when_you_win_lines(summary: PlayerSummary) -> list[str]:
+    lines = [
+        f"{_TIME_OF_DAY_LABELS.get(bucket, escape_user_text(bucket))}: {_split_text(split)}"
+        for bucket, split in summary.by_time_of_day.items()
+    ]
+    if lines:
+        lines.append(f"({_plural(summary.timed_games, 'game')} with a recorded time)")
+    return lines + _weekday_extreme_lines(summary)
+
+
 def build_player_insights_embed(view: PlayerInsightsView) -> discord.Embed:
     """One player's record, points, board, awards, margins and splits."""
     summary = view.summary
@@ -1096,6 +1187,9 @@ def build_player_insights_embed(view: PlayerInsightsView) -> discord.Embed:
     margins = _player_margin_lines(summary)
     if margins:
         _add_field(embed, "Margins", "\n".join(margins), inline=False)
+    when_you_win = _player_when_you_win_lines(summary)
+    if when_you_win:
+        _add_field(embed, "When you win", "\n".join(when_you_win), inline=False)
     if summary.by_player_count:
         counts = [
             f"{count} players: {_split_text(split)}"
@@ -1247,6 +1341,17 @@ def _meta_calendar_lines(view: MetaInsightsView) -> list[str]:
     return [f"Busiest day: {_WEEKDAY_NAMES[day]} ({_plural(top, 'game')} of {view.meta.games})"]
 
 
+def _meta_time_of_day_lines(view: MetaInsightsView) -> list[str]:
+    counts = {
+        bucket: view.meta.games_by_time_of_day.get(bucket, 0) for bucket in _TIME_OF_DAY_LABELS
+    }
+    total = sum(counts.values())
+    if not total:
+        return []
+    parts = " • ".join(f"{label} {counts[bucket]}" for bucket, label in _TIME_OF_DAY_LABELS.items())
+    return [f"Time of day: {parts} ({_plural(total, 'game')} with a recorded time)"]
+
+
 def _has_any_score_data(meta: MetaSummary) -> bool:
     return any(meta.winner_composition_samples.values()) or any(
         meta.loser_composition_samples.values()
@@ -1276,7 +1381,7 @@ def build_meta_insights_embed(view: MetaInsightsView) -> discord.Embed:
         ("VP cards", _meta_vp_card_lines(view)),
         ("Winning scores & margins", _meta_score_lines(view)),
         ("Most frequent holders", _meta_holder_lines(view)),
-        ("Calendar", _meta_calendar_lines(view)),
+        ("Calendar", _meta_calendar_lines(view) + _meta_time_of_day_lines(view)),
     )
     for name, lines in sections:
         if lines:
@@ -1312,6 +1417,50 @@ def _chunk_lines(lines: Sequence[str], limit: int) -> list[list[str]]:
     return chunks
 
 
+def _rivalry_lines(view: HeadToHeadView) -> list[str]:
+    """Nemesis / best matchup / closest rival, phrased neutrally for any subject."""
+    highlights = view.highlights
+    if highlights is None:
+        return []
+    records = {opponent.opponent_id: opponent for opponent in view.opponents}
+    lines: list[str] = []
+
+    nemesis = records.get(highlights.nemesis) if highlights.nemesis is not None else None
+    if highlights.nemesis is not None:
+        who = mention(highlights.nemesis)
+        if nemesis is None:
+            lines.append(f"Nemesis: {who}")
+        else:
+            lines.append(
+                f"Nemesis: {who} won {nemesis.opponent_wins} of "
+                f"{nemesis.games_together} shared games"
+            )
+    best_id = highlights.best_matchup
+    best = records.get(best_id) if best_id is not None else None
+    if best_id is not None:
+        who = mention(best_id)
+        if best is None:
+            lines.append(f"Best matchup: {who}")
+        else:
+            lines.append(
+                f"Best matchup: {who} — won {best.wins} of {best.games_together} shared games"
+            )
+    rival_id = highlights.closest_rival
+    rival = records.get(rival_id) if rival_id is not None else None
+    if rival_id is not None:
+        who = mention(rival_id)
+        if rival is None:
+            lines.append(f"Closest rival: {who}")
+        else:
+            lines.append(
+                f"Closest rival: {who} — won {rival.wins}, they won {rival.opponent_wins} "
+                f"({rival.games_together} shared games)"
+            )
+    if lines:
+        lines.append(f"(min {_plural(highlights.min_games, 'shared game')})")
+    return lines
+
+
 def build_head_to_head_embed(view: HeadToHeadView) -> discord.Embed:
     """The subject's record against each opponent, in the view's own order."""
     embed, show = _insights_embed(
@@ -1319,6 +1468,10 @@ def build_head_to_head_embed(view: HeadToHeadView) -> discord.Embed:
     )
     if not show:
         return embed
+
+    rivalries = _rivalry_lines(view)
+    if rivalries:
+        _add_field(embed, "Rivalries", "\n".join(rivalries), inline=False)
 
     lines = [_opponent_line(opponent) for opponent in view.opponents]
     shown = 0

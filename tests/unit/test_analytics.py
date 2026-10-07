@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from fractions import Fraction
 from time import perf_counter
+from zoneinfo import ZoneInfo
 
 from catan_bot.domain.analytics import (
     GAME_TYPE_ORDER,
+    TIME_OF_DAY_BUCKETS,
     AwardStat,
     HeadToHead,
+    MatchupHighlights,
     RecordSplit,
     games_by_type,
     head_to_head,
+    matchup_highlights,
     meta_summary,
     most_played_game_type,
     player_summaries,
     player_summary,
+    win_rate_by_season,
     win_rate_timeline,
 )
 from catan_bot.domain.participation import ParticipationRecord
@@ -33,13 +38,28 @@ def row(
     breakdown: dict[str, int] | None = None,
     players: int = 2,
     target: int | None = 10,
+    played_at: datetime | None = None,
+    played_timezone: str | None = None,
+    season_id: int | None = None,
 ) -> ParticipationRecord:
     if points is None:
         breakdown = None
     elif breakdown is None:
         breakdown = {"settlements": points}
     return ParticipationRecord(
-        game_id, day, None, game_type, False, target, players, user_id, winner, points, breakdown
+        game_id,
+        day,
+        played_at,
+        game_type,
+        False,
+        target,
+        players,
+        user_id,
+        winner,
+        points,
+        breakdown,
+        season_id,
+        played_timezone,
     )
 
 
@@ -667,3 +687,118 @@ def test_most_played_game_type_puts_unknown_types_after_known_then_by_name() -> 
 def test_most_played_game_type_is_none_without_games() -> None:
     assert most_played_game_type({}) is None
     assert most_played_game_type({"normal": 0}) is None
+
+
+def test_time_of_day_boundaries_use_recorded_local_timezone_on_dst_date() -> None:
+    zone = ZoneInfo("America/Chicago")
+    values = [(4, 59), (5, 0), (16, 59), (17, 0), (20, 59), (21, 0)]
+    records = [
+        row(
+            index,
+            date(2025, 3, 9),
+            1,
+            winner=index in (2, 4, 6),
+            played_at=datetime(2025, 3, 9, hour, minute, tzinfo=zone),
+            played_timezone="America/Chicago",
+        )
+        for index, (hour, minute) in enumerate(values, 1)
+    ]
+
+    summary = player_summary(records, 1)
+    assert TIME_OF_DAY_BUCKETS == ("daytime", "evening", "late_night")
+    assert list(summary.by_time_of_day) == list(TIME_OF_DAY_BUCKETS)
+    assert summary.by_time_of_day == {
+        "daytime": RecordSplit(2, 1, Fraction(1, 2)),
+        "evening": RecordSplit(2, 1, Fraction(1, 2)),
+        "late_night": RecordSplit(2, 1, Fraction(1, 2)),
+    }
+    assert summary.timed_games == 6
+    assert meta_summary(records).games_by_time_of_day == {
+        "daytime": 2,
+        "evening": 2,
+        "late_night": 2,
+    }
+
+
+def test_time_of_day_skips_missing_and_invalid_metadata_and_weekday_splits() -> None:
+    records = [
+        row(
+            1,
+            date(2025, 3, 10),
+            1,
+            winner=True,
+            played_at=datetime(2025, 3, 10, 18, tzinfo=ZoneInfo("UTC")),
+            played_timezone="not/a_timezone",
+        ),
+        row(2, date(2025, 3, 11), 1, played_at=datetime(2025, 3, 11, 18, tzinfo=ZoneInfo("UTC"))),
+        row(3, date(2025, 3, 12), 1),
+        row(
+            4,
+            date(2025, 3, 10),
+            1,
+            played_at=datetime(2025, 3, 10, 12, tzinfo=ZoneInfo("UTC")),
+            played_timezone="UTC",
+        ),
+    ]
+
+    summary = player_summary(records, 1)
+    assert summary.by_time_of_day == {"daytime": RecordSplit(1, 0, 0)}
+    assert summary.timed_games == 1
+    assert summary.by_weekday == {
+        0: RecordSplit(2, 1, Fraction(1, 2)),
+        1: RecordSplit(1, 0, 0),
+        2: RecordSplit(1, 0, 0),
+    }
+
+
+def test_time_of_day_skips_naive_timestamp_but_buckets_aware_timestamp() -> None:
+    records = [
+        row(
+            1,
+            date(2026, 1, 1),
+            1,
+            winner=True,
+            played_at=datetime(2026, 1, 1, 17),
+            played_timezone="UTC",
+        ),
+        row(
+            2,
+            date(2026, 1, 1),
+            1,
+            played_at=datetime(2026, 1, 1, 17, tzinfo=ZoneInfo("UTC")),
+            played_timezone="UTC",
+        ),
+    ]
+
+    summary = player_summary(records, 1)
+    assert summary.by_time_of_day == {"evening": RecordSplit(1, 0, 0)}
+    assert summary.timed_games == 1
+    assert meta_summary(records).games_by_time_of_day == {"evening": 1}
+
+
+def test_matchup_highlights_threshold_ties_and_empty_cases() -> None:
+    pairs = [
+        HeadToHead(1, 9, 2, 0, 2),  # under threshold
+        HeadToHead(1, 8, 4, 1, 2),
+        HeadToHead(1, 7, 6, 2, 3),  # same rates as opponent 8, more games
+        HeadToHead(1, 6, 6, 3, 2),
+        HeadToHead(1, 5, 6, 2, 2),
+    ]
+    assert matchup_highlights(pairs, 1) == MatchupHighlights(7, 6, 5, 3)
+    assert matchup_highlights(pairs, 100) == MatchupHighlights(None, None, None, 3)
+    assert matchup_highlights([], 1, min_games=5) == MatchupHighlights(None, None, None, 5)
+
+
+def test_win_rate_by_season_splits_and_skips_missing_season() -> None:
+    records = [
+        row(1, date(2025, 1, 1), 1, winner=True, season_id=3),
+        row(1, date(2025, 1, 1), 2, season_id=3),
+        row(2, date(2025, 1, 2), 1, season_id=3),
+        row(2, date(2025, 1, 2), 2, winner=True, season_id=3),
+        row(3, date(2025, 1, 3), 1, winner=True, season_id=8),
+        row(4, date(2025, 1, 4), 1, winner=True),
+    ]
+    assert win_rate_by_season(records) == {
+        3: {1: RecordSplit(2, 1, Fraction(1, 2)), 2: RecordSplit(2, 1, Fraction(1, 2))},
+        8: {1: RecordSplit(1, 1, 1)},
+    }

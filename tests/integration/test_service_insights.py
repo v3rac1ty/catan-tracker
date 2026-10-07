@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, date, datetime
+from fractions import Fraction
 
 import asyncpg
 import pytest
@@ -26,6 +27,8 @@ import pytest
 from catan_bot.db.repositories import analytics as analytics_repo
 from catan_bot.db.repositories import games, players, seasons
 from catan_bot.domain import analytics as domain_analytics
+from catan_bot.domain.analytics import MatchupHighlights, RecordSplit
+from catan_bot.domain.participation import ParticipationRecord
 from catan_bot.services import insights_service
 from catan_bot.services.results import (
     ChartInsightsView,
@@ -604,6 +607,211 @@ async def test_chart_view_is_guild_isolated(
     assert view.meta.games == 1
     assert view.filter.available_game_types == {"normal": 1}
     assert [(h.player_a, h.player_b) for h in view.head_to_head] == [(1, 2)]
+
+
+# --- rivalries ------------------------------------------------------------
+
+
+async def _normal_records(pool: asyncpg.Pool, guild_id: int) -> list[ParticipationRecord]:
+    async with pool.acquire() as conn:
+        return await analytics_repo.list_participations(conn, guild_id, game_type="normal")
+
+
+async def test_head_to_head_highlights_use_the_three_game_minimum(
+    pool: asyncpg.Pool, guild_id: int, seeded: int
+) -> None:
+    one = await insights_service.head_to_head_insights(pool, guild_id, 1)
+    three = await insights_service.head_to_head_insights(pool, guild_id, 3)
+
+    # Normal view: 1 vs 2 is 3 shared games (1 won 2, 2 won 1); 1 vs 3 is only 1 game.
+    assert one.highlights == MatchupHighlights(
+        nemesis=2, best_matchup=2, closest_rival=2, min_games=3
+    )
+    # Nobody has 3 shared games with player 3, so every highlight is None.
+    assert three.highlights == MatchupHighlights(None, None, None, 3)
+    pairs = domain_analytics.head_to_head(await _normal_records(pool, guild_id))
+    assert one.highlights == domain_analytics.matchup_highlights(pairs, 1)
+
+
+async def test_head_to_head_highlights_for_a_member_without_games(
+    pool: asyncpg.Pool, guild_id: int, seeded: int
+) -> None:
+    view = await insights_service.head_to_head_insights(pool, guild_id, 99)
+
+    assert view.highlights == MatchupHighlights(None, None, None, 3)
+
+
+async def test_head_to_head_highlights_follow_the_single_game_type_rule(
+    pool: asyncpg.Pool, app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    # Three normal games that 1 wins vs 2, plus three seafarers games that 2 wins: the
+    # default (normal, on the tie) must not see the seafarers games, and vice versa.
+    for day in (1, 2, 3):
+        await _play(app_conn, guild_id, played_on=date(2026, 3, day), winner=1, losers=[2])
+    for day in (4, 5, 6):
+        await _play(
+            app_conn,
+            guild_id,
+            played_on=date(2026, 3, day),
+            winner=2,
+            losers=[1],
+            game_type="seafarers",
+        )
+
+    normal = await insights_service.head_to_head_insights(pool, guild_id, 1)
+    seafarers = await insights_service.head_to_head_insights(
+        pool, guild_id, 1, game_type="seafarers"
+    )
+
+    assert normal.filter.game_type == "normal"
+    assert normal.highlights == MatchupHighlights(
+        nemesis=None, best_matchup=2, closest_rival=2, min_games=3
+    )
+    assert normal.opponents == [OpponentRecord(2, 3, 3, 0)]
+    assert seafarers.highlights == MatchupHighlights(
+        nemesis=2, best_matchup=None, closest_rival=2, min_games=3
+    )
+    assert seafarers.opponents == [OpponentRecord(2, 3, 0, 3)]
+
+
+async def test_head_to_head_highlights_are_empty_without_an_active_season(
+    pool: asyncpg.Pool, guild_id: int, games_without_season: None
+) -> None:
+    view = await insights_service.head_to_head_insights(pool, guild_id, 1, scope="season")
+
+    assert view.opponents == []
+    assert view.highlights == MatchupHighlights(None, None, None, 3)
+
+
+# --- seasons in the chart view --------------------------------------------
+
+
+async def test_chart_view_lists_the_seasons_that_have_games_and_their_records(
+    pool: asyncpg.Pool, guild_id: int, seeded: int
+) -> None:
+    view = await insights_service.chart_insights(pool, guild_id)
+
+    # Normal view: only S1 is in a season (P1/P2 have no season).
+    assert [season.season_id for season in view.seasons] == [seeded]
+    assert view.seasons[0].name == "Spring <b>"
+    assert view.season_records == {
+        seeded: {
+            1: RecordSplit(1, 0, Fraction(0)),
+            2: RecordSplit(1, 1, Fraction(1)),
+        }
+    }
+    records = await _normal_records(pool, guild_id)
+    assert view.season_records == domain_analytics.win_rate_by_season(records)
+
+
+async def test_chart_view_seasons_are_chronological_by_start_not_id(
+    pool: asyncpg.Pool, app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    async def season(name: str, starts_on: date) -> int:
+        created = await seasons.create_season(
+            app_conn,
+            guild_id,
+            name,
+            starts_on,
+            date(2026, 12, 31),
+            datetime(2027, 1, 1, tzinfo=UTC),
+            1,
+            1,
+        )
+        assert await seasons.cancel_active_season(app_conn, guild_id) is not None
+        return created.season_id
+
+    later = await season("Later", date(2026, 6, 1))  # created first: lower id
+    earlier = await season("Earlier", date(2026, 1, 1))
+    seafarers_only = await season("Only seafarers", date(2026, 3, 1))
+    assert later < earlier
+    await _play(
+        app_conn, guild_id, played_on=date(2026, 7, 1), winner=1, losers=[2], season_id=later
+    )
+    await _play(
+        app_conn, guild_id, played_on=date(2026, 2, 1), winner=2, losers=[1], season_id=earlier
+    )
+    await _play(
+        app_conn,
+        guild_id,
+        played_on=date(2026, 3, 5),
+        winner=1,
+        losers=[2],
+        season_id=seafarers_only,
+        game_type="seafarers",
+    )
+
+    view = await insights_service.chart_insights(pool, guild_id)
+    seafarers = await insights_service.chart_insights(pool, guild_id, game_type="seafarers")
+
+    # The normal view skips the seafarers-only season and orders the rest by start date.
+    assert view.filter.game_type == "normal"
+    assert [item.name for item in view.seasons] == ["Earlier", "Later"]
+    assert set(view.season_records) == {earlier, later}
+    assert [item.name for item in seafarers.seasons] == ["Only seafarers"]
+    assert set(seafarers.season_records) == {seafarers_only}
+
+
+async def test_chart_view_keeps_a_season_older_than_a_hundred_newer_ones(
+    pool: asyncpg.Pool, app_conn: asyncpg.Connection, guild_id: int
+) -> None:
+    async def new_season(name: str, starts_on: date) -> int:
+        created = await seasons.create_season(
+            app_conn,
+            guild_id,
+            name,
+            starts_on,
+            date(2026, 12, 31),
+            datetime(2027, 1, 1, tzinfo=UTC),
+            1,
+            1,
+        )
+        assert await seasons.cancel_active_season(app_conn, guild_id) is not None
+        return created.season_id
+
+    oldest = await new_season("Oldest", date(2025, 1, 1))
+    for index in range(105):  # newer, gameless seasons: more than any list_seasons page
+        await new_season(f"Empty {index}", date(2026, 1, 1))
+    newest = await new_season("Newest", date(2026, 2, 1))
+    await _play(
+        app_conn, guild_id, played_on=date(2025, 2, 1), winner=1, losers=[2], season_id=oldest
+    )
+    await _play(
+        app_conn, guild_id, played_on=date(2026, 3, 1), winner=2, losers=[1], season_id=newest
+    )
+
+    view = await insights_service.chart_insights(pool, guild_id)
+
+    assert [item.name for item in view.seasons] == ["Oldest", "Newest"]
+    assert set(view.season_records) == {oldest, newest}
+
+
+async def test_chart_view_season_scope_only_lists_the_active_season(
+    pool: asyncpg.Pool, guild_id: int, seeded: int
+) -> None:
+    view = await insights_service.chart_insights(pool, guild_id, scope="season")
+
+    assert [item.season_id for item in view.seasons] == [seeded]
+    assert set(view.season_records) == {seeded}
+
+
+async def test_chart_view_without_seasons_has_no_season_data(
+    pool: asyncpg.Pool, guild_id: int, games_without_season: None
+) -> None:
+    view = await insights_service.chart_insights(pool, guild_id)
+
+    assert view.meta.games == 2
+    assert view.seasons == []
+    assert view.season_records == {}
+
+
+async def test_chart_view_without_active_season_scope_has_no_season_data(
+    pool: asyncpg.Pool, guild_id: int, games_without_season: None
+) -> None:
+    view = await insights_service.chart_insights(pool, guild_id, scope="season")
+
+    assert view.seasons == []
+    assert view.season_records == {}
 
 
 # --- isolation and validation ---------------------------------------------
