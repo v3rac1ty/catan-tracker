@@ -6,7 +6,7 @@
 #   bash scripts/deploy.sh --rollback [REV]
 #   bash scripts/deploy.sh --help
 #
-# Run it inside tmux or screen: a lost SSH session kills it mid-deploy.
+# Run it inside screen: a lost SSH session kills it mid-deploy.
 # See docs/DEPLOYMENT.md section 7 for what each step does and how to recover.
 set -Eeuo pipefail
 
@@ -59,7 +59,7 @@ fast-forward, rebuild, apply migrations, sync slash commands once, and wait for
 the bot to connect and stay up. Any failure (or Ctrl-C / SIGTERM) after the
 update rolls the code back automatically to the revision that was running. The
 database is never restored automatically and the db container is never
-recreated. Run it inside tmux or screen.
+recreated. Run it inside screen.
 
 Options:
   --no-sync         do not sync slash commands this run

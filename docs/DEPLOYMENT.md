@@ -263,13 +263,16 @@ sensitive.
 ### Recommended: `scripts/deploy.sh`
 
 Run the whole update with one command, as the normal user, from any directory.
-Run it inside `tmux` or `screen` so a dropped SSH session cannot kill it
-mid-deploy:
+Run it inside GNU `screen` so a dropped SSH session cannot kill it mid-deploy
+(install it with `sudo apt install screen` if it is missing):
 
 ```bash
-tmux new -A -s deploy
+screen -S deploy
 bash /opt/catan-tracker/scripts/deploy.sh
 ```
+
+If the connection drops, log back in and reattach with `screen -r deploy`. To
+leave a deploy running on purpose, detach with Ctrl-a then d.
 
 The script, in order:
 
@@ -339,7 +342,7 @@ final checkout and container state, and exit 1. This covers:
 - an unexpected command failure inside the script after the fast-forward.
 
 It does not cover `kill -9` (SIGKILL), power loss or a VM crash, or a lost SSH
-session when the script is not running under `tmux` or `screen` (the hangup
+session when the script is not running under `screen` (the hangup
 kills it). After any of those, check `git status`, `sudo docker compose ps
 --all` and the bot logs, then rerun `bash scripts/deploy.sh --rollback` or the
 manual steps below. A failure before the fast-forward (dirty tree, CI gate,
