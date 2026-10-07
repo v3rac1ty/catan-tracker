@@ -882,7 +882,42 @@ def _insights_filter_line(insights_filter: InsightsFilter) -> str:
         line = "All-time"
     if insights_filter.game_type is not None:
         line += f" • Game type: {_game_type_label(insights_filter.game_type)}"
+    if insights_filter.game_type is not None and insights_filter.game_type_defaulted:
+        line += " (most played)"
     return line
+
+
+_GAME_TYPE_ORDER = ("normal", "seafarers", "cities_knights", "seafarers_cities_knights")
+
+
+def _also_played_line(insights_filter: InsightsFilter) -> str | None:
+    """Describe other played types in stable count/catalog order."""
+    shown_type = insights_filter.game_type
+    catalog_order = {game_type: index for index, game_type in enumerate(_GAME_TYPE_ORDER)}
+    other_types = [
+        (game_type, count)
+        for game_type, count in insights_filter.available_game_types.items()
+        if count > 0 and game_type != shown_type
+    ]
+    other_types.sort(
+        key=lambda item: (-item[1], catalog_order.get(item[0], len(_GAME_TYPE_ORDER)), item[0])
+    )
+    if not other_types:
+        return None
+    labels = " · ".join(
+        f"{_game_type_label(game_type)} ({_plural(count, 'game')})"
+        for game_type, count in other_types
+    )
+    return f"Also played: {labels}. Pick game_type to see them."
+
+
+def _insights_description_lines(insights_filter: InsightsFilter) -> list[str]:
+    """Common description prefix for insight embeds, including alternate types."""
+    lines = [_insights_filter_line(insights_filter)]
+    also_played = _also_played_line(insights_filter)
+    if also_played is not None:
+        lines.append(also_played)
+    return lines
 
 
 def build_chart_embed(
@@ -896,7 +931,7 @@ def build_chart_embed(
         _set_description(embed, _NO_SEASON_TEXT)
         return embed
 
-    lines = [_insights_filter_line(view.filter)]
+    lines = _insights_description_lines(view.filter)
     lines.extend(f"{label} — {mention(user_id)}" for label, user_id in chart.legend)
     if chart.note:
         lines.append(escape_user_text(chart.note))
@@ -913,10 +948,12 @@ def build_chart_unavailable_embed(view: ChartInsightsView, kind_title: str) -> d
     if view.filter.scope == "season" and view.filter.season is None:
         _set_description(embed, _NO_SEASON_TEXT)
     else:
-        _set_description(
-            embed,
-            f"{_insights_filter_line(view.filter)}\nNot enough recorded data for this chart yet.",
-        )
+        lines = _insights_description_lines(view.filter)
+        if view.meta.games == 0:
+            lines.append(_NO_GAMES_TEXT)
+        else:
+            lines.append("Not enough recorded data for this chart yet.")
+        _set_description(embed, "\n".join(lines))
     return embed
 
 
@@ -940,7 +977,7 @@ def _insights_embed(
     lines = []
     if subject_id is not None:
         lines.append(mention(subject_id))
-    lines.append(_insights_filter_line(insights_filter))
+    lines.extend(_insights_description_lines(insights_filter))
     if not has_games:
         lines.append(_NO_GAMES_TEXT)
     _set_description(embed, "\n".join(lines))
@@ -1065,12 +1102,6 @@ def build_player_insights_embed(view: PlayerInsightsView) -> discord.Embed:
             for count, split in sorted(summary.by_player_count.items())
         ]
         _add_field(embed, "By player count", "\n".join(counts), inline=True)
-    if summary.by_game_type:
-        types = [
-            f"{_game_type_label(game_type)}: {_split_text(split)}"
-            for game_type, split in sorted(summary.by_game_type.items())
-        ]
-        _add_field(embed, "By game type", "\n".join(types), inline=True)
     return embed
 
 

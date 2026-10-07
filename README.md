@@ -57,9 +57,11 @@ one player's record with each opponent. `/insights chart` offers six charts:
 How winners score, Points by source, Award impact, Win rate over time, Winning
 scores & margins, and Head-to-head. Charts use P1–P8 labels with a legend mapping
 each label to its Discord member. The scope defaults to all-time and can be
-set to the active season; the optional `game_type` filter narrows results to one
-ruleset. Every score-based stat shows how many scored games it uses, since older
-games may not have recorded scores. Largest Army and Longest Road are tracked as
+set to the active season. Results always cover exactly one game type and never
+mix types; when `game_type` is omitted, insights use the most-played type in the
+scope. Set `game_type` to switch to another type. Every score-based stat shows
+how many scored games it uses, since older games may not have recorded scores.
+Largest Army and Longest Road are tracked as
 held or not held; knight counts and road lengths are not recorded.
 
 ### Reporting a game and collecting scores

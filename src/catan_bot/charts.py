@@ -106,6 +106,32 @@ _CATALOG_LABELS = {
 }
 
 
+# Fixed catalog labels for the game type shown in the image title.
+GAME_TYPE_LABELS = {
+    "normal": "Normal",
+    "seafarers": "Seafarers",
+    "cities_knights": "Cities & Knights",
+    "seafarers_cities_knights": "Seafarers + Cities & Knights",
+}
+
+
+def game_type_label(game_type: str) -> str:
+    """Catalog label for a game type; unknown keys become a safe ASCII title."""
+    label = GAME_TYPE_LABELS.get(game_type)
+    if label is not None:
+        return label
+    words = "".join(c if c.isascii() and (c.isalnum() or c == "-") else " " for c in game_type)
+    return " ".join(words.split()).title()[:40] or "Other"
+
+
+def _image_title(kind: str, view: ChartInsightsView) -> str:
+    """The in-image title; names the game type whenever the view is for one."""
+    game_type = view.filter.game_type
+    if game_type is None:
+        return CHART_TITLES[kind]
+    return f"{CHART_TITLES[kind]} · {game_type_label(game_type)}"
+
+
 def _ascii(text: str) -> str:
     return text.encode("ascii", "ignore").decode("ascii").strip()
 
@@ -309,7 +335,7 @@ def _build_winning_formula(view: ChartInsightsView) -> _Built | None:
     other_avg = _composition_per_player(others, meta.loser_composition_samples)
     keys = sorted(set(win_avg) | set(other_avg), key=lambda k: (-win_avg.get(k, 0.0), k))
     fig = _new_figure(
-        CHART_TITLES["winning-formula"],
+        _image_title("winning-formula", view),
         f"Winners: {winner_n} scored games · Everyone else: {other_n} scored appearances",
     )
     ax = fig.add_subplot()
@@ -372,7 +398,7 @@ def _build_points_by_source(view: ChartInsightsView) -> _Built | None:
     players_drawn = [(label, p) for label, p, _ in players]
 
     fig = _new_figure(
-        CHART_TITLES["points-by-source"],
+        _image_title("points-by-source", view),
         "Average points per game by source, over each player's scored games",
     )
     ax = fig.add_subplot()
@@ -414,7 +440,7 @@ def _build_award_impact(view: ChartInsightsView) -> _Built | None:
 
     stats.sort(key=sort_key)
     fig = _new_figure(
-        CHART_TITLES["award-impact"],
+        _image_title("award-impact", view),
         "How often a player wins when holding an award, versus when not",
     )
     ax = fig.add_subplot()
@@ -468,7 +494,7 @@ def _build_win_rate_trend(view: ChartInsightsView) -> _Built | None:
     by_date = len(dates) >= 2  # one day of games has no time axis to speak of
 
     fig = _new_figure(
-        CHART_TITLES["win-rate-trend"], "Each player's win rate after every game they played"
+        _image_title("win-rate-trend", view), "Each player's win rate after every game they played"
     )
     ax = fig.add_subplot()
     _style_axes(ax, grid="y")
@@ -543,7 +569,7 @@ def _build_winning_scores(view: ChartInsightsView) -> _Built | None:
     meta = view.meta
     if not meta.scored_games or not meta.winning_score_distribution:
         return None
-    fig = _new_figure(CHART_TITLES["winning-scores"])
+    fig = _new_figure(_image_title("winning-scores", view))
     score_ax, margin_ax = fig.subplots(1, 2)
     for ax in (score_ax, margin_ax):
         _style_axes(ax, grid="y")
@@ -602,7 +628,7 @@ def _build_head_to_head(view: ChartInsightsView) -> _Built | None:
         return None
 
     fig = _new_figure(
-        CHART_TITLES["head-to-head"],
+        _image_title("head-to-head", view),
         "Share of shared games the row player won (wins / games together)",
     )
     ax = fig.add_subplot()

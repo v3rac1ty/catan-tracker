@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from fractions import Fraction
 
 from catan_bot.domain.participation import ParticipationRecord
+
+# Catalog order of the game types; also the tie-break order for "most played".
+GAME_TYPE_ORDER: tuple[str, ...] = (
+    "normal",
+    "seafarers",
+    "cities_knights",
+    "seafarers_cities_knights",
+)
 
 _ROAD_KEY = {
     "normal": "longest_road",
@@ -117,6 +125,32 @@ class MetaSummary:
     games_by_weekday: dict[int, int]
     avg_winning_score_by_month: dict[str, Fraction]
     winning_score_samples_by_month: dict[str, int]
+
+
+def games_by_type(records: Sequence[ParticipationRecord]) -> dict[str, int]:
+    """Distinct game count per game type; only types with at least one game."""
+    game_ids: dict[str, set[int]] = {}
+    for record in records:
+        game_ids.setdefault(record.game_type, set()).add(record.game_id)
+    return {game_type: len(ids) for game_type, ids in game_ids.items() if ids}
+
+
+def _type_rank(game_type: str) -> tuple[int, int, str]:
+    if game_type in GAME_TYPE_ORDER:
+        return (0, GAME_TYPE_ORDER.index(game_type), game_type)
+    return (1, 0, game_type)
+
+
+def most_played_game_type(counts: Mapping[str, int]) -> str | None:
+    """The type with the most games; ties go to the earliest in `GAME_TYPE_ORDER`.
+
+    Unknown types sort after the known ones, then by name. `None` when no type
+    has a positive count.
+    """
+    played = [(game_type, count) for game_type, count in counts.items() if count > 0]
+    if not played:
+        return None
+    return min(played, key=lambda item: (-item[1], _type_rank(item[0])))[0]
 
 
 def _groups(records: Sequence[ParticipationRecord]) -> list[list[ParticipationRecord]]:

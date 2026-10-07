@@ -7,11 +7,14 @@ from fractions import Fraction
 from time import perf_counter
 
 from catan_bot.domain.analytics import (
+    GAME_TYPE_ORDER,
     AwardStat,
     HeadToHead,
     RecordSplit,
+    games_by_type,
     head_to_head,
     meta_summary,
+    most_played_game_type,
     player_summaries,
     player_summary,
     win_rate_timeline,
@@ -610,3 +613,57 @@ def test_win_rate_timeline_is_cumulative_per_player() -> None:
         (date(2025, 3, 2), Fraction(3, 5)),
     ]
     assert timeline[3][0] == (date(2025, 1, 7), 0)
+
+
+def test_game_type_order_is_the_catalog_order() -> None:
+    assert GAME_TYPE_ORDER == (
+        "normal",
+        "seafarers",
+        "cities_knights",
+        "seafarers_cities_knights",
+    )
+
+
+def test_games_by_type_counts_distinct_games_not_participations() -> None:
+    day = date(2025, 1, 6)
+    records = [
+        row(1, day, 1, winner=True),
+        row(1, day, 2),
+        row(1, day, 3),
+        row(2, day, 1, game_type="seafarers"),
+        row(2, day, 2, game_type="seafarers", winner=True),
+        row(3, day, 1, game_type="seafarers"),
+        row(3, day, 2, game_type="seafarers", winner=True),
+    ]
+
+    assert games_by_type(records) == {"normal": 1, "seafarers": 2}
+
+
+def test_games_by_type_of_no_records_is_empty() -> None:
+    assert games_by_type([]) == {}
+
+
+def test_most_played_game_type_picks_the_largest_count() -> None:
+    counts = {"normal": 2, "cities_knights": 5, "seafarers": 3}
+
+    assert most_played_game_type(counts) == "cities_knights"
+
+
+def test_most_played_game_type_breaks_ties_by_catalog_order() -> None:
+    assert most_played_game_type({"cities_knights": 4, "seafarers": 4}) == "seafarers"
+    assert most_played_game_type({"seafarers_cities_knights": 2, "normal": 2}) == "normal"
+    assert (
+        most_played_game_type({"seafarers_cities_knights": 3, "cities_knights": 3})
+        == "cities_knights"
+    )
+
+
+def test_most_played_game_type_puts_unknown_types_after_known_then_by_name() -> None:
+    assert most_played_game_type({"zzz": 3, "seafarers": 3}) == "seafarers"
+    assert most_played_game_type({"zzz": 3, "aaa": 3}) == "aaa"
+    assert most_played_game_type({"zzz": 4, "seafarers": 3}) == "zzz"
+
+
+def test_most_played_game_type_is_none_without_games() -> None:
+    assert most_played_game_type({}) is None
+    assert most_played_game_type({"normal": 0}) is None

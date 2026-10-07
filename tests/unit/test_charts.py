@@ -577,3 +577,63 @@ def test_award_impact_puts_long_bar_labels_inside_the_axis() -> None:
     assert ax.get_xlim() == (0, 100)
     fig.canvas.draw()
     assert max(t.get_window_extent().x1 for t in ax.texts) <= ax.bbox.x1 + 1
+
+
+# --- M4: game type in the image title --------------------------------------
+_TYPE_LABELS = {
+    "normal": "Normal",
+    "seafarers": "Seafarers",
+    "cities_knights": "Cities & Knights",
+    "seafarers_cities_knights": "Seafarers + Cities & Knights",
+}
+
+
+def _for_type(view: ChartInsightsView, game_type: str | None) -> ChartInsightsView:
+    return replace(view, filter=replace(view.filter, game_type=game_type))
+
+
+def _image_title(fig) -> str:  # noqa: ANN001
+    return fig.texts[0].get_text()
+
+
+@pytest.mark.parametrize("kind", CHART_KINDS)
+@pytest.mark.parametrize("game_type", list(_TYPE_LABELS))
+def test_image_title_names_the_game_type_and_fits(
+    kind: str, game_type: str, view: ChartInsightsView
+) -> None:
+    built = charts._BUILDERS[kind](_for_type(view, game_type))
+    assert built is not None
+    title = built.figure.texts[0]
+    assert title.get_text() == f"{CHART_TITLES[kind]} \u00b7 {_TYPE_LABELS[game_type]}"
+    built.figure.canvas.draw()
+    extent = title.get_window_extent()
+    assert extent.x0 >= 0
+    assert extent.x1 <= built.figure.bbox.x1 - 20  # comfortable right margin at 1200px
+
+
+@pytest.mark.parametrize("kind", CHART_KINDS)
+def test_image_title_is_plain_without_a_game_type(kind: str, view: ChartInsightsView) -> None:
+    built = charts._BUILDERS[kind](_for_type(view, None))
+    assert built is not None
+    assert _image_title(built.figure) == CHART_TITLES[kind]
+
+
+@pytest.mark.parametrize("kind", CHART_KINDS)
+def test_rendered_chart_title_stays_the_plain_chart_title(
+    kind: str, view: ChartInsightsView
+) -> None:
+    chart = render_chart(kind, _for_type(view, "cities_knights"))
+    assert chart is not None
+    assert chart.title == CHART_TITLES[kind]
+
+
+def test_unknown_game_type_gets_a_safe_ascii_title(view: ChartInsightsView) -> None:
+    assert charts.game_type_label("seafarers_cities_knights") == "Seafarers + Cities & Knights"
+    assert charts.game_type_label("fancy_new-mode") == "Fancy New-Mode"
+    assert charts.game_type_label("caf\u00e9\U0001f600_mode") == "Caf Mode"
+    assert charts.game_type_label("\U0001f600") == "Other"
+    built = charts._BUILDERS["winning-formula"](_for_type(view, "caf\u00e9_mode\n<@123>"))
+    assert built is not None
+    title = _image_title(built.figure)
+    assert title.isascii() or title.count("\u00b7") == 1
+    assert "\n" not in title

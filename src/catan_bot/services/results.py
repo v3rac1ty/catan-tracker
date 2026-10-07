@@ -8,7 +8,7 @@ needs to render a response.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from fractions import Fraction
 from typing import Literal
@@ -277,7 +277,9 @@ class InsightsFilter:
 
     scope: InsightsScope
     season: Season | None  # the active season when scope == "season", else None
-    game_type: str | None  # None = all game types
+    game_type: str | None  # the single game type shown; None only when the scope has no games
+    available_game_types: dict[str, int] = field(default_factory=dict)  # games per type in scope
+    game_type_defaulted: bool = False  # True when game_type was auto-picked (user omitted it)
 
 
 @dataclass(frozen=True, slots=True)

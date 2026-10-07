@@ -6,6 +6,7 @@ from typing import get_args
 
 import asyncpg
 
+from catan_bot.db.models import Season
 from catan_bot.db.repositories import analytics as analytics_repo
 from catan_bot.db.repositories import guilds, seasons
 from catan_bot.domain import analytics as domain_analytics
@@ -29,20 +30,45 @@ async def _load(
     scope: InsightsScope,
     game_type: str | None,
 ) -> tuple[InsightsFilter, list[ParticipationRecord]]:
-    """Resolve the scope to a filter and fetch the matching participation rows."""
+    """Resolve scope and a single game type; fetch only that type's participation rows.
+
+    Insights never mix game types: the scope's rows are fetched once without a
+    type filter, per-type game counts are taken, the type is the caller's choice
+    (else the most-played one) and the rows are narrowed to it in memory.
+    """
     await guilds.ensure_guild(conn, guild_id)
+    season: Season | None = None
     if scope == "season":
-        active = await seasons.get_active_season(conn, guild_id)
-        flt = InsightsFilter(scope=scope, season=active, game_type=game_type)
-        if active is None:
+        season = await seasons.get_active_season(conn, guild_id)
+        if season is None:
+            flt = InsightsFilter(scope=scope, season=None, game_type=game_type)
             return flt, []
         records = await analytics_repo.list_participations(
-            conn, guild_id, season_id=active.season_id, game_type=game_type
+            conn, guild_id, season_id=season.season_id
         )
-        return flt, records
-    flt = InsightsFilter(scope=scope, season=None, game_type=game_type)
-    records = await analytics_repo.list_participations(conn, guild_id, game_type=game_type)
-    return flt, records
+    else:
+        records = await analytics_repo.list_participations(conn, guild_id)
+
+    counts = domain_analytics.games_by_type(records)
+    defaulted = False
+    if game_type is None:
+        game_type = domain_analytics.most_played_game_type(counts)
+        defaulted = game_type is not None
+    flt = InsightsFilter(
+        scope=scope,
+        season=season,
+        game_type=game_type,
+        available_game_types=counts,
+        game_type_defaulted=defaulted,
+    )
+    return flt, [record for record in records if record.game_type == game_type]
+
+
+def _require_valid(scope: object, game_type: object) -> None:
+    _require_scope(scope)
+    if game_type is not None and game_type not in domain_analytics.GAME_TYPE_ORDER:
+        # Fixed message, like the scope check: never echo the caller's value.
+        raise ValueError("invalid insights game type")
 
 
 def _require_scope(scope: object) -> None:
@@ -60,7 +86,7 @@ async def player_insights(
     scope: InsightsScope = "all_time",
     game_type: str | None = None,
 ) -> PlayerInsightsView:
-    _require_scope(scope)
+    _require_valid(scope, game_type)
     async with pool.acquire() as conn:
         flt, records = await _load(conn, guild_id, scope, game_type)
     return PlayerInsightsView(filter=flt, summary=domain_analytics.player_summary(records, user_id))
@@ -73,7 +99,7 @@ async def meta_insights(
     scope: InsightsScope = "all_time",
     game_type: str | None = None,
 ) -> MetaInsightsView:
-    _require_scope(scope)
+    _require_valid(scope, game_type)
     async with pool.acquire() as conn:
         flt, records = await _load(conn, guild_id, scope, game_type)
     return MetaInsightsView(
@@ -91,7 +117,7 @@ async def head_to_head_insights(
     scope: InsightsScope = "all_time",
     game_type: str | None = None,
 ) -> HeadToHeadView:
-    _require_scope(scope)
+    _require_valid(scope, game_type)
     async with pool.acquire() as conn:
         flt, records = await _load(conn, guild_id, scope, game_type)
     opponents: list[OpponentRecord] = []
@@ -117,7 +143,7 @@ async def chart_insights(
     scope: InsightsScope = "all_time",
     game_type: str | None = None,
 ) -> ChartInsightsView:
-    _require_scope(scope)
+    _require_valid(scope, game_type)
     async with pool.acquire() as conn:
         flt, records = await _load(conn, guild_id, scope, game_type)
     return ChartInsightsView(

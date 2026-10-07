@@ -63,8 +63,9 @@ _COMMANDS: tuple[tuple[str, str], ...] = (
     ("/stats", "Show a player's win/loss record."),
     (
         "/insights player|meta|head-to-head|chart",
-        "Explore player and group trends, compare a player's record "
-        "against opponents, or view a chart.",
+        "Explore player and group trends, compare a player's record against opponents, or view a "
+        "chart. Results always cover one game type and never mix types; the most-played type is "
+        "the default. Set game_type to switch types.",
     ),
     (
         "/event create [channel]|list|cancel",

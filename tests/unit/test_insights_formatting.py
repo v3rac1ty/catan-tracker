@@ -275,6 +275,52 @@ def test_game_type_label_is_shown_when_filtered() -> None:
         assert "Game type: Cities & Knights" in embed.description
 
 
+def test_defaulted_game_type_is_marked_and_also_played_is_sorted() -> None:
+    filtered = InsightsFilter(
+        scope="all_time",
+        season=None,
+        game_type="normal",
+        available_game_types={
+            "seafarers_cities_knights": 2,
+            "cities_knights": 3,
+            "seafarers": 3,
+            "normal": 5,
+            "unknown_type": 0,
+        },
+        game_type_defaulted=True,
+    )
+    embed = build_player_insights_embed(_player_view(insights_filter=filtered))
+
+    assert embed.description is not None
+    assert "Game type: Normal (most played)" in embed.description
+    assert (
+        "Also played: Seafarers (3 games) · Cities & Knights (3 games) · "
+        "Seafarers + Cities & Knights (2 games). Pick game_type to see them."
+    ) in embed.description
+
+
+def test_also_played_singular_and_absent_when_no_other_types() -> None:
+    filtered = InsightsFilter(
+        scope="all_time",
+        season=None,
+        game_type="normal",
+        available_game_types={"normal": 5, "cities_knights": 1},
+    )
+    embed = build_meta_insights_embed(_meta_view(filtered))
+
+    assert embed.description is not None
+    assert (
+        "Also played: Cities & Knights (1 game). Pick game_type to see them." in embed.description
+    )
+
+    no_alternates = InsightsFilter(
+        scope="all_time", season=None, game_type="normal", available_game_types={"normal": 5}
+    )
+    assert "Also played:" not in (
+        build_meta_insights_embed(_meta_view(no_alternates)).description or ""
+    )
+
+
 def test_unknown_game_type_label_is_escaped() -> None:
     filtered = InsightsFilter(scope="all_time", season=None, game_type="**odd**")
     embed = build_meta_insights_embed(_meta_view(filtered))
@@ -362,8 +408,7 @@ def test_player_embed_has_split_fields() -> None:
 
     assert "3 players: 3-2 (60.0%)" in fields["By player count"]
     assert "4 players: 1-0 (100.0%)" in fields["By player count"]
-    assert "Normal: 3-2 (60.0%)" in fields["By game type"]
-    assert "Cities & Knights: 1-0 (100.0%)" in fields["By game type"]
+    assert "By game type" not in fields
 
 
 def test_player_embed_passes_the_clean_and_limit_checks() -> None:
@@ -510,7 +555,12 @@ def test_season_scope_without_active_season_uses_no_active_season_description() 
 
 
 def test_no_games_description_respects_filters() -> None:
-    filtered = InsightsFilter(scope="all_time", season=None, game_type="seafarers")
+    filtered = InsightsFilter(
+        scope="all_time",
+        season=None,
+        game_type="seafarers",
+        available_game_types={"normal": 2, "seafarers": 0},
+    )
     embeds = [
         build_player_insights_embed(PlayerInsightsView(filtered, player_summary([], 101))),
         build_meta_insights_embed(MetaInsightsView(filtered, meta_summary([]), [])),
@@ -521,6 +571,7 @@ def test_no_games_description_respects_filters() -> None:
         assert embed.description is not None
         assert "No confirmed games yet." in embed.description
         assert "Game type: Seafarers" in embed.description
+        assert "Also played: Normal (2 games). Pick game_type to see them." in embed.description
         assert not embed.fields
         _assert_clean(embed)
 
