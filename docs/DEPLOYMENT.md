@@ -279,6 +279,11 @@ Investigate a nonempty `git status --short` before pulling; production-only
 changes should live in `.env`, which Git ignores. Save `PREVIOUS_REVISION` in
 the maintenance record together with the backup filename.
 
+The `bot` container runs with a read-only root filesystem and a 64 MB `tmpfs`
+at `/tmp`, which matplotlib uses for its cache (`MPLCONFIGDIR=/tmp/matplotlib`).
+Do not remove the `tmpfs` entry or the variable, or the bot crash-loops at
+startup when it imports the insights charts.
+
 To roll back application code, check out a known release tag or the recorded
 revision and rebuild:
 

@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# MPLCONFIGDIR: the runtime root filesystem is read-only and matplotlib needs a
+# writable config/cache directory at import time; /tmp is a tmpfs at runtime.
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 MPLCONFIGDIR=/tmp/matplotlib
 
 WORKDIR /app
 

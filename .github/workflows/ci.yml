@@ -83,3 +83,85 @@ jobs:
 
       - name: Test
         run: python -m pytest -q
+
+  container-smoke:
+    name: Production container smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      # Dummy values so compose interpolation succeeds; the smoke command never
+      # connects to a database or to Discord.
+      POSTGRES_PASSWORD: catan-ci-dummy-postgres
+      MIGRATOR_PASSWORD: catan-ci-dummy-migrator
+      APP_PASSWORD: catan-ci-dummy-app
+      DISCORD_TOKEN: catan-ci-dummy-discord-token
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build the production image
+        run: docker compose build bot
+
+      # Runs the `bot` service exactly as in production (read-only root
+      # filesystem, /tmp tmpfs, MPLCONFIGDIR, dropped capabilities) with only the
+      # command overridden. Guards against import-time writes to the filesystem.
+      - name: Import insights cog and render a chart under production hardening
+        run: |
+          docker compose run --rm --no-deps -T bot python - <<'EOF'
+          import os
+          import tempfile
+          from datetime import date
+
+          # The container must run as the unprivileged user, and that user must be
+          # able to write to the /tmp tmpfs (some runc versions mount it root-owned).
+          assert os.getuid() != 0, "smoke test must run as the non-root container user"
+          fd, tmp_path = tempfile.mkstemp(prefix="smoke-write-check-")
+          os.close(fd)
+          os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+          print(f"uid={os.getuid()} mkstemp={tmp_path}")
+          os.remove(tmp_path)
+
+          import catan_bot.cogs.insights_cog  # noqa: F401  (the import that crashed production)
+          from catan_bot import charts
+          from catan_bot.domain.analytics import (
+              head_to_head,
+              meta_summary,
+              player_summaries,
+              win_rate_timeline,
+          )
+          from catan_bot.domain.participation import ParticipationRecord
+          from catan_bot.services.results import ChartInsightsView, InsightsFilter
+
+
+          def row(user_id, is_winner, points):
+              return ParticipationRecord(
+                  game_id=1,
+                  played_on=date(2026, 1, 1),
+                  played_at=None,
+                  game_type="normal",
+                  extension_5_6=False,
+                  target_points=10,
+                  player_count=2,
+                  user_id=user_id,
+                  is_winner=is_winner,
+                  total_points=points,
+                  breakdown={"settlements": 3, "cities": 4, "vp_cards": points - 7},
+              )
+
+
+          records = [row(1, True, 10), row(2, False, 8)]
+          view = ChartInsightsView(
+              filter=InsightsFilter(scope="all_time", season=None, game_type="normal"),
+              meta=meta_summary(records),
+              players=player_summaries(records),
+              head_to_head=head_to_head(records),
+              timeline=win_rate_timeline(records),
+          )
+          chart = charts.render_chart("winning-scores", view)
+          assert chart is not None, "chart not rendered"
+          assert chart.png.startswith(b"\x89PNG"), "output is not a PNG"
+          print(f"ok: rendered {len(chart.png)} PNG bytes")
+          EOF

@@ -55,6 +55,10 @@ services:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
       DEV_GUILD_ID: ${DEV_GUILD_ID:-}
       SYNC_COMMANDS: ${SYNC_COMMANDS:-false}
+      # The root filesystem is read-only; matplotlib needs a writable cache dir.
+      MPLCONFIGDIR: /tmp/matplotlib
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     depends_on:
       migrate:
         condition: service_completed_successfully
