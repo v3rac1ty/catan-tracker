@@ -452,6 +452,164 @@ def test_meta_handles_unscored_winner_and_no_games() -> None:
     assert summary.winner_composition == {}
 
 
+def test_meta_deep_stats_tied_runners_tied_board_leaders_and_exclusions() -> None:
+    records = [
+        # Tied runners-up: each source averages to 5, so the winning lead is 1 + 1 = 2.
+        row(
+            1,
+            date(2025, 7, 1),
+            1,
+            winner=True,
+            points=12,
+            target=10,
+            breakdown={"settlements": 6, "cities": 6},
+        ),
+        row(
+            1, date(2025, 7, 1), 2, points=10, target=10, breakdown={"settlements": 8, "cities": 2}
+        ),
+        row(
+            1,
+            date(2025, 7, 1),
+            3,
+            points=10,
+            target=10,
+            breakdown={"settlements": 2, "monopoly": 8},
+        ),
+        # Equal board points are excluded from leader games and counted as a tie.
+        row(
+            2,
+            date(2025, 7, 2),
+            1,
+            winner=True,
+            points=10,
+            target=10,
+            breakdown={"settlements": 4, "cities": 6},
+        ),
+        row(
+            2, date(2025, 7, 2), 2, points=10, target=10, breakdown={"settlements": 4, "cities": 6}
+        ),
+        # Incomplete scoring is excluded from all fully-scored game statistics.
+        row(
+            3,
+            date(2025, 7, 3),
+            1,
+            winner=True,
+            points=10,
+            target=10,
+            breakdown={"settlements": 5, "cities": 5},
+        ),
+        row(3, date(2025, 7, 3), 2, points=None, target=10),
+        # A missing target is excluded from close-finish and overshoot samples.
+        row(
+            4,
+            date(2025, 7, 4),
+            1,
+            winner=True,
+            points=13,
+            target=None,
+            breakdown={"settlements": 7, "cities": 6},
+        ),
+        row(
+            4, date(2025, 7, 4), 2, points=8, target=None, breakdown={"settlements": 5, "cities": 3}
+        ),
+    ]
+
+    summary = meta_summary(records)
+    assert summary.lead_source_samples == 3
+    assert summary.lead_sources == {
+        "cities": Fraction(8, 3),
+        "monopoly": Fraction(-4, 3),
+        "settlements": 1,
+    }
+    assert sum(summary.lead_sources.values()) == summary.avg_margin == Fraction(7, 3)
+    assert summary.board_leader_games == 2
+    assert summary.board_leader_wins == 2
+    assert summary.board_leader_ties == 1
+    assert summary.close_finish_games == 2
+    assert summary.close_finish_distribution == {1: 1, 2: 1}
+    assert summary.close_finish_avg == Fraction(3, 2)
+    assert summary.overshoot_samples == 3
+    assert summary.overshoot_distribution == {0: 2, 2: 1}
+    assert summary.exact_target_rate == Fraction(2, 3)
+
+
+def test_player_fair_share_and_winning_ingredients_with_missing_sources() -> None:
+    records = []
+    # User 1 wins a three-player game and loses four- and six-player games.
+    for uid, points, winner, breakdown in (
+        (1, 10, True, {"settlements": 6, "cities": 4}),
+        (2, 8, False, {"settlements": 5, "cities": 3}),
+        (3, 7, False, {"settlements": 4, "cities": 3}),
+    ):
+        records.append(
+            row(
+                1,
+                date(2025, 8, 1),
+                uid,
+                winner=winner,
+                points=points,
+                players=3,
+                breakdown=breakdown,
+            )
+        )
+    for gid, day, players, winner_id, own_breakdown in (
+        (2, date(2025, 8, 2), 4, 2, {"settlements": 4, "cities": 6}),
+        (3, date(2025, 8, 3), 6, 2, {"settlements": 3, "cities": 6, "monopoly": 1}),
+    ):
+        for uid in range(1, players + 1):
+            is_own = uid == 1
+            breakdown = own_breakdown if is_own else {"settlements": 4, "cities": 4}
+            records.append(
+                row(
+                    gid,
+                    day,
+                    uid,
+                    winner=uid == winner_id,
+                    points=sum(breakdown.values()),
+                    players=players,
+                    breakdown=breakdown,
+                )
+            )
+    records.extend(
+        [
+            row(4, date(2025, 8, 4), 1, winner=True, points=10, target=None),
+            row(4, date(2025, 8, 4), 2, points=8, target=None),
+        ]
+    )
+
+    summary = player_summary(records, 1)
+    assert summary.expected_wins == Fraction(5, 4)
+    assert summary.wins_vs_expected == Fraction(8, 5)
+    assert summary.ingredient_win_samples == 1
+    assert summary.ingredient_loss_samples == 2
+    assert summary.winning_ingredients == {
+        "cities": Fraction(-1, 5),
+        "monopoly": Fraction(-1, 20),
+        "settlements": Fraction(1, 4),
+    }
+
+
+def test_winning_ingredients_samples_for_players_with_only_wins_or_losses() -> None:
+    records = [
+        row(
+            1,
+            date(2025, 9, 1),
+            1,
+            winner=True,
+            points=10,
+            breakdown={"settlements": 6, "cities": 4},
+        ),
+        row(1, date(2025, 9, 1), 2, points=8, breakdown={"settlements": 5, "cities": 3}),
+    ]
+    winner = player_summary(records, 1)
+    loser = player_summary(records, 2)
+    assert winner.ingredient_win_samples == 1 and winner.ingredient_loss_samples == 0
+    assert loser.ingredient_win_samples == 0 and loser.ingredient_loss_samples == 1
+    assert winner.winning_ingredients == loser.winning_ingredients == {}
+    assert winner.expected_wins == loser.expected_wins == Fraction(1, 2)
+    assert winner.wins_vs_expected == 2 and loser.wins_vs_expected == 0
+
+
 def test_meta_balanced_style_and_neither_award_combo() -> None:
     records = [
         row(

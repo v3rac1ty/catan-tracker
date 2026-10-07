@@ -10,6 +10,12 @@ import discord
 
 from catan_bot.db.models import Season
 from catan_bot.domain.analytics import (
+    BOARD_LEADER_MIN,
+    CLOSE_FINISH_MIN,
+    FAIR_SHARE_MIN,
+    INGREDIENTS_MIN,
+    LEAD_SOURCES_MIN,
+    OVERSHOOT_MIN,
     AwardStat,
     MatchupHighlights,
     MetaSummary,
@@ -25,6 +31,7 @@ from catan_bot.formatting import (
     EMBED_FIELD_VALUE_MAX,
     EMBED_MAX_FIELDS,
     EMBED_TOTAL_MAX,
+    _signed_lead,
     build_head_to_head_embed,
     build_meta_insights_embed,
     build_player_insights_embed,
@@ -896,3 +903,377 @@ def test_meta_calendar_without_time_data_is_unchanged() -> None:
     assert _fields(build_meta_insights_embed(_meta_view()))["Calendar"] == (
         "Busiest day: Saturday (6 games of 6)"
     )
+
+
+# ---------------------------------------------------------------------------
+# M6: deciding factors, wins vs fair share, winning ingredients
+# ---------------------------------------------------------------------------
+
+EXPLORATORY = " — exploratory"
+
+
+_BLANK_DECIDING = {
+    "lead_sources": {},
+    "lead_source_samples": 0,
+    "board_leader_games": 0,
+    "board_leader_wins": 0,
+    "board_leader_ties": 0,
+    "close_finish_games": 0,
+    "close_finish_avg": None,
+    "close_finish_distribution": {},
+    "overshoot_distribution": {},
+    "overshoot_samples": 0,
+    "exact_target_rate": None,
+}
+
+
+def _meta_with(**changes: object) -> MetaInsightsView:
+    """The fixture meta view with every deciding-factor stat blanked, then `changes`."""
+    view = _meta_view()
+    return replace(view, meta=replace(view.meta, **(_BLANK_DECIDING | changes)))
+
+
+def _deciding(**changes: object) -> str | None:
+    return _fields(build_meta_insights_embed(_meta_with(**changes))).get("Deciding factors")
+
+
+def _player_with(**changes: object) -> PlayerInsightsView:
+    return PlayerInsightsView(ALL_TIME, replace(player_summary(_records(), 101), **changes))
+
+
+def _lines(value: str | None) -> list[str]:
+    assert value is not None
+    return value.split("\n")
+
+
+def test_deciding_factors_present_with_all_four_lines() -> None:
+    value = _deciding(
+        lead_sources={
+            "cities": Fraction(14, 10),
+            "longest_road": Fraction(9, 10),
+            "settlements": Fraction(-3, 10),
+            "largest_army": Fraction(1, 10),
+            "vp_cards": Fraction(5, 10),
+        },
+        lead_source_samples=24,
+        board_leader_games=20,
+        board_leader_wins=13,
+        board_leader_ties=3,
+        close_finish_games=18,
+        close_finish_avg=Fraction(7, 6),
+        close_finish_distribution={0: 2, 1: 12, 2: 4},
+        overshoot_distribution={0: 3, 1: 5, 2: 2},
+        overshoot_samples=10,
+        exact_target_rate=Fraction(3, 10),
+    )
+
+    assert _lines(value) == [
+        "Winning lead mostly from: Cities +1.4, Longest road +0.9, VP cards +0.5 "
+        "(24 fully scored games)",
+        "Board leader won 65.0% (13 of 20 games; 3 ties excluded)",
+        "Crowded finishes: avg 1.2 losers finished at target − 2 or higher (18 games)",
+        "Winners overshoot the target by 0.9 on average; exact-target wins 30.0% (10 wins)",
+    ]
+
+
+def test_deciding_factors_absent_without_data() -> None:
+    embed = build_meta_insights_embed(_meta_with())
+
+    assert "Deciding factors" not in _fields(embed)
+    _assert_clean(embed)
+
+
+def test_deciding_factors_render_from_real_domain_output() -> None:
+    embed = build_meta_insights_embed(_meta_view())
+    value = _fields(embed)["Deciding factors"]
+
+    assert "Winning lead mostly from:" in value
+    assert "fully scored games)" in value
+    assert "Board leader won" in value
+    assert "Crowded finishes:" in value
+    assert "Winners overshoot the target by" in value
+    assert EXPLORATORY in value  # the fixture has only five games
+    _assert_clean(embed)
+    _assert_within_limits(embed)
+
+
+def test_deciding_factors_skips_only_lines_with_no_data() -> None:
+    value = _deciding(board_leader_games=12, board_leader_wins=6, board_leader_ties=0)
+
+    assert _lines(value) == ["Board leader won 50.0% (6 of 12 games)"]
+
+
+def test_lead_sources_with_no_positive_source_or_no_samples_are_skipped() -> None:
+    assert _deciding(lead_sources={"cities": Fraction(-1)}, lead_source_samples=12) is None
+    assert _deciding(lead_sources={"cities": Fraction(1)}, lead_source_samples=0) is None
+
+
+def test_lead_sources_show_at_most_three_with_catalog_order_on_ties() -> None:
+    sources = {key: Fraction(1) for key in ("vp_cards", "cities", "settlements", "largest_army")}
+    value = _deciding(lead_sources=sources, lead_source_samples=10)
+
+    assert value is not None
+    assert value.startswith("Winning lead mostly from: Houses +1.0, Cities +1.0, Largest army +1.0")
+    assert "VP cards" not in value
+
+
+def test_lead_sources_singular_sample_wording() -> None:
+    value = _deciding(lead_sources={"cities": Fraction(2)}, lead_source_samples=1)
+
+    assert value == f"Winning lead mostly from: Cities +2.0 (1 fully scored game){EXPLORATORY}"
+
+
+def test_exploratory_boundary_for_every_meta_line() -> None:
+    cases = (
+        (
+            LEAD_SOURCES_MIN,
+            lambda n: {"lead_sources": {"cities": Fraction(1)}, "lead_source_samples": n},
+        ),
+        (BOARD_LEADER_MIN, lambda n: {"board_leader_games": n, "board_leader_wins": 1}),
+        (
+            CLOSE_FINISH_MIN,
+            lambda n: {"close_finish_games": n, "close_finish_avg": Fraction(1)},
+        ),
+        (
+            OVERSHOOT_MIN,
+            lambda n: {
+                "overshoot_samples": n,
+                "overshoot_distribution": {0: n},
+                "exact_target_rate": Fraction(1),
+            },
+        ),
+    )
+    for minimum, build in cases:
+        below = _lines(_deciding(**build(minimum - 1)))
+        at_min = _lines(_deciding(**build(minimum)))
+        assert len(below) == len(at_min) == 1
+        assert below[0].endswith(EXPLORATORY), below
+        assert not at_min[0].endswith(EXPLORATORY), at_min
+
+
+def test_board_leader_ties_excluded_wording() -> None:
+    one = _deciding(board_leader_games=10, board_leader_wins=7, board_leader_ties=1)
+    several = _deciding(board_leader_games=10, board_leader_wins=7, board_leader_ties=4)
+    single_game = _deciding(board_leader_games=1, board_leader_wins=1, board_leader_ties=0)
+
+    assert one == "Board leader won 70.0% (7 of 10 games; 1 tie excluded)"
+    assert several == "Board leader won 70.0% (7 of 10 games; 4 ties excluded)"
+    assert single_game == f"Board leader won 100.0% (1 of 1 game){EXPLORATORY}"
+
+
+def test_board_leader_with_only_ties_is_skipped() -> None:
+    assert _deciding(board_leader_games=0, board_leader_wins=0, board_leader_ties=5) is None
+
+
+def test_overshoot_line_variants() -> None:
+    no_rate = _deciding(overshoot_samples=12, overshoot_distribution={1: 6, 3: 6})
+    under = _deciding(
+        overshoot_samples=10,
+        overshoot_distribution={-1: 10},
+        exact_target_rate=Fraction(0),
+    )
+
+    assert no_rate == "Winners overshoot the target by 2.0 on average (12 wins)"
+    assert under == (
+        "Winners finish 1.0 under the target on average; exact-target wins 0.0% (10 wins)"
+    )
+
+
+def test_crowded_finishes_needs_a_recorded_average() -> None:
+    assert _deciding(close_finish_games=12, close_finish_avg=None) is None
+    value = _deciding(close_finish_games=1, close_finish_avg=Fraction(0))
+    assert value == (
+        f"Crowded finishes: avg 0.0 losers finished at target − 2 or higher (1 game){EXPLORATORY}"
+    )
+
+
+def test_wins_vs_fair_share_line_in_record_field() -> None:
+    summary = replace(
+        player_summary(_records(), 101),
+        wins=7,
+        games=FAIR_SHARE_MIN,
+        expected_wins=Fraction(26, 5),
+        wins_vs_expected=Fraction(35, 26),
+    )
+    embed = build_player_insights_embed(PlayerInsightsView(ALL_TIME, summary))
+    record = _lines(_fields(embed)["Record"])
+
+    assert "Wins vs fair share: 7 vs 5.2 expected (1.35×)" in record
+    _assert_clean(embed)
+
+
+def test_wins_vs_fair_share_exploratory_boundary() -> None:
+    def fair_share_line(games: int) -> str:
+        summary = replace(
+            player_summary(_records(), 101),
+            games=games,
+            expected_wins=Fraction(2),
+            wins_vs_expected=Fraction(3, 2),
+        )
+        view = PlayerInsightsView(ALL_TIME, summary)
+        record = _lines(_fields(build_player_insights_embed(view))["Record"])
+        return next(line for line in record if line.startswith("Wins vs fair share"))
+
+    assert fair_share_line(FAIR_SHARE_MIN - 1).endswith(EXPLORATORY)
+    assert not fair_share_line(FAIR_SHARE_MIN).endswith(EXPLORATORY)
+
+
+def test_wins_vs_fair_share_absent_without_expected_wins() -> None:
+    view = _player_with(expected_wins=None, wins_vs_expected=None)
+    embed = build_player_insights_embed(view)
+
+    assert "fair share" not in _fields(embed)["Record"]
+    _assert_clean(embed)
+
+
+def _ingredient_view(
+    ingredients: dict[str, Fraction], wins: int = 8, losses: int = 6
+) -> PlayerInsightsView:
+    return _player_with(
+        winning_ingredients=ingredients,
+        ingredient_win_samples=wins,
+        ingredient_loss_samples=losses,
+    )
+
+
+def test_winning_ingredients_top_three_positive_with_samples() -> None:
+    view = _ingredient_view(
+        {
+            "cities": Fraction(8, 100),
+            "settlements": Fraction(-5, 100),
+            "longest_road": Fraction(4, 100),
+            "largest_army": Fraction(2, 100),
+            "vp_cards": Fraction(1, 100),
+        },
+        wins=12,
+        losses=9,
+    )
+    embed = build_player_insights_embed(view)
+
+    assert _lines(_fields(embed)["Winning ingredients"]) == [
+        "Cities: +8% of target more in wins",
+        "Longest road: +4% of target more in wins",
+        "Largest army: +2% of target more in wins",
+        "(12 wins / 9 losses)",
+    ]
+    _assert_clean(embed)
+    _assert_within_limits(embed)
+
+
+def test_winning_ingredients_skipped_when_only_negative_or_zero() -> None:
+    view = _ingredient_view({"cities": Fraction(-1, 10), "settlements": Fraction(0)})
+
+    assert "Winning ingredients" not in _fields(build_player_insights_embed(view))
+
+
+def test_winning_ingredients_never_drop_a_small_positive_difference() -> None:
+    view = _ingredient_view({"cities": Fraction(4, 1000), "settlements": Fraction(1, 100)})
+
+    assert _lines(_fields(build_player_insights_embed(view))["Winning ingredients"])[:2] == [
+        "Houses: +1% of target more in wins",
+        "Cities: +<1% of target more in wins",
+    ]
+    tiny = _ingredient_view({"cities": Fraction(4, 1000)})
+    assert _lines(_fields(build_player_insights_embed(tiny))["Winning ingredients"]) == [
+        "Cities: +<1% of target more in wins",
+        "(8 wins / 6 losses)",
+    ]
+    half = _ingredient_view({"cities": Fraction(1, 200)})
+    assert (
+        "Cities: +1% of target" in _fields(build_player_insights_embed(half))["Winning ingredients"]
+    )
+
+
+def test_small_lead_sources_render_as_less_than_a_tenth() -> None:
+    value = _deciding(
+        lead_sources={
+            "cities": Fraction(4, 100),
+            "longest_road": Fraction(5, 100),
+            "settlements": Fraction(0),
+            "largest_army": Fraction(-1, 100),
+        },
+        lead_source_samples=12,
+    )
+
+    assert (
+        value == "Winning lead mostly from: Longest road +0.1, Cities +<0.1 (12 fully scored games)"
+    )
+
+
+def test_signed_lead_helper_covers_zero_and_negative_tiny_values() -> None:
+    assert _signed_lead(Fraction(0)) == "0.0"
+    assert _signed_lead(Fraction(4, 100)) == "+<0.1"
+    assert _signed_lead(Fraction(-4, 100)) == "−<0.1"
+    assert _signed_lead(Fraction(-3, 10)) == "−0.3"
+    assert _signed_lead(Fraction(14, 10)) == "+1.4"
+
+
+def test_winning_ingredients_need_both_samples() -> None:
+    positive = {"cities": Fraction(1, 10)}
+
+    for wins, losses in ((0, 5), (5, 0), (0, 0)):
+        embed = build_player_insights_embed(_ingredient_view(positive, wins, losses))
+        assert "Winning ingredients" not in _fields(embed)
+
+
+def test_winning_ingredients_exploratory_boundary_on_either_side() -> None:
+    positive = {"cities": Fraction(1, 10)}
+
+    def footer(wins: int, losses: int) -> str:
+        view = _ingredient_view(positive, wins, losses)
+        return _lines(_fields(build_player_insights_embed(view))["Winning ingredients"])[-1]
+
+    assert footer(INGREDIENTS_MIN - 1, 20).endswith(EXPLORATORY)
+    assert footer(20, INGREDIENTS_MIN - 1).endswith(EXPLORATORY)
+    assert footer(INGREDIENTS_MIN, INGREDIENTS_MIN) == (
+        f"({INGREDIENTS_MIN} wins / {INGREDIENTS_MIN} losses)"
+    )
+    assert footer(1, 1) == f"(1 win / 1 loss){EXPLORATORY}"
+
+
+def test_new_fields_never_render_none_and_stay_within_limits() -> None:
+    meta_view = _meta_with(
+        lead_sources={f"source_{index}_{'q' * 30}": Fraction(index + 1, 3) for index in range(8)},
+        lead_source_samples=15,
+        board_leader_games=15,
+        board_leader_wins=9,
+        board_leader_ties=2,
+        close_finish_games=15,
+        close_finish_avg=Fraction(4, 3),
+        overshoot_samples=15,
+        overshoot_distribution={0: 5, 1: 10},
+        exact_target_rate=Fraction(1, 3),
+    )
+    player_view = _ingredient_view({f"key_{index}": Fraction(index + 1, 50) for index in range(10)})
+    meta_embed = build_meta_insights_embed(meta_view)
+    for embed in (meta_embed, build_player_insights_embed(player_view)):
+        _assert_clean(embed)
+        _assert_within_limits(embed)
+    assert "Deciding factors" in _fields(meta_embed)
+
+
+def test_deciding_factors_fit_beside_the_many_sources_stress_case() -> None:
+    meta = meta_summary(_records())
+    keys = [f"source_{index:02d}_{'z' * 30}" for index in range(40)]
+    meta = replace(
+        meta,
+        winner_composition={key: Fraction(7, 3) for key in keys},
+        loser_composition={key: Fraction(5, 3) for key in keys},
+        winner_composition_samples={key: 12 for key in keys},
+        loser_composition_samples={key: 30 for key in keys},
+        awards={key: _award_stat(key) for key in keys},
+        lead_sources={key: Fraction(1, 3) for key in keys},
+        lead_source_samples=30,
+        board_leader_games=30,
+        board_leader_wins=15,
+        close_finish_games=30,
+        close_finish_avg=Fraction(1),
+        overshoot_samples=30,
+        overshoot_distribution={0: 30},
+        exact_target_rate=Fraction(1),
+    )
+    players = [_extreme_summary(1_000_000_000_000_000_000 + i, award_count=0) for i in range(40)]
+    embed = build_meta_insights_embed(MetaInsightsView(ALL_TIME, meta, players))
+
+    _assert_within_limits(embed)
+    _assert_clean(embed)

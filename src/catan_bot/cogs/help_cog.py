@@ -64,9 +64,12 @@ _COMMANDS: tuple[tuple[str, str], ...] = (
     (
         "/insights player|meta|head-to-head|chart",
         "Explore player and group trends (including when a player wins), compare a player's "
-        "record against opponents with nemesis and closest-rival highlights, or view a chart, "
-        "including win rate by season. Results always cover one game type and never mix types; "
-        "the most-played type is the default. Set game_type to switch types.",
+        "record against opponents with nemesis and closest-rival highlights, or view one of "
+        "8 charts, including win rate by season and where the winning lead came from. "
+        "Meta lists deciding factors; player adds wins vs fair share and winning ingredients. "
+        "Small samples are marked exploratory. Results always "
+        "cover one game type and never mix types; the most-played type is the default. "
+        "Set game_type to switch types.",
     ),
     (
         "/event create [channel]|list|cancel",

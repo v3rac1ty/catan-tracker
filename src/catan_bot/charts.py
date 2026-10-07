@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
+from fractions import Fraction
 from io import BytesIO
 from typing import TYPE_CHECKING
 
@@ -34,11 +35,10 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Rectangle
 from matplotlib.ticker import MaxNLocator, PercentFormatter
 
+from catan_bot.domain.analytics import LEAD_SOURCES_MIN
 from catan_bot.domain.scoring import score_sources
 
 if TYPE_CHECKING:
-    from fractions import Fraction
-
     from matplotlib.axes import Axes
 
     from catan_bot.domain.analytics import AwardStat, PlayerSummary
@@ -52,6 +52,7 @@ CHART_KINDS: tuple[str, ...] = (
     "winning-scores",
     "head-to-head",
     "season-trend",
+    "winning-lead",
 )
 CHART_TITLES: dict[str, str] = {
     "winning-formula": "How winners score",
@@ -61,6 +62,7 @@ CHART_TITLES: dict[str, str] = {
     "winning-scores": "Winning scores & margins",
     "head-to-head": "Head-to-head",
     "season-trend": "Win rate by season",
+    "winning-lead": "Where the winning lead came from",
 }
 MAX_PLAYERS = 8
 MAX_SEASONS = 12  # season-trend shows at most the most recent seasons
@@ -85,6 +87,9 @@ CATEGORICAL = (
 )
 SEQUENTIAL = ("#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b")
 _HEATMAP_CMAP = LinearSegmentedColormap.from_list("catan_blue", SEQUENTIAL)
+
+LEAD_POSITIVE = CATEGORICAL[0]  # winner ahead (diverging pair, blue)
+LEAD_NEGATIVE = CATEGORICAL[7]  # winner behind (diverging pair, red)
 
 _FIGSIZE = (10, 6)
 _DPI = 120
@@ -209,12 +214,12 @@ def _labelled_players(view: ChartInsightsView) -> list[tuple[str, PlayerSummary]
     return [(f"P{i}", player) for i, player in enumerate(view.players[:MAX_PLAYERS], start=1)]
 
 
-def _new_figure(title: str, subtitle: str | None = None) -> Figure:
+def _new_figure(title: str, subtitle: str | None = None, *, subtitle_lines: int = 1) -> Figure:
     """A dark figure with a left-aligned header; the plot area sits below it."""
     fig = Figure(figsize=_FIGSIZE, dpi=_DPI, facecolor=SURFACE, layout="constrained")
     FigureCanvasAgg(fig)  # attaches itself to the figure; no global state
     fig.text(0.02, 0.975, title, color=INK, fontsize=17, fontweight="bold", va="top")
-    header = 0.88 if subtitle else 0.92
+    header = 0.88 - 0.04 * (subtitle_lines - 1) if subtitle else 0.92
     if subtitle:
         fig.text(0.02, 0.918, subtitle, color=INK_SECONDARY, fontsize=11, va="top")
     layout = fig.get_layout_engine()
@@ -791,6 +796,73 @@ def _build_season_trend(view: ChartInsightsView) -> _Built | None:
     )
 
 
+# --- 8. winning-lead ------------------------------------------------------
+def _signed(value: Fraction) -> str:
+    """One-decimal signed label; exact zero is ``0.0``, a tiny nonzero is ``+<0.1``."""
+    text = f"{float(value):+.1f}"
+    if text not in ("+0.0", "-0.0"):
+        return text
+    if value == 0:
+        return "0.0"
+    return "+<0.1" if value > 0 else "-<0.1"
+
+
+def _plain(value: Fraction) -> str:
+    """One-decimal unsigned-looking number that never prints ``-0.0``."""
+    text = f"{float(value):.1f}"
+    return "0.0" if text == "-0.0" else text
+
+
+def _build_winning_lead(view: ChartInsightsView) -> _Built | None:
+    meta = view.meta
+    samples = meta.lead_source_samples
+    if not samples or not meta.lead_sources:
+        return None
+    exact = dict(meta.lead_sources)
+    values = {key: float(lead) for key, lead in exact.items()}
+    keys = sorted(values, key=lambda k: (-values[k], k))
+    margin = sum(exact.values(), Fraction())  # exact: bars sum to the average winning margin
+    noun = "game" if samples == 1 else "games"
+    subtitle = (
+        f"Winner minus runner-up per source, over {samples} fully scored {noun};\n"
+        f"bars sum to the average winning margin ({_plain(margin)} pts)"
+    )
+    if samples < LEAD_SOURCES_MIN:
+        subtitle += f" — exploratory (under {LEAD_SOURCES_MIN} games)"
+    fig = _new_figure(_image_title("winning-lead", view), subtitle, subtitle_lines=2)
+    layout = fig.get_layout_engine()
+    if layout is not None:
+        layout.set(w_pad=0.3)  # keep the outermost tick labels off the image edge
+    ax = fig.add_subplot()
+    _style_axes(ax, grid="x")
+    ax.spines["left"].set_visible(False)
+    rows = list(range(len(keys)))
+    ax.barh(
+        rows,
+        [values[k] for k in keys],
+        height=0.6,
+        color=[LEAD_POSITIVE if values[k] >= 0 else LEAD_NEGATIVE for k in keys],
+        edgecolor=SURFACE,
+        linewidth=_GAP,
+        zorder=2,
+    )
+    ax.axvline(0, color=BASELINE, linewidth=1.5, zorder=3)
+    for row, key in zip(rows, keys, strict=True):
+        value = values[key]
+        label = _signed(exact[key])
+        if value >= 0:
+            ax.text(value, row, f"  {label}", va="center", ha="left", color=INK, fontsize=11)
+        else:
+            ax.text(value, row, f"{label}  ", va="center", ha="right", color=INK, fontsize=11)
+    reach = max(max(abs(v) for v in values.values()) * 1.3, 0.5)
+    ax.set_xlim(-reach, reach)
+    ax.set_yticks(rows, labels=[source_label(k) for k in keys])
+    ax.set_ylim(len(keys) - 0.4, -0.6)  # biggest lead on top
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=7))
+    ax.set_xlabel("Average points: winner minus runner-up")
+    return _Built(fig)
+
+
 _BUILDERS: dict[str, Callable[[ChartInsightsView], _Built | None]] = {
     "winning-formula": _build_winning_formula,
     "points-by-source": _build_points_by_source,
@@ -799,4 +871,5 @@ _BUILDERS: dict[str, Callable[[ChartInsightsView], _Built | None]] = {
     "winning-scores": _build_winning_scores,
     "head-to-head": _build_head_to_head,
     "season-trend": _build_season_trend,
+    "winning-lead": _build_winning_lead,
 }

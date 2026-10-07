@@ -124,6 +124,7 @@ def test_wins_and_games_add_up(records: list[ParticipationRecord]) -> None:
     games = _game_count(records)
     assert sum(s.wins for s in summaries) == games
     assert sum(s.games for s in summaries) == len(records)
+    assert sum((s.expected_wins or Fraction()) for s in summaries) == games
     meta = meta_summary(records)
     assert meta.games == games
     assert sum(meta.by_game_type.values()) == games
@@ -181,6 +182,11 @@ def test_player_summary_rates_and_sample_bounds(records: list[ParticipationRecor
         assert s.timed_games == s.games
         assert sum(split.wins for split in s.by_weekday.values()) == s.wins
         assert sum(split.wins for split in s.by_time_of_day.values()) <= s.wins
+        assert (s.expected_wins is None) == (s.games == 0)
+        if s.expected_wins is not None:
+            assert s.wins_vs_expected == Fraction(s.wins, 1) / s.expected_wins
+        assert s.ingredient_win_samples <= s.scored_games
+        assert s.ingredient_loss_samples <= s.scored_games
         for split in (
             *s.by_player_count.values(),
             *s.by_game_type.values(),
@@ -311,6 +317,23 @@ def test_meta_sample_bounds_and_totals(records: list[ParticipationRecord]) -> No
     assert meta.margin_samples <= fully_scored_game_count
     assert sum(meta.margin_distribution.values()) == meta.margin_samples
     assert (meta.avg_margin is None) == (meta.margin_samples == 0)
+    assert meta.lead_source_samples == meta.margin_samples
+    assert sum(meta.lead_sources.values(), Fraction()) == (meta.avg_margin or Fraction())
+    assert meta.board_leader_wins <= meta.board_leader_games
+    assert sum(meta.close_finish_distribution.values()) == meta.close_finish_games
+    assert (meta.close_finish_avg is None) == (meta.close_finish_games == 0)
+    assert sum(meta.overshoot_distribution.values()) == meta.overshoot_samples
+    assert (meta.exact_target_rate is None) == (meta.overshoot_samples == 0)
+    expected_overshoots: dict[int, int] = {}
+    for row in records:
+        if row.is_winner and row.total_points is not None and row.target_points is not None:
+            amount = row.total_points - row.target_points
+            expected_overshoots[amount] = expected_overshoots.get(amount, 0) + 1
+    assert meta.overshoot_distribution == expected_overshoots
+    if meta.overshoot_samples:
+        assert meta.exact_target_rate == Fraction(
+            expected_overshoots.get(0, 0), meta.overshoot_samples
+        )
     assert meta.winners_with_vp_cards.games <= meta.scored_games
     assert meta.winners_with_vp_cards.wins <= meta.winners_with_vp_cards.games
     assert _in_unit_interval(meta.winners_with_vp_cards.win_rate)

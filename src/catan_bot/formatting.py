@@ -45,7 +45,18 @@ from catan_bot.db.models import (
 if TYPE_CHECKING:
     from catan_bot.charts import RenderedChart
 
-from catan_bot.domain.analytics import AwardStat, MetaSummary, PlayerSummary, RecordSplit
+from catan_bot.domain.analytics import (
+    BOARD_LEADER_MIN,
+    CLOSE_FINISH_MIN,
+    FAIR_SHARE_MIN,
+    INGREDIENTS_MIN,
+    LEAD_SOURCES_MIN,
+    OVERSHOOT_MIN,
+    AwardStat,
+    MetaSummary,
+    PlayerSummary,
+    RecordSplit,
+)
 from catan_bot.domain.ranking import PlayerMovement, RankedPlayer
 from catan_bot.domain.scoring import GameRules, ScoreSource, score_sources
 from catan_bot.services.results import (
@@ -860,6 +871,48 @@ def _avg(value: Fraction) -> str:
     return f"{float(value):.1f}"
 
 
+_EXPLORATORY_SUFFIX = " \u2014 exploratory"
+_DECIDING_TOP_SOURCES = 3
+
+
+def _exploratory(line: str, sample: int, minimum: int) -> str:
+    """Flag a line whose sample is below its minimum as exploratory."""
+    return line + _EXPLORATORY_SUFFIX if sample < minimum else line
+
+
+_LEAD_TINY = Fraction(1, 20)
+_PERCENT_TINY = Fraction(1, 200)
+
+
+def _signed_lead(value: Fraction) -> str:
+    """A signed 1-decimal lead; magnitudes that would round to 0.0 show as `<0.1`."""
+    if value == 0:
+        return "0.0"
+    sign = "+" if value > 0 else "−"
+    if abs(value) < _LEAD_TINY:
+        return f"{sign}<0.1"
+    return f"{sign}{_avg(abs(value))}"
+
+
+def _signed_percent(value: Fraction) -> str:
+    """A signed whole percent of a fraction; never rounds a positive value away to 0."""
+    percent = value * 100
+    if value == 0:
+        return "0%"
+    sign = "+" if value > 0 else "−"
+    if abs(value) < _PERCENT_TINY:
+        return f"{sign}<1%"
+    return f"{sign}{int(abs(percent) + Fraction(1, 2))}%"
+
+
+def _top_positive_sources(values: Mapping[str, Fraction]) -> list[tuple[str, Fraction]]:
+    """Positive entries, largest first; ties keep catalog order."""
+    order = {key: index for index, key in enumerate(_ordered_source_keys(values))}
+    positive = [(key, value) for key, value in values.items() if value > 0]
+    positive.sort(key=lambda item: (-item[1], order[item[0]]))
+    return positive
+
+
 def _rate_text(rate: Fraction | None) -> str:
     return format_win_rate(rate) if rate is not None else _NO_DATA_TEXT
 
@@ -1063,6 +1116,15 @@ def _player_record_lines(summary: PlayerSummary) -> list[str]:
     ]
     if summary.recent_form.games:
         lines.append(f"Last {summary.recent_form.games}: {_split_text(summary.recent_form)}")
+    if summary.expected_wins is not None and summary.wins_vs_expected is not None:
+        lines.append(
+            _exploratory(
+                f"Wins vs fair share: {summary.wins} vs {_avg(summary.expected_wins)} expected "
+                f"({float(summary.wins_vs_expected):.2f}\u00d7)",
+                summary.games,
+                FAIR_SHARE_MIN,
+            )
+        )
     return lines
 
 
@@ -1127,6 +1189,25 @@ def _player_margin_lines(summary: PlayerSummary) -> list[str]:
     return lines
 
 
+def _player_ingredient_lines(summary: PlayerSummary) -> list[str]:
+    """Sources where this player's share of the target is higher in wins than losses."""
+    wins, losses = summary.ingredient_win_samples, summary.ingredient_loss_samples
+    if wins < 1 or losses < 1:
+        return []
+    shown = _top_positive_sources(summary.winning_ingredients)[:_DECIDING_TOP_SOURCES]
+    if not shown:
+        return []
+    lines = [
+        f"{_source_label_for_key(key)}: {_signed_percent(value)} of target more in wins"
+        for key, value in shown
+    ]
+    loss_text = f"{losses} loss" if losses == 1 else f"{losses} losses"
+    lines.append(
+        _exploratory(f"({_plural(wins, 'win')} / {loss_text})", min(wins, losses), INGREDIENTS_MIN)
+    )
+    return lines
+
+
 def _weekday_extreme_lines(summary: PlayerSummary) -> list[str]:
     """Best and worst weekday by win rate, among days with enough games to compare."""
     eligible = [
@@ -1187,6 +1268,9 @@ def build_player_insights_embed(view: PlayerInsightsView) -> discord.Embed:
     margins = _player_margin_lines(summary)
     if margins:
         _add_field(embed, "Margins", "\n".join(margins), inline=False)
+    ingredients = _player_ingredient_lines(summary)
+    if ingredients:
+        _add_field(embed, "Winning ingredients", "\n".join(ingredients), inline=False)
     when_you_win = _player_when_you_win_lines(summary)
     if when_you_win:
         _add_field(embed, "When you win", "\n".join(when_you_win), inline=False)
@@ -1304,6 +1388,72 @@ def _meta_score_lines(view: MetaInsightsView) -> list[str]:
     return lines
 
 
+def _meta_lead_source_line(meta: MetaSummary) -> str | None:
+    if meta.lead_source_samples < 1:
+        return None
+    top = _top_positive_sources(meta.lead_sources)[:_DECIDING_TOP_SOURCES]
+    if not top:
+        return None
+    sources = ", ".join(f"{_source_label_for_key(key)} {_signed_lead(value)}" for key, value in top)
+    return _exploratory(
+        f"Winning lead mostly from: {sources} "
+        f"({_plural(meta.lead_source_samples, 'fully scored game')})",
+        meta.lead_source_samples,
+        LEAD_SOURCES_MIN,
+    )
+
+
+def _meta_board_leader_line(meta: MetaSummary) -> str | None:
+    if meta.board_leader_games < 1:
+        return None
+    rate = Fraction(meta.board_leader_wins, meta.board_leader_games)
+    detail = f"{meta.board_leader_wins} of {_plural(meta.board_leader_games, 'game')}"
+    if meta.board_leader_ties:
+        detail += f"; {_plural(meta.board_leader_ties, 'tie')} excluded"
+    return _exploratory(
+        f"Board leader won {format_win_rate(rate)} ({detail})",
+        meta.board_leader_games,
+        BOARD_LEADER_MIN,
+    )
+
+
+def _meta_close_finish_line(meta: MetaSummary) -> str | None:
+    if meta.close_finish_games < 1 or meta.close_finish_avg is None:
+        return None
+    return _exploratory(
+        f"Crowded finishes: avg {_avg(meta.close_finish_avg)} losers finished at "
+        f"target − 2 or higher ({_plural(meta.close_finish_games, 'game')})",
+        meta.close_finish_games,
+        CLOSE_FINISH_MIN,
+    )
+
+
+def _meta_overshoot_line(meta: MetaSummary) -> str | None:
+    samples = meta.overshoot_samples
+    if samples < 1:
+        return None
+    total = sum(points * count for points, count in meta.overshoot_distribution.items())
+    average = Fraction(total, samples)
+    if average >= 0:
+        line = f"Winners overshoot the target by {_avg(average)} on average"
+    else:
+        line = f"Winners finish {_avg(-average)} under the target on average"
+    if meta.exact_target_rate is not None:
+        line += f"; exact-target wins {format_win_rate(meta.exact_target_rate)}"
+    return _exploratory(f"{line} ({_plural(samples, 'win')})", samples, OVERSHOOT_MIN)
+
+
+def _meta_deciding_factor_lines(view: MetaInsightsView) -> list[str]:
+    meta = view.meta
+    candidates = (
+        _meta_lead_source_line(meta),
+        _meta_board_leader_line(meta),
+        _meta_close_finish_line(meta),
+        _meta_overshoot_line(meta),
+    )
+    return [line for line in candidates if line is not None]
+
+
 def _top_holder(
     players: Sequence[PlayerSummary], key: str
 ) -> tuple[PlayerSummary, AwardStat] | None:
@@ -1380,6 +1530,7 @@ def build_meta_insights_embed(view: MetaInsightsView) -> discord.Embed:
         ("Play styles", _meta_play_style_lines(view)),
         ("VP cards", _meta_vp_card_lines(view)),
         ("Winning scores & margins", _meta_score_lines(view)),
+        ("Deciding factors", _meta_deciding_factor_lines(view)),
         ("Most frequent holders", _meta_holder_lines(view)),
         ("Calendar", _meta_calendar_lines(view) + _meta_time_of_day_lines(view)),
     )

@@ -39,6 +39,13 @@ _AWARDS_BY_TYPE = {
 
 TIME_OF_DAY_BUCKETS = ("daytime", "evening", "late_night")
 
+LEAD_SOURCES_MIN = 10
+BOARD_LEADER_MIN = 10
+CLOSE_FINISH_MIN = 10
+OVERSHOOT_MIN = 10
+FAIR_SHARE_MIN = 20
+INGREDIENTS_MIN = 5
+
 
 def _time_of_day_bucket(record: ParticipationRecord) -> str | None:
     """Return the local-time bucket, skipping missing or invalid time metadata."""
@@ -113,6 +120,11 @@ class PlayerSummary:
     by_time_of_day: dict[str, RecordSplit] = field(default_factory=dict)
     timed_games: int = 0
     by_weekday: dict[int, RecordSplit] = field(default_factory=dict)
+    expected_wins: Fraction | None = None
+    wins_vs_expected: Fraction | None = None
+    winning_ingredients: dict[str, Fraction] = field(default_factory=dict)
+    ingredient_win_samples: int = 0
+    ingredient_loss_samples: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +169,17 @@ class MetaSummary:
     avg_winning_score_by_month: dict[str, Fraction]
     winning_score_samples_by_month: dict[str, int]
     games_by_time_of_day: dict[str, int] = field(default_factory=dict)
+    lead_sources: dict[str, Fraction] = field(default_factory=dict)
+    lead_source_samples: int = 0
+    board_leader_games: int = 0
+    board_leader_wins: int = 0
+    board_leader_ties: int = 0
+    close_finish_games: int = 0
+    close_finish_avg: Fraction | None = None
+    close_finish_distribution: dict[int, int] = field(default_factory=dict)
+    overshoot_distribution: dict[int, int] = field(default_factory=dict)
+    overshoot_samples: int = 0
+    exact_target_rate: Fraction | None = None
 
 
 def matchup_highlights(
@@ -338,6 +361,49 @@ def _player_summary(
         for r in scored
         if r.target_points and r.total_points is not None
     ]
+    expected_wins = sum((Fraction(1, r.player_count) for r in rows), Fraction())
+    ingredient_wins = [
+        r
+        for r in rows
+        if r.is_winner and r.total_points is not None and r.target_points is not None
+    ]
+    ingredient_losses = [
+        r
+        for r in rows
+        if not r.is_winner and r.total_points is not None and r.target_points is not None
+    ]
+    ingredient_keys = sorted(
+        {
+            key
+            for r in (*ingredient_wins, *ingredient_losses)
+            if r.breakdown is not None
+            for key in r.breakdown
+        }
+    )
+    winning_ingredients = {
+        key: Fraction(
+            sum(
+                (
+                    Fraction((r.breakdown or {}).get(key, 0), r.target_points)
+                    for r in ingredient_wins
+                ),
+                Fraction(),
+            ),
+            len(ingredient_wins),
+        )
+        - Fraction(
+            sum(
+                (
+                    Fraction((r.breakdown or {}).get(key, 0), r.target_points)
+                    for r in ingredient_losses
+                ),
+                Fraction(),
+            ),
+            len(ingredient_losses),
+        )
+        for key in ingredient_keys
+        if ingredient_wins and ingredient_losses
+    }
     settlements = source_values("settlements")
     cities = source_values("cities")
     vp_cards = source_values("vp_cards")
@@ -440,6 +506,11 @@ def _player_summary(
         {bucket: _split(times[bucket]) for bucket in TIME_OF_DAY_BUCKETS if bucket in times},
         sum(len(group) for group in times.values()),
         {weekday: _split(group) for weekday, group in sorted(weekdays.items())},
+        expected_wins if games else None,
+        Fraction(wins, expected_wins) if expected_wins else None,
+        winning_ingredients,
+        len(ingredient_wins),
+        len(ingredient_losses),
     )
 
 
@@ -494,6 +565,17 @@ def meta_summary(records: Sequence[ParticipationRecord]) -> MetaSummary:
     time_buckets: dict[str, int] = {}
     month_scores: dict[str, list[int]] = {}
     scored_games = 0
+    lead_source_totals: dict[str, Fraction] = {}
+    lead_source_samples = 0
+    board_leader_games = 0
+    board_leader_wins = 0
+    board_leader_ties = 0
+    close_finish_counts: dict[int, int] = {}
+    close_finish_totals = 0
+    close_finish_games = 0
+    overshoots: dict[int, int] = {}
+    overshoot_samples = 0
+    exact_target_wins = 0
 
     for game in games:
         # Game metadata is shared across rows; count once per game.
@@ -524,6 +606,11 @@ def meta_summary(records: Sequence[ParticipationRecord]) -> MetaSummary:
             continue
         scored_games += 1
         winning_scores.append(winner.total_points)
+        if winner.target_points is not None:
+            overshoot = winner.total_points - winner.target_points
+            overshoots[overshoot] = overshoots.get(overshoot, 0) + 1
+            overshoot_samples += 1
+            exact_target_wins += overshoot == 0
         month = winner.played_on.strftime("%Y-%m")
         month_scores.setdefault(month, []).append(winner.total_points)
         if winner.game_type in ("normal", "seafarers"):
@@ -540,6 +627,52 @@ def meta_summary(records: Sequence[ParticipationRecord]) -> MetaSummary:
             ]
             if other_scores:
                 margins.append(winner.total_points - max(other_scores))
+                if winner.breakdown is not None:
+                    runner_ups = [
+                        r for r in game if not r.is_winner and r.total_points == max(other_scores)
+                    ]
+                    source_keys = set(winner.breakdown)
+                    for runner in runner_ups:
+                        if runner.breakdown is not None:
+                            source_keys.update(runner.breakdown)
+                    for key in source_keys:
+                        runner_average = sum(
+                            (
+                                Fraction((r.breakdown or {}).get(key, 0), len(runner_ups))
+                                for r in runner_ups
+                            ),
+                            Fraction(),
+                        )
+                        lead_source_totals[key] = lead_source_totals.get(key, Fraction()) + (
+                            winner.breakdown.get(key, 0) - runner_average
+                        )
+                    lead_source_samples += 1
+            if all(r.breakdown is not None for r in game):
+                board_points = {
+                    r.user_id: r.breakdown.get("settlements", 0) + r.breakdown.get("cities", 0)
+                    for r in game
+                    if r.breakdown is not None
+                }
+                if board_points:
+                    highest_board = max(board_points.values())
+                    board_leaders = [
+                        uid for uid, points in board_points.items() if points == highest_board
+                    ]
+                    if len(board_leaders) == 1:
+                        board_leader_games += 1
+                        board_leader_wins += board_leaders[0] == winner.user_id
+                    else:
+                        board_leader_ties += 1
+            if first.target_points is not None:
+                close_count = sum(
+                    not r.is_winner
+                    and r.total_points is not None
+                    and r.total_points >= first.target_points - 2
+                    for r in game
+                )
+                close_finish_counts[close_count] = close_finish_counts.get(close_count, 0) + 1
+                close_finish_totals += close_count
+                close_finish_games += 1
         road = _ROAD_KEY.get(winner.game_type)
         if (
             road
@@ -594,6 +727,22 @@ def meta_summary(records: Sequence[ParticipationRecord]) -> MetaSummary:
         },
         {month: len(values) for month, values in sorted(month_scores.items())},
         {bucket: time_buckets[bucket] for bucket in TIME_OF_DAY_BUCKETS if bucket in time_buckets},
+        {
+            key: Fraction(total, lead_source_samples)
+            for key, total in sorted(lead_source_totals.items())
+        }
+        if lead_source_samples
+        else {},
+        lead_source_samples,
+        board_leader_games,
+        board_leader_wins,
+        board_leader_ties,
+        close_finish_games,
+        Fraction(close_finish_totals, close_finish_games) if close_finish_games else None,
+        close_finish_counts,
+        overshoots,
+        overshoot_samples,
+        Fraction(exact_target_wins, overshoot_samples) if overshoot_samples else None,
     )
 
 

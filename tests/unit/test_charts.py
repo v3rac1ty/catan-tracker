@@ -15,6 +15,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
+from matplotlib.colors import to_rgba
 from PIL import Image
 
 from catan_bot import charts
@@ -35,7 +36,7 @@ from catan_bot.services.results import ChartInsightsView, InsightsFilter
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 PLAYER_KINDS = ("points-by-source", "win-rate-trend", "head-to-head", "season-trend")
-PLAYER_FREE_KINDS = ("winning-formula", "award-impact", "winning-scores")
+PLAYER_FREE_KINDS = ("winning-formula", "award-impact", "winning-scores", "winning-lead")
 ALL_FILTER = InsightsFilter(scope="all_time", season=None, game_type=None)
 
 
@@ -187,9 +188,11 @@ def test_chart_kinds_and_titles_match_contract() -> None:
         "winning-scores",
         "head-to-head",
         "season-trend",
+        "winning-lead",
     )
     assert set(CHART_TITLES) == set(CHART_KINDS)
     assert CHART_TITLES["winning-scores"] == "Winning scores & margins"
+    assert CHART_TITLES["winning-lead"] == "Where the winning lead came from"
     assert MAX_PLAYERS == 8
 
 
@@ -211,7 +214,9 @@ def test_empty_data_returns_none(kind: str, empty_view: ChartInsightsView) -> No
     assert render_chart(kind, empty_view) is None
 
 
-@pytest.mark.parametrize("kind", ["winning-formula", "award-impact", "winning-scores"])
+@pytest.mark.parametrize(
+    "kind", ["winning-formula", "award-impact", "winning-scores", "winning-lead"]
+)
 def test_scored_charts_are_none_when_nothing_is_scored(kind: str) -> None:
     unscored = make_view(make_records(games=6, unscored_every=1))
     assert unscored.players  # players exist, but no recorded points
@@ -864,3 +869,193 @@ def test_other_player_charts_are_unaffected_by_unseasoned_top_players() -> None:
     assert chart is not None
     assert [label for label, _ in chart.legend] == [f"P{i}" for i in range(1, 9)]
     assert chart.note == "Showing the 8 most active of 10 players."
+
+
+# --- M6: winning-lead -------------------------------------------------------
+def _lead_view(
+    lead: dict[str, float], samples: int, game_type: str | None = None
+) -> ChartInsightsView:
+    """A view whose meta carries exactly the given winning-lead data."""
+    base = make_view(make_records(games=12, unscored_every=0))
+    meta = replace(
+        base.meta,
+        lead_sources={key: Fraction(value).limit_denominator(1000) for key, value in lead.items()},
+        lead_source_samples=samples,
+    )
+    return replace(_for_type(base, game_type), meta=meta)
+
+
+def _lead_fig(view: ChartInsightsView):  # noqa: ANN202
+    fig = _fig(charts._build_winning_lead, view)
+    assert fig is not None
+    fig.canvas.draw()
+    return fig
+
+
+def _subtitle(fig) -> str:  # noqa: ANN001
+    return fig.texts[1].get_text()
+
+
+MIXED_LEAD = {
+    "settlements": 0.8,
+    "cities": 1.4,
+    "longest_road": 0.9,
+    "largest_army": -0.3,
+    "vp_cards": 0.1,
+    "defender_of_catan": -0.6,
+}
+
+
+def test_winning_lead_renders_a_valid_png_from_real_games(view: ChartInsightsView) -> None:
+    assert view.meta.lead_source_samples > 0
+    chart = render_chart("winning-lead", view)
+    assert chart is not None
+    assert chart.png.startswith(PNG_MAGIC)
+    assert chart.title == "Where the winning lead came from"
+    assert chart.legend == ()
+    assert chart.note is None
+
+
+def test_winning_lead_is_none_without_samples() -> None:
+    assert render_chart("winning-lead", _lead_view({}, 0)) is None
+    assert render_chart("winning-lead", _lead_view({"cities": 1.0}, 0)) is None
+    assert render_chart("winning-lead", _lead_view({}, 5)) is None
+
+
+def test_winning_lead_bars_are_signed_sorted_and_colored() -> None:
+    fig = _lead_fig(_lead_view(MIXED_LEAD, 25))
+    ax = fig.axes[0]
+    ordered = sorted(MIXED_LEAD, key=lambda k: (-MIXED_LEAD[k], k))
+    assert [t.get_text() for t in ax.get_yticklabels()] == [source_label(k) for k in ordered]
+    assert ax.get_ylim()[0] > ax.get_ylim()[1]  # first (largest) bar on top
+    widths = [patch.get_width() for patch in ax.patches]
+    assert widths == pytest.approx([MIXED_LEAD[k] for k in ordered], abs=1e-3)
+    assert widths == sorted(widths, reverse=True)
+    colors = [patch.get_facecolor() for patch in ax.patches]
+    assert colors == [to_rgba("#3987e5" if w >= 0 else "#e66767") for w in widths]
+    assert fig.legends == []
+    baselines = [line for line in ax.get_lines() if line.get_color() == "#383835"]
+    assert [list(line.get_xdata()) for line in baselines] == [[0, 0]]
+
+
+def test_winning_lead_labels_are_signed_in_ink_colors() -> None:
+    fig = _lead_fig(_lead_view(MIXED_LEAD, 25))
+    ax = fig.axes[0]
+    assert sorted(t.get_text().strip() for t in ax.texts) == sorted(
+        f"{v:+.1f}" for v in MIXED_LEAD.values()
+    )
+    assert {t.get_color() for t in ax.texts} <= {charts.INK, charts.INK_SECONDARY}
+    for text in ax.texts:  # a label sits on the outer side of its bar
+        assert (text.get_ha() == "left") == (text.get_position()[0] >= 0)
+
+
+@pytest.mark.parametrize(
+    "lead",
+    [
+        MIXED_LEAD,
+        {"cities": -1.2, "settlements": -0.4, "vp_cards": -2.5},  # all negative
+        {"cities": 4.37, "settlements": 0.2},  # large positive
+        {"cities": -0.04, "settlements": 0.04},  # rounds to zero
+    ],
+    ids=["mixed", "all-negative", "positive", "tiny"],
+)
+def test_winning_lead_labels_stay_inside_the_axes_with_symmetric_limits(
+    lead: dict[str, float],
+) -> None:
+    fig = _lead_fig(_lead_view(lead, 30))
+    ax = fig.axes[0]
+    lo, hi = ax.get_xlim()
+    assert lo == pytest.approx(-hi)
+    assert hi > max(abs(v) for v in lead.values())
+    for text in ax.texts:
+        extent = text.get_window_extent()
+        assert extent.x0 >= ax.bbox.x0 - 1
+        assert extent.x1 <= ax.bbox.x1 + 1
+    chart = render_chart("winning-lead", _lead_view(lead, 30))
+    assert chart is not None
+    assert chart.png.startswith(PNG_MAGIC)
+
+
+def test_winning_lead_tiny_nonzero_labels_say_less_than_a_tenth() -> None:
+    fig = _lead_fig(_lead_view({"cities": -0.04, "settlements": 0.04, "vp_cards": 0}, 30))
+    assert sorted(t.get_text().strip() for t in fig.axes[0].texts) == ["+<0.1", "-<0.1", "0.0"]
+    assert "0.0 pts" in _subtitle(fig)
+    assert "-0.0" not in _subtitle(fig)
+
+
+def test_winning_lead_subtitle_sums_exact_fractions_never_negative_zero() -> None:
+    # 3/10 - 1/10 - 2/10 is exactly 0, but the float sum is -2.8e-17 -> "-0.0".
+    lead = {
+        "cities": Fraction(3, 10),
+        "settlements": Fraction(-1, 10),
+        "vp_cards": Fraction(-2, 10),
+    }
+    assert sum(float(v) for v in lead.values()) < 0  # the float trap this guards against
+    base = _lead_view({}, 0)
+    meta = replace(base.meta, lead_sources=lead, lead_source_samples=30)
+    fig = _lead_fig(replace(base, meta=meta))
+    assert "(0.0 pts)" in _subtitle(fig)
+    assert "-0.0" not in _subtitle(fig)
+    assert sorted(t.get_text().strip() for t in fig.axes[0].texts) == ["+0.3", "-0.1", "-0.2"]
+
+
+def test_winning_lead_subtitle_sum_matches_the_bars() -> None:
+    fig = _lead_fig(_lead_view(MIXED_LEAD, 25))
+    total = sum(MIXED_LEAD.values())
+    assert total == pytest.approx(2.3)
+    assert _subtitle(fig) == (
+        "Winner minus runner-up per source, over 25 fully scored games;\n"
+        f"bars sum to the average winning margin ({total:.1f} pts)"
+    )
+    assert "2.3 pts" in _subtitle(fig)
+
+
+def test_winning_lead_subtitle_matches_real_average_margin(view: ChartInsightsView) -> None:
+    fig = _lead_fig(view)
+    bars = sum(patch.get_width() for patch in fig.axes[0].patches)
+    assert f"({bars:.1f} pts)" in _subtitle(fig)
+    assert f"over {view.meta.lead_source_samples} fully scored games" in _subtitle(fig)
+
+
+EXPLORATORY = " — exploratory (under 10 games)"
+
+
+@pytest.mark.parametrize(
+    ("samples", "exploratory"),
+    [(1, True), (9, True), (analytics.LEAD_SOURCES_MIN - 1, True), (10, False), (11, False)],
+)
+def test_winning_lead_exploratory_suffix_boundary(samples: int, exploratory: bool) -> None:
+    assert analytics.LEAD_SOURCES_MIN == 10
+    fig = _lead_fig(_lead_view({"cities": 1.0, "settlements": 0.5}, samples))
+    assert _subtitle(fig).endswith(EXPLORATORY) is exploratory
+    assert (EXPLORATORY in _subtitle(fig)) is exploratory
+
+
+def test_winning_lead_one_game_subtitle_is_singular() -> None:
+    fig = _lead_fig(_lead_view({"cities": 1.0}, 1))
+    assert "over 1 fully scored game;" in _subtitle(fig)
+
+
+@pytest.mark.parametrize("game_type", list(_TYPE_LABELS))
+def test_winning_lead_title_names_the_game_type(game_type: str) -> None:
+    fig = _lead_fig(_lead_view(MIXED_LEAD, 25, game_type))
+    assert _image_title(fig) == f"Where the winning lead came from · {_TYPE_LABELS[game_type]}"
+    assert _image_title(_lead_fig(_lead_view(MIXED_LEAD, 25))) == "Where the winning lead came from"
+
+
+def test_winning_lead_uses_catalog_labels_and_no_legend() -> None:
+    fig = _lead_fig(_lead_view({"metropolis_bonus": 0.4, "totally_new_source": -0.2}, 12))
+    assert [t.get_text() for t in fig.axes[0].get_yticklabels()] == [
+        "Metropolis",
+        "Totally New Source",
+    ]
+    assert fig.legends == []
+
+
+@pytest.mark.parametrize("samples", [1, 4, 27])
+def test_winning_lead_subtitle_fits_inside_the_image(samples: int) -> None:
+    fig = _lead_fig(_lead_view(MIXED_LEAD, samples))
+    subtitle = fig.texts[1]
+    extent = subtitle.get_window_extent()
+    assert extent.x1 <= fig.bbox.x1 - 20
+    assert extent.y0 >= fig.axes[0].get_tightbbox().y1 - 1  # clear of the plot
