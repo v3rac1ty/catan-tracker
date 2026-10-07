@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from fractions import Fraction
 from typing import Literal
 
 from catan_bot.db.models import (
@@ -19,7 +20,7 @@ from catan_bot.db.models import (
     Season,
     SeasonResultRow,
 )
-from catan_bot.domain.analytics import MetaSummary, PlayerSummary
+from catan_bot.domain.analytics import HeadToHead, MetaSummary, PlayerSummary
 from catan_bot.domain.bet import BetOutcome
 from catan_bot.domain.ranking import PlayerMovement, PlayerStats, RankedPlayer
 from catan_bot.domain.scoring import GameRules, PlayerScore
@@ -305,3 +306,14 @@ class HeadToHeadView:
     filter: InsightsFilter
     user_id: int
     opponents: list[OpponentRecord]  # sorted games_together desc, then opponent_id asc
+
+
+@dataclass(frozen=True, slots=True)
+class ChartInsightsView:
+    """Everything the `/insights chart` renderer needs, from one set of records."""
+
+    filter: InsightsFilter
+    meta: MetaSummary
+    players: list[PlayerSummary]  # domain player_summaries order
+    head_to_head: list[HeadToHead]  # domain head_to_head
+    timeline: dict[int, list[tuple[date, Fraction]]]  # domain win_rate_timeline

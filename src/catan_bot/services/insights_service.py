@@ -11,6 +11,7 @@ from catan_bot.db.repositories import guilds, seasons
 from catan_bot.domain import analytics as domain_analytics
 from catan_bot.domain.participation import ParticipationRecord
 from catan_bot.services.results import (
+    ChartInsightsView,
     HeadToHeadView,
     InsightsFilter,
     InsightsScope,
@@ -107,3 +108,22 @@ async def head_to_head_insights(
             )
     opponents.sort(key=lambda item: (-item.games_together, item.opponent_id))
     return HeadToHeadView(filter=flt, user_id=user_id, opponents=opponents)
+
+
+async def chart_insights(
+    pool: asyncpg.Pool,
+    guild_id: int,
+    *,
+    scope: InsightsScope = "all_time",
+    game_type: str | None = None,
+) -> ChartInsightsView:
+    _require_scope(scope)
+    async with pool.acquire() as conn:
+        flt, records = await _load(conn, guild_id, scope, game_type)
+    return ChartInsightsView(
+        filter=flt,
+        meta=domain_analytics.meta_summary(records),
+        players=domain_analytics.player_summaries(records),
+        head_to_head=domain_analytics.head_to_head(records),
+        timeline=domain_analytics.win_rate_timeline(records),
+    )

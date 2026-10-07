@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from catan_bot import formatting
+from catan_bot import charts, formatting
 from catan_bot.bot import CatanBot
 from catan_bot.permissions import guild_id_from_interaction
 from catan_bot.services import insights_service
@@ -20,6 +23,9 @@ _GAME_TYPE_CHOICES = [
     app_commands.Choice(name="Seafarers", value="seafarers"),
     app_commands.Choice(name="Cities & Knights", value="cities_knights"),
     app_commands.Choice(name="Seafarers + Cities & Knights", value="seafarers_cities_knights"),
+]
+_CHART_KIND_CHOICES = [
+    app_commands.Choice(name=charts.CHART_TITLES[kind], value=kind) for kind in charts.CHART_KINDS
 ]
 
 
@@ -119,6 +125,46 @@ class InsightsCog(commands.Cog):
         embed = formatting.build_head_to_head_embed(view)
         await interaction.edit_original_response(
             embed=embed, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    @insights_group.command(name="chart", description="Show a chart of group trends.")
+    @app_commands.describe(
+        kind="Which chart to show.",
+        scope="Which games to include. Defaults to all-time.",
+        game_type="Only include games with this ruleset.",
+    )
+    @app_commands.choices(
+        kind=_CHART_KIND_CHOICES, scope=_SCOPE_CHOICES, game_type=_GAME_TYPE_CHOICES
+    )
+    async def chart(
+        self,
+        interaction: discord.Interaction,
+        kind: app_commands.Choice[str],
+        scope: app_commands.Choice[str] | None = None,
+        game_type: app_commands.Choice[str] | None = None,
+    ) -> None:
+        guild_id = guild_id_from_interaction(interaction)
+        scope_value = scope.value if scope is not None else "all_time"
+        game_type_value = game_type.value if game_type is not None else None
+        await interaction.response.defer(thinking=True)
+        view = await insights_service.chart_insights(
+            self.bot.pool, guild_id, scope=scope_value, game_type=game_type_value
+        )
+        rendered = await asyncio.to_thread(charts.render_chart, kind.value, view)
+        if rendered is None:
+            embed = formatting.build_chart_unavailable_embed(view, charts.CHART_TITLES[kind.value])
+            await interaction.edit_original_response(
+                embed=embed, allowed_mentions=discord.AllowedMentions.none()
+            )
+            return
+
+        filename = f"insights-{kind.value}.png"
+        file = discord.File(io.BytesIO(rendered.png), filename=filename)
+        embed = formatting.build_chart_embed(view, rendered, filename)
+        await interaction.edit_original_response(
+            embed=embed,
+            attachments=[file],
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
 

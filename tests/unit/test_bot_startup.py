@@ -79,6 +79,7 @@ async def test_all_commands_register_in_an_offline_tree() -> None:
             "player",
             "meta",
             "head-to-head",
+            "chart",
         }
         assert {command.name for command in top_level["event"].commands} == {
             "create",

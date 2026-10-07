@@ -78,6 +78,7 @@ _ALLOWED_EXACT_IMPORTS = frozenset(
         "logging",
         "dataclasses",
         "datetime",
+        "fractions",
         "typing",
         "collections.abc",
         "asyncpg",

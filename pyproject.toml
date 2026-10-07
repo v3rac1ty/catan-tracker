@@ -12,6 +12,7 @@ dependencies = [
   "asyncpg>=0.31,<0.32",
   "pydantic-settings>=2.15,<3",
   "tzdata",
+  "matplotlib>=3.11,<4",
 ]
 
 [project.optional-dependencies]

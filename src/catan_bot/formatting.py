@@ -27,6 +27,7 @@ import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, time
 from fractions import Fraction
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import discord
@@ -40,11 +41,16 @@ from catan_bot.db.models import (
     RsvpRoster,
     Season,
 )
+
+if TYPE_CHECKING:
+    from catan_bot.charts import RenderedChart
+
 from catan_bot.domain.analytics import AwardStat, MetaSummary, PlayerSummary, RecordSplit
 from catan_bot.domain.ranking import PlayerMovement, RankedPlayer
 from catan_bot.domain.scoring import GameRules, ScoreSource, score_sources
 from catan_bot.services.results import (
     Announcement,
+    ChartInsightsView,
     HeadToHeadView,
     InsightsFilter,
     Leaderboard,
@@ -879,6 +885,41 @@ def _insights_filter_line(insights_filter: InsightsFilter) -> str:
     return line
 
 
+def build_chart_embed(
+    view: ChartInsightsView, chart: RenderedChart, filename: str
+) -> discord.Embed:
+    """Build the chart attachment embed with its filters and player legend."""
+    embed = discord.Embed(
+        title=truncate(chart.title, EMBED_TITLE_MAX), color=discord.Color.blurple()
+    )
+    if view.filter.scope == "season" and view.filter.season is None:
+        _set_description(embed, _NO_SEASON_TEXT)
+        return embed
+
+    lines = [_insights_filter_line(view.filter)]
+    lines.extend(f"{label} — {mention(user_id)}" for label, user_id in chart.legend)
+    if chart.note:
+        lines.append(escape_user_text(chart.note))
+    _set_description(embed, "\n".join(lines))
+    embed.set_image(url=f"attachment://{filename}")
+    return embed
+
+
+def build_chart_unavailable_embed(view: ChartInsightsView, kind_title: str) -> discord.Embed:
+    """Build the M2-style empty state for a chart without enough data."""
+    embed = discord.Embed(
+        title=truncate(kind_title, EMBED_TITLE_MAX), color=discord.Color.blurple()
+    )
+    if view.filter.scope == "season" and view.filter.season is None:
+        _set_description(embed, _NO_SEASON_TEXT)
+    else:
+        _set_description(
+            embed,
+            f"{_insights_filter_line(view.filter)}\nNot enough recorded data for this chart yet.",
+        )
+    return embed
+
+
 def _insights_embed(
     title: str,
     insights_filter: InsightsFilter,
@@ -1560,6 +1601,8 @@ __all__ = [
     "EMBED_TITLE_MAX",
     "EMBED_TOTAL_MAX",
     "build_config_show_embed",
+    "build_chart_embed",
+    "build_chart_unavailable_embed",
     "build_event_embed",
     "build_event_list_embed",
     "build_event_reminder_embed",

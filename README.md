@@ -45,7 +45,7 @@ flowchart LR
 | `/game void`, `/game history`, `/game show` | Void a game / view chronological, numbered history (voided games hidden unless `include_voided` is set) / show one game's full details | Admin / anyone | Available |
 | `/game update` | Admin-only correction of a confirmed game, with optional field preservation and audit revisions | Admin | Available |
 | `/leaderboard [channel]`, `/stats` | View rankings and player stats. A selected leaderboard channel receives the public board; otherwise it posts here. | Anyone | Available |
-| `/insights player`, `/insights meta`, `/insights head-to-head` | Explore player trends, group winning patterns, or a player's record against each opponent. | Anyone | Available |
+| `/insights player`, `/insights meta`, `/insights head-to-head`, `/insights chart` | Explore player trends, group winning patterns, or a player's record against each opponent; chart group results. | Anyone | Available |
 | `/event create [date] [channel] ...`, `/event list`, `/event cancel` | Schedule and manage game nights. A selected channel receives the event; otherwise it posts here. | Anyone / creator or admin | Available |
 | RSVP buttons | Going / Maybe / Not going | Anyone | Available |
 
@@ -53,7 +53,10 @@ flowchart LR
 
 `/insights player` shows one player's record, scoring, board stats, and awards;
 `/insights meta` summarizes how the group wins; `/insights head-to-head` compares
-one player's record with each opponent. The scope defaults to all-time and can be
+one player's record with each opponent. `/insights chart` offers six charts:
+How winners score, Points by source, Award impact, Win rate over time, Winning
+scores & margins, and Head-to-head. Charts use P1–P8 labels with a legend mapping
+each label to its Discord member. The scope defaults to all-time and can be
 set to the active season; the optional `game_type` filter narrows results to one
 ruleset. Every score-based stat shows how many scored games it uses, since older
 games may not have recorded scores. Largest Army and Longest Road are tracked as

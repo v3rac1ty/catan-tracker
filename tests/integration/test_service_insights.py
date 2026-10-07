@@ -19,9 +19,12 @@ from datetime import UTC, date, datetime
 import asyncpg
 import pytest
 
+from catan_bot.db.repositories import analytics as analytics_repo
 from catan_bot.db.repositories import games, players, seasons
+from catan_bot.domain import analytics as domain_analytics
 from catan_bot.services import insights_service
 from catan_bot.services.results import (
+    ChartInsightsView,
     HeadToHeadView,
     InsightsFilter,
     MetaInsightsView,
@@ -318,6 +321,108 @@ async def test_head_to_head_respects_season_scope(
     ]
 
 
+# --- chart view -----------------------------------------------------------
+
+
+async def _expected_chart_parts(
+    pool: asyncpg.Pool, guild_id: int, *, season_id: int | None = None, game_type: str | None = None
+) -> tuple[object, ...]:
+    async with pool.acquire() as conn:
+        records = await analytics_repo.list_participations(
+            conn, guild_id, season_id=season_id, game_type=game_type
+        )
+    return (
+        domain_analytics.meta_summary(records),
+        domain_analytics.player_summaries(records),
+        domain_analytics.head_to_head(records),
+        domain_analytics.win_rate_timeline(records),
+    )
+
+
+def _chart_parts(view: ChartInsightsView) -> tuple[object, ...]:
+    return view.meta, view.players, view.head_to_head, view.timeline
+
+
+async def test_chart_view_matches_the_domain_functions_over_the_same_records(
+    pool: asyncpg.Pool, guild_id: int, seeded: int
+) -> None:
+    view = await insights_service.chart_insights(pool, guild_id)
+
+    assert isinstance(view, ChartInsightsView)
+    assert view.filter == InsightsFilter("all_time", None, None)
+    assert _chart_parts(view) == await _expected_chart_parts(pool, guild_id)
+    # Spot-check the hand-derived seed too, so the comparison above can't be vacuous.
+    assert [(p.user_id, p.games) for p in view.players] == [(1, 4), (2, 4), (3, 2)]
+    assert [(h.player_a, h.player_b, h.games_together) for h in view.head_to_head] == [
+        (1, 2, 4),
+        (1, 3, 2),
+        (2, 3, 2),
+    ]
+    assert sorted(view.timeline) == [1, 2, 3]
+    assert [d for d, _ in view.timeline[1]] == [
+        date(2026, 3, 1),
+        date(2026, 3, 5),
+        date(2026, 4, 1),
+        date(2026, 4, 10),
+    ]
+    assert view.meta.games == 4
+
+
+async def test_chart_view_season_scope(pool: asyncpg.Pool, guild_id: int, seeded: int) -> None:
+    view = await insights_service.chart_insights(pool, guild_id, scope="season")
+
+    assert view.filter.scope == "season"
+    assert view.filter.season is not None
+    assert view.filter.season.season_id == seeded
+    assert _chart_parts(view) == await _expected_chart_parts(pool, guild_id, season_id=seeded)
+    assert view.meta.games == 2
+    assert sorted(view.timeline) == [1, 2, 3]
+    assert len(view.timeline[1]) == 2
+
+
+async def test_chart_view_without_active_season_is_empty(
+    pool: asyncpg.Pool, guild_id: int, games_without_season: None
+) -> None:
+    view = await insights_service.chart_insights(pool, guild_id, scope="season")
+
+    assert view.filter == InsightsFilter(scope="season", season=None, game_type=None)
+    assert view.meta.games == 0
+    assert view.players == []
+    assert view.head_to_head == []
+    assert view.timeline == {}
+
+
+async def test_chart_view_game_type_filter(pool: asyncpg.Pool, guild_id: int, seeded: int) -> None:
+    view = await insights_service.chart_insights(pool, guild_id, game_type="seafarers")
+
+    assert view.filter == InsightsFilter("all_time", None, "seafarers")
+    assert _chart_parts(view) == await _expected_chart_parts(pool, guild_id, game_type="seafarers")
+    assert view.meta.games == 1
+    assert [p.user_id for p in view.players] == [1, 2, 3]
+    assert all(len(points) == 1 for points in view.timeline.values())
+
+    combined = await insights_service.chart_insights(
+        pool, guild_id, scope="season", game_type="normal"
+    )
+    assert combined.meta.games == 1
+    assert [p.user_id for p in combined.players] == [1, 2]
+
+
+async def test_chart_view_is_guild_isolated(
+    pool: asyncpg.Pool,
+    app_conn: asyncpg.Connection,
+    guild_id: int,
+    other_guild_id: int,
+    seeded: int,
+) -> None:
+    await _play(app_conn, other_guild_id, played_on=date(2026, 5, 1), winner=2, losers=[1])
+
+    view = await insights_service.chart_insights(pool, other_guild_id)
+
+    assert view.meta.games == 1
+    assert [(h.player_a, h.player_b) for h in view.head_to_head] == [(1, 2)]
+
+
 # --- isolation and validation ---------------------------------------------
 
 
@@ -364,6 +469,7 @@ async def test_invalid_scope_raises_with_a_fixed_message(
         insights_service.player_insights(pool, guild_id, 1, scope=bad_scope),  # type: ignore[arg-type]
         insights_service.meta_insights(pool, guild_id, scope=bad_scope),  # type: ignore[arg-type]
         insights_service.head_to_head_insights(pool, guild_id, 1, scope=bad_scope),  # type: ignore[arg-type]
+        insights_service.chart_insights(pool, guild_id, scope=bad_scope),  # type: ignore[arg-type]
     ]
     for call in calls:
         with pytest.raises(ValueError) as exc_info:
